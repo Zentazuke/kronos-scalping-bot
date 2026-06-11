@@ -979,17 +979,39 @@ class ExecutionRouter:
     async def _emergency_flatten(
         self, symbol: str, exit_side: str, amount: Decimal
     ) -> None:
-        """Market close of an unprotected position. Last resort."""
+        """Market close of an unprotected position. Last resort.
+
+        Single-position mode sweeps the symbol's resting orders first — they
+        can only be this trade's own stray legs. Concurrent mode MUST NOT:
+        the symbol's other resting orders are sibling trades' live brackets,
+        and cancelling them silently strips their protection (observed live
+        2026-06-11: one failed 6th ADA bracket cancelled five healthy OCOs,
+        which the monitor then found vanished -> 5x UNKNOWN, naked shorts).
+        The naked position being flattened here has no resting orders of its
+        own — its bracket is exactly what failed to place.
+        """
         self._set_state(symbol, AssetState.CLOSING)
-        try:
-            cancel_all: Any = getattr(self._exchange, "cancel_all_orders", None)
-            if callable(cancel_all):
-                await asyncio.wait_for(cancel_all(symbol), timeout=FLATTEN_TIMEOUT_S)
-        except OrderNotFound:
-            # Binance answers -2011 when there is simply nothing to cancel.
-            logger.info("%s: no resting orders to cancel pre-flatten", symbol)
-        except Exception:  # noqa: BLE001 — proceed to flatten regardless
-            logger.error("%s: cancel_all_orders failed pre-flatten", symbol, exc_info=True)
+        if self._max_open_trades == 1:
+            try:
+                cancel_all: Any = getattr(self._exchange, "cancel_all_orders", None)
+                if callable(cancel_all):
+                    await asyncio.wait_for(
+                        cancel_all(symbol), timeout=FLATTEN_TIMEOUT_S
+                    )
+            except OrderNotFound:
+                # Binance answers -2011 when there is simply nothing to cancel.
+                logger.info("%s: no resting orders to cancel pre-flatten", symbol)
+            except Exception:  # noqa: BLE001 — proceed to flatten regardless
+                logger.error(
+                    "%s: cancel_all_orders failed pre-flatten", symbol, exc_info=True
+                )
+        else:
+            logger.warning(
+                "%s: concurrent mode — sibling brackets left untouched, "
+                "flattening only the naked %s",
+                symbol,
+                amount,
+            )
         try:
             await asyncio.wait_for(
                 self._exchange.create_order(
@@ -1622,6 +1644,33 @@ class ExecutionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(router.state(_SYMBOL), AssetState.IDLE)
 
     # -- spot venue routing -------------------------------------------------- #
+
+    async def test_concurrent_flatten_spares_sibling_brackets(self) -> None:
+        """A failed bracket's flatten must not cancel other trades' OCOs."""
+        exchange = _FakeSpotExchange(mid_price=self.mid, fail_oco=True)
+        router = ExecutionRouter(
+            exchange,
+            fixed_trade_notional=self.trigger,
+            max_open_trades=0,  # concurrent (data-farm) mode
+        )
+        deep = _book(self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100))
+        result = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger,
+            open_positions=5,
+        )
+        self.assertEqual(result.status, ExecutionStatus.ABORT_BRACKET_FAILED)
+        # The naked entry was flattened, but no symbol-wide cancel happened.
+        self.assertEqual(exchange.cancelled, [])
+
+    async def test_single_mode_flatten_still_sweeps_orders(self) -> None:
+        exchange = _FakeSpotExchange(mid_price=self.mid, fail_oco=True)
+        router = ExecutionRouter(exchange, fixed_trade_notional=self.trigger)
+        deep = _book(self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100))
+        result = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger
+        )
+        self.assertEqual(result.status, ExecutionStatus.ABORT_BRACKET_FAILED)
+        self.assertIn(_SYMBOL, exchange.cancelled)  # own strays swept
 
     async def test_oco_request_uses_fixed_point_strings(self) -> None:
         """Tiny quantities must never serialize as scientific notation.
