@@ -189,6 +189,26 @@ liquidations/funding/OI (spot has none), Tier-3 sentiment (noise at 5m).
 - Cowork artifact + Vercel `dashboard` branch exist but are PAUSED
   (hourly refresh task disabled); localhost is the maintained one.
 
+### FIXED — two live harvester bugs (2026-06-11 ~20:30, suite 101)
+1. **-1100 OCO rejection (BTC only):** `quantity`/prices were serialized as
+   Python floats; below 1e-4 float repr is scientific ("9e-05") and Binance's
+   regex rejects it. Venue-minimum BTC sizes (~0.00009) hit it on EVERY
+   bracket; the filled entry was emergency-flattened each time. Fix:
+   `f"{decimal:f}"` fixed-point strings in `_place_spot_oco`. ADA (~32.4)
+   never triggered it — that asymmetry was the diagnostic clue.
+2. **Sibling-bracket massacre in concurrent mode:** a 6th ADA OCO failed at
+   the venue (Binance spot caps stop-type orders at 5/symbol), and
+   `_emergency_flatten`'s `cancel_all_orders(symbol)` then cancelled the five
+   HEALTHY sibling OCOs → monitor recorded 5× UNKNOWN, wallet left short
+   ~162 ADA unprotected. Fix: concurrent mode flattens only the naked amount
+   and never sweeps the symbol's orders; single mode keeps the sweep.
+   `.env` now runs MAX_OPEN_TRADES_PER_SYMBOL=4 (stay under the venue cap).
+   NOTE: trades #15–19 (UNKNOWN) left real unhedged short exposure —
+   testnet only, user advised to check/flatten ADA balance manually.
+ALSO: bot.log timestamps are LOCAL (UTC+1 for user); journal/TUI are UTC.
+Cowork mount sync can lag bot.log by HOURS — diagnose live issues from
+user-pasted PowerShell output, not the mounted file.
+
 ### ACTIVE — main account switched to HARVESTER mode (2026-06-11 evening)
 User chose to maximize training data on the existing testnet account while
 the 2 extra accounts don't exist yet. `.env` now runs: VARIANT=harvester,
