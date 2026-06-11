@@ -825,9 +825,16 @@ class TradingSupervisor:
                             )
                         )
 
-            # Step D — protective execution routing.
+            # Step D — protective execution routing. The live open-trade
+            # count feeds the concurrent-position cap (harvester mode);
+            # single-position mode ignores it.
             result: ExecutionResult = await self._router.route_trade(
-                symbol, direction, frame, book, trigger_price
+                symbol,
+                direction,
+                frame,
+                book,
+                trigger_price,
+                open_positions=len(self._journal.open_trades(symbol)),
             )
             self._publish(ExecutionUpdate(result=result))
             logger.info(
@@ -1089,6 +1096,7 @@ class _FakeRouter:
         self.routed: List[Tuple[str, SignalDirection, Decimal]] = []
         self.flattened: List[Tuple[str, ...]] = []
         self.reconciled: List[str] = []
+        self.open_positions_seen: List[Optional[int]] = []
 
     async def on_reconnect(self, symbol: str) -> None:
         return None
@@ -1107,7 +1115,10 @@ class _FakeRouter:
         dataframe: pd.DataFrame,
         l2_order_book: L2OrderBook,
         trigger_price: Decimal,
+        *,
+        open_positions: Optional[int] = None,
     ) -> ExecutionResult:
+        self.open_positions_seen.append(open_positions)
         self.routed.append((symbol, direction, trigger_price))
         index: int = len(self.routed)
         return ExecutionResult(

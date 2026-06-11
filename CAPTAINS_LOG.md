@@ -145,6 +145,20 @@ All four pieces implemented + tested (12 new tests, suite now 89):
   DEAD_BAND_LOW, DEAD_BAND_HIGH, TP_ATR_MULT, SL_ATR_MULT, SLIPPAGE_LIMIT
   (constructor-validated).
 
+### BUILT — concurrent positions + venue-minimum sizing (2026-06-11 late)
+User wants maximum trade throughput for training data. execution.py now has:
+- `MAX_OPEN_TRADES_PER_SYMBOL` (default 1 = original strict state machine +
+  zero-exposure reconcile; N>1 = cap; 0 = unlimited). In concurrent mode the
+  journal's variant-scoped open-trade count (passed by the supervisor on
+  every route call) is the limiter; only a mid-flight PENDING_ENTRY blocks.
+  After placement the state returns to IDLE instead of holding ACTIVE.
+- `FIXED_TRADE_NOTIONAL=min` — sizes at the venue minimum (max of min-amount
+  and min-notional floors, +10% headroom so quantization can't round below).
+- OutcomeMonitor already handles N open trades per symbol natively.
+- CAUTION: concurrent mode skips the zero-exposure reconcile by design.
+  NEVER enable it on a real-money account; it exists for the data farm.
+- Suite: 93 tests.
+
 ### ACTIVE — main account switched to HARVESTER mode (2026-06-11 evening)
 User chose to maximize training data on the existing testnet account while
 the 2 extra accounts don't exist yet. `.env` now runs: VARIANT=harvester,

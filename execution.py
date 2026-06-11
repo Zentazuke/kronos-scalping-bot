@@ -241,6 +241,7 @@ class ExecutionRouter:
         take_profit_atr_mult: Decimal = TAKE_PROFIT_ATR_MULT,
         order_timeout_s: float = ORDER_TIMEOUT_S,
         fixed_trade_notional: Optional[Decimal] = None,
+        max_open_trades: int = 1,
     ) -> None:
         self._verify_sandbox(exchange, require_sandbox)
         self._exchange: Any = exchange
@@ -252,9 +253,14 @@ class ExecutionRouter:
         # exactly this much quote currency instead of Kelly × equity. The
         # liquidity cap, quantization, and venue-minimum sieves still apply;
         # only the capital-allocation arithmetic is replaced.
+        self._fixed_notional_is_min: bool = False
         if fixed_trade_notional is None:
             env_notional: str = os.getenv("FIXED_TRADE_NOTIONAL", "").strip()
-            if env_notional:
+            if env_notional.lower() == "min":
+                # Smallest routable trade: venue minimum amount/notional
+                # plus 10% headroom so quantization cannot round below it.
+                self._fixed_notional_is_min = True
+            elif env_notional:
                 try:
                     fixed_trade_notional = Decimal(env_notional)
                 except ArithmeticError as exc:
@@ -276,6 +282,39 @@ class ExecutionRouter:
                 "trade requests a fixed %s quote notional (harvester mode)",
                 self._fixed_notional,
                 self._fixed_notional,
+            )
+        elif self._fixed_notional_is_min:
+            logger.warning(
+                "FIXED_TRADE_NOTIONAL=min — Kelly sizing bypassed, every "
+                "trade requests the venue-minimum size (harvester mode)"
+            )
+
+        # Concurrent-position mode (data farm). 1 (default) keeps the strict
+        # one-bracket-per-symbol state machine and the zero-exposure
+        # reconcile gate. N>1 allows that many simultaneous brackets per
+        # symbol; 0 = unlimited. The supervisor supplies the live open-trade
+        # count from the journal on every routing call.
+        if max_open_trades == 1:
+            env_max: str = os.getenv("MAX_OPEN_TRADES_PER_SYMBOL", "").strip()
+            if env_max:
+                try:
+                    max_open_trades = int(env_max)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "BOOT REFUSED: MAX_OPEN_TRADES_PER_SYMBOL is not an "
+                        f"integer: {env_max!r}"
+                    ) from exc
+        if max_open_trades < 0:
+            raise RuntimeError(
+                "BOOT REFUSED: MAX_OPEN_TRADES_PER_SYMBOL must be >= 0 "
+                f"(0 = unlimited), found {max_open_trades}"
+            )
+        self._max_open_trades: int = max_open_trades
+        if self._max_open_trades != 1:
+            logger.warning(
+                "MAX_OPEN_TRADES_PER_SYMBOL=%s — one-position state machine "
+                "bypassed; concurrent brackets allowed (harvester mode)",
+                "unlimited" if self._max_open_trades == 0 else self._max_open_trades,
             )
         self._slippage_limit: Decimal = slippage_limit
         self._liquidity_tiers: int = liquidity_tiers
@@ -483,8 +522,14 @@ class ExecutionRouter:
         dataframe: pd.DataFrame,
         l2_order_book: L2OrderBook,
         trigger_price: Decimal,
+        *,
+        open_positions: Optional[int] = None,
     ) -> ExecutionResult:
-        """Route one signal through every sieve; place brackets only if clean."""
+        """Route one signal through every sieve; place brackets only if clean.
+
+        ``open_positions`` is the caller's live open-trade count for this
+        symbol (from the journal); it is only consulted in concurrent mode.
+        """
         if direction is SignalDirection.NEUTRAL:
             return ExecutionResult(
                 status=ExecutionStatus.ABORT_NEUTRAL_SIGNAL,
@@ -493,21 +538,47 @@ class ExecutionRouter:
                 reason="neutral signal is never routable",
             )
 
-        if self.state(symbol) is not AssetState.IDLE:
-            return ExecutionResult(
-                status=ExecutionStatus.BLOCKED_STATE,
-                symbol=symbol,
-                direction=direction,
-                reason=f"state machine lock: asset is {self.state(symbol).value}",
-            )
+        if self._max_open_trades == 1:
+            if self.state(symbol) is not AssetState.IDLE:
+                return ExecutionResult(
+                    status=ExecutionStatus.BLOCKED_STATE,
+                    symbol=symbol,
+                    direction=direction,
+                    reason=f"state machine lock: asset is {self.state(symbol).value}",
+                )
 
-        if not await self.reconcile_exchange_truth(symbol):
-            return ExecutionResult(
-                status=ExecutionStatus.BLOCKED_EXCHANGE_TRUTH,
-                symbol=symbol,
-                direction=direction,
-                reason="exchange truth shows active exposure or is unverifiable",
-            )
+            if not await self.reconcile_exchange_truth(symbol):
+                return ExecutionResult(
+                    status=ExecutionStatus.BLOCKED_EXCHANGE_TRUTH,
+                    symbol=symbol,
+                    direction=direction,
+                    reason="exchange truth shows active exposure or is unverifiable",
+                )
+        else:
+            # Concurrent mode: the venue legitimately shows exposure, so the
+            # zero-exposure reconcile is replaced by an explicit cap. Only a
+            # routing already mid-flight on this symbol still blocks.
+            if self.state(symbol) is AssetState.PENDING_ENTRY:
+                return ExecutionResult(
+                    status=ExecutionStatus.BLOCKED_STATE,
+                    symbol=symbol,
+                    direction=direction,
+                    reason="another entry is mid-flight for this symbol",
+                )
+            if (
+                self._max_open_trades > 0
+                and open_positions is not None
+                and open_positions >= self._max_open_trades
+            ):
+                return ExecutionResult(
+                    status=ExecutionStatus.BLOCKED_STATE,
+                    symbol=symbol,
+                    direction=direction,
+                    reason=(
+                        f"concurrent position cap reached "
+                        f"({open_positions}/{self._max_open_trades})"
+                    ),
+                )
 
         self._set_state(symbol, AssetState.PENDING_ENTRY)
         try:
@@ -571,7 +642,11 @@ class ExecutionRouter:
         atr_sma: Decimal = report.atr_sma
 
         requested_amount: Decimal
-        if self._fixed_notional is not None:
+        if self._fixed_notional_is_min:
+            # Harvester mode at venue minimum: smallest size the exchange
+            # will accept, independent of equity and the variant's record.
+            requested_amount = self._venue_minimum_amount(symbol, market_price)
+        elif self._fixed_notional is not None:
             # Harvester mode: constant tiny notional, no Kelly, no equity
             # read — sizing must not depend on the variant's own record.
             requested_amount = self._fixed_notional / market_price
@@ -746,7 +821,12 @@ class ExecutionRouter:
                 entry_fill_price=fill_price,
             )
 
-        self._set_state(symbol, AssetState.ACTIVE)
+        # Concurrent mode never holds the ACTIVE lock — the journal count
+        # (checked at routing time) is the position limiter instead.
+        self._set_state(
+            symbol,
+            AssetState.ACTIVE if self._max_open_trades == 1 else AssetState.IDLE,
+        )
         logger.info(
             "%s: bracket live — %s %s @ %s | TP %s | SL %s (2.5x ATR=%s)",
             symbol,
@@ -981,6 +1061,22 @@ class ExecutionRouter:
         )
         return Decimal(str(raw)) if raw is not None else _ZERO
 
+    def _min_cost(self, symbol: str) -> Decimal:
+        """Venue minimum notional (quote); Binance spot default is 10 USDT."""
+        raw: Any = (
+            (self._market(symbol).get("limits", {}).get("cost") or {}).get("min")
+        )
+        return Decimal(str(raw)) if raw is not None else Decimal("10")
+
+    def _venue_minimum_amount(self, symbol: str, market_price: Decimal) -> Decimal:
+        """Smallest routable base amount, with 10% headroom above both the
+        minimum-amount and minimum-notional floors so banker's-rounding
+        quantization can never push the order below a venue limit."""
+        floor: Decimal = max(
+            self._min_amount(symbol), self._min_cost(symbol) / market_price
+        )
+        return floor * Decimal("1.10")
+
 
 # --------------------------------------------------------------------------- #
 # Embedded test architecture                                                   #
@@ -1190,6 +1286,78 @@ class ExecutionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, ExecutionStatus.EXECUTED)
         # requested 10 base units, but 5% of top-3 depth (1.0) caps it.
         self.assertEqual(result.executed_amount, Decimal("0.050"))
+
+    async def test_unlimited_mode_routes_concurrent_brackets(self) -> None:
+        exchange = _FakeExchange(mid_price=self.mid)
+        router = ExecutionRouter(
+            exchange,
+            fixed_trade_notional=self.trigger,
+            max_open_trades=0,  # unlimited
+        )
+        deep = _book(self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100))
+        first = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger,
+            open_positions=0,
+        )
+        second = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger,
+            open_positions=1,
+        )
+        self.assertEqual(first.status, ExecutionStatus.EXECUTED)
+        self.assertEqual(second.status, ExecutionStatus.EXECUTED)
+        # No ACTIVE lock held between entries in concurrent mode.
+        self.assertEqual(router.state(_SYMBOL), AssetState.IDLE)
+        self.assertEqual(len(exchange.orders), 6)  # two full brackets
+
+    async def test_concurrent_cap_blocks_when_reached(self) -> None:
+        exchange = _FakeExchange(mid_price=self.mid)
+        router = ExecutionRouter(
+            exchange, fixed_trade_notional=self.trigger, max_open_trades=2
+        )
+        deep = _book(self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100))
+        blocked = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger,
+            open_positions=2,
+        )
+        self.assertEqual(blocked.status, ExecutionStatus.BLOCKED_STATE)
+        self.assertEqual(exchange.orders, [])
+        allowed = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger,
+            open_positions=1,
+        )
+        self.assertEqual(allowed.status, ExecutionStatus.EXECUTED)
+
+    async def test_min_notional_sizing_uses_venue_floors(self) -> None:
+        os.environ["FIXED_TRADE_NOTIONAL"] = "min"
+        try:
+            exchange = _FakeExchange(mid_price=self.mid)
+            router = ExecutionRouter(exchange)
+            self.assertTrue(router._fixed_notional_is_min)
+            deep = _book(
+                self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100)
+            )
+            result = await router.route_trade(
+                _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger
+            )
+            self.assertEqual(result.status, ExecutionStatus.EXECUTED)
+            assert result.executed_amount is not None
+            notional: Decimal = result.executed_amount * Decimal(str(self.mid))
+            # Floor is min-cost (10 USDT default) with 10% headroom; the
+            # quantized order must sit just above it, never far above.
+            self.assertGreaterEqual(notional, Decimal("10"))
+            self.assertLess(notional, Decimal("14"))
+        finally:
+            del os.environ["FIXED_TRADE_NOTIONAL"]
+
+    def test_bad_max_open_trades_refuses_boot(self) -> None:
+        with self.assertRaises(RuntimeError):
+            ExecutionRouter(_FakeExchange(mid_price=self.mid), max_open_trades=-1)
+        os.environ["MAX_OPEN_TRADES_PER_SYMBOL"] = "many"
+        try:
+            with self.assertRaises(RuntimeError):
+                ExecutionRouter(_FakeExchange(mid_price=self.mid))
+        finally:
+            del os.environ["MAX_OPEN_TRADES_PER_SYMBOL"]
 
     def test_fixed_notional_env_is_honoured_and_validated(self) -> None:
         os.environ["FIXED_TRADE_NOTIONAL"] = "25"
