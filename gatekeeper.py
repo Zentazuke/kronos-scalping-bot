@@ -115,6 +115,13 @@ class RegimeReport:
     minus_di: Optional[Decimal] = None
     rsi: Optional[Decimal] = None
     book_imbalance: Optional[Decimal] = None  # top-5 bid share, 0..1
+    # Microstructure features (Phase A). Journaled with every trade so the
+    # meta-labeler can learn their weight; spread additionally feeds the
+    # router's spread sieve. None whenever the book cannot support them.
+    spread_bps: Optional[Decimal] = None       # (ask-bid)/mid * 10_000
+    relative_volume: Optional[Decimal] = None  # candle / lookback average
+    depth_imbalance: Optional[Decimal] = None  # (bid-ask)/(bid+ask), ±0.25%
+    total_depth: Optional[Decimal] = None      # base units within ±0.25%
 
     @property
     def passed(self) -> bool:
@@ -278,6 +285,13 @@ class MarketGatekeeper:
 
         book_age_ms, book_fresh = self._book_freshness(bars[-1].ts_ms, l2_order_book)
 
+        relative_volume: Optional[Decimal] = (
+            candle_volume / average_volume if average_volume > _ZERO else None
+        )
+        spread_bps, depth_imbalance, total_depth = self._microstructure(
+            l2_order_book
+        )
+
         return RegimeReport(
             sufficient_data=True,
             trend_ok=adx > self._adx_threshold,
@@ -294,7 +308,52 @@ class MarketGatekeeper:
             minus_di=minus_di,
             rsi=rsi,
             book_imbalance=book_imbalance,
+            spread_bps=spread_bps,
+            relative_volume=relative_volume,
+            depth_imbalance=depth_imbalance,
+            total_depth=total_depth,
         )
+
+    @staticmethod
+    def _microstructure(
+        book: L2OrderBook,
+    ) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+        """(spread_bps, depth_imbalance, total_depth) within 0.25% of mid.
+
+        Spread answers "is execution already expensive?"; the depth pair
+        answers "who is defending price, and with how much size?". A book
+        that is empty, crossed, or non-positive yields all-None — missing
+        evidence is never fabricated.
+        """
+        if not book.is_populated:
+            return None, None, None
+        best_bid: Decimal = Decimal(str(book.bids[0][0]))
+        best_ask: Decimal = Decimal(str(book.asks[0][0]))
+        if best_bid <= _ZERO or best_ask <= _ZERO or best_ask < best_bid:
+            return None, None, None
+        mid: Decimal = (best_bid + best_ask) / Decimal("2")
+        spread_bps: Decimal = (best_ask - best_bid) / mid * Decimal("10000")
+        band: Decimal = mid * Decimal("0.0025")
+        bid_depth: Decimal = sum(
+            (
+                Decimal(str(size))
+                for price, size in book.bids
+                if Decimal(str(price)) >= mid - band
+            ),
+            _ZERO,
+        )
+        ask_depth: Decimal = sum(
+            (
+                Decimal(str(size))
+                for price, size in book.asks
+                if Decimal(str(price)) <= mid + band
+            ),
+            _ZERO,
+        )
+        total: Decimal = bid_depth + ask_depth
+        if total <= _ZERO:
+            return spread_bps, None, total
+        return spread_bps, (bid_depth - ask_depth) / total, total
 
     def confluence(self, report: RegimeReport, *, long_side: bool) -> ConfluenceReport:
         """Count how many directional confirmations agree with the model.
@@ -633,6 +692,30 @@ class MarketGatekeeperTests(unittest.TestCase):
         self.gatekeeper: MarketGatekeeper = MarketGatekeeper()
 
     # -- admission ----------------------------------------------------- #
+
+    def test_microstructure_features_computed(self) -> None:
+        frame: pd.DataFrame = _trending_frame()
+        report: RegimeReport = self.gatekeeper.evaluate(
+            frame, _book_for(frame, bid_sizes=(9.0, 2.0, 1.0), ask_sizes=(3.0, 2.0, 1.0))
+        )
+        # Test book: best bid 100.0, best ask 100.1 -> ~10 bps spread.
+        assert report.spread_bps is not None
+        self.assertAlmostEqual(float(report.spread_bps), 9.995, places=2)
+        # All 3 levels per side sit inside the 0.25% band: 12 vs 6.
+        self.assertEqual(report.total_depth, Decimal("18"))
+        assert report.depth_imbalance is not None
+        self.assertAlmostEqual(float(report.depth_imbalance), 1 / 3, places=6)
+        assert report.relative_volume is not None
+        self.assertGreater(report.relative_volume, Decimal("1"))
+
+    def test_microstructure_none_on_empty_book(self) -> None:
+        frame: pd.DataFrame = _trending_frame()
+        report: RegimeReport = self.gatekeeper.evaluate(
+            frame, _book_for(frame, populated=False)
+        )
+        self.assertIsNone(report.spread_bps)
+        self.assertIsNone(report.depth_imbalance)
+        self.assertIsNone(report.total_depth)
 
     def test_admits_when_all_barriers_pass(self) -> None:
         frame: pd.DataFrame = _trending_frame()

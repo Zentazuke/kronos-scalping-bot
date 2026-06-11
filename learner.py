@@ -76,6 +76,12 @@ FEATURE_NAMES: Final[Tuple[str, ...]] = (
     "book_align",
     "atr_ratio",
     "adx_norm",
+    # Phase A microstructure features. Safe to extend while no trained
+    # model exists; a saved model records its own feature_names, and the
+    # filter stays dormant until retrained with the new vector.
+    "spread_bps",
+    "rel_volume",
+    "depth_align",
 )
 
 META_MIN_SAMPLES: Final[int] = 100  # decided trades before the model is real
@@ -106,6 +112,9 @@ def features_from_context(
     book_imbalance: Optional[Decimal],
     atr: Optional[Decimal],
     atr_sma: Optional[Decimal],
+    spread_bps: Optional[Decimal] = None,
+    relative_volume: Optional[Decimal] = None,
+    depth_imbalance: Optional[Decimal] = None,
 ) -> List[float]:
     """Direction-signed feature vector from live decision-time values."""
     edge_p: float = _f(p_up if long_side else p_down, 0.5)
@@ -122,7 +131,14 @@ def features_from_context(
     atr_baseline: float = _f(atr_sma)
     atr_ratio: float = (atr_value / atr_baseline - 1.0) if atr_baseline > 0 else 0.0
     adx_norm: float = _f(adx) / 100.0
-    return [edge_p, di_align, rsi_room, book_align, atr_ratio, adx_norm]
+    spread: float = _f(spread_bps, 0.0)
+    rel_volume: float = _f(relative_volume, 1.0)
+    raw_depth: float = _f(depth_imbalance, 0.0)
+    depth_align: float = raw_depth if long_side else -raw_depth
+    return [
+        edge_p, di_align, rsi_room, book_align, atr_ratio, adx_norm,
+        spread, rel_volume, depth_align,
+    ]
 
 
 def features_from_record(trade: TradeRecord) -> List[float]:
@@ -137,6 +153,9 @@ def features_from_record(trade: TradeRecord) -> List[float]:
         book_imbalance=trade.book_imbalance,
         atr=trade.atr,
         atr_sma=trade.atr_sma,
+        spread_bps=trade.spread_bps,
+        relative_volume=trade.relative_volume,
+        depth_imbalance=trade.depth_imbalance,
     )
 
 

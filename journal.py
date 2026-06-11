@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS trades (
     p_down          TEXT,
     confluence_votes INTEGER,
     meta_p_win      TEXT,
+    spread_bps      TEXT,
+    relative_volume TEXT,
+    depth_imbalance TEXT,
+    total_depth     TEXT,
     variant         TEXT NOT NULL DEFAULT 'prod',
     status          TEXT NOT NULL DEFAULT 'OPEN',
     ts_close        TEXT,
@@ -159,6 +163,10 @@ class TradeRecord:
     p_down: Optional[Decimal]
     confluence_votes: Optional[int]
     meta_p_win: Optional[Decimal]
+    spread_bps: Optional[Decimal]
+    relative_volume: Optional[Decimal]
+    depth_imbalance: Optional[Decimal]
+    total_depth: Optional[Decimal]
     variant: str
     status: str
     ts_close: Optional[str]
@@ -244,6 +252,17 @@ class TradeJournal:
                 "ALTER TABLE trades ADD COLUMN variant TEXT NOT NULL DEFAULT 'prod'"
             )
             logger.info("journal migrated: variant column added (existing rows = prod)")
+        for feature in (
+            "spread_bps",
+            "relative_volume",
+            "depth_imbalance",
+            "total_depth",
+        ):
+            if feature not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE trades ADD COLUMN {feature} TEXT"
+                )
+                logger.info("journal migrated: %s column added", feature)
 
     def close(self) -> None:
         self._conn.close()
@@ -265,6 +284,10 @@ class TradeJournal:
         p_down: Optional[Decimal] = None,
         confluence_votes: Optional[int] = None,
         meta_p_win: Optional[Decimal] = None,
+        spread_bps: Optional[Decimal] = None,
+        relative_volume: Optional[Decimal] = None,
+        depth_imbalance: Optional[Decimal] = None,
+        total_depth: Optional[Decimal] = None,
     ) -> int:
         """Journal one EXECUTED bracket with its full decision context."""
         if result.executed_amount is None or result.entry_fill_price is None:
@@ -275,8 +298,11 @@ class TradeJournal:
                 ts_open, symbol, direction, amount, entry_price,
                 tp_price, sl_price, tp_order_id, sl_order_id,
                 adx, atr, atr_sma, rsi, plus_di, minus_di, book_imbalance,
-                p_up, p_down, confluence_votes, meta_p_win, variant, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                p_up, p_down, confluence_votes, meta_p_win,
+                spread_bps, relative_volume, depth_imbalance, total_depth,
+                variant, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _utc_now(),
@@ -299,6 +325,10 @@ class TradeJournal:
                 _to_text(p_down),
                 confluence_votes,
                 _to_text(meta_p_win),
+                _to_text(spread_bps),
+                _to_text(relative_volume),
+                _to_text(depth_imbalance),
+                _to_text(total_depth),
                 self._variant,
                 STATUS_OPEN,
             ),
@@ -364,6 +394,10 @@ class TradeJournal:
                 else None
             ),
             meta_p_win=_to_decimal(row["meta_p_win"]),
+            spread_bps=_to_decimal(row["spread_bps"]),
+            relative_volume=_to_decimal(row["relative_volume"]),
+            depth_imbalance=_to_decimal(row["depth_imbalance"]),
+            total_depth=_to_decimal(row["total_depth"]),
             variant=str(row["variant"]),
             status=str(row["status"]),
             ts_close=row["ts_close"],
@@ -728,6 +762,10 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
             book_imbalance=Decimal("0.58"),
             p_up=Decimal("0.6"),
             confluence_votes=2,
+            spread_bps=Decimal("4.2"),
+            relative_volume=Decimal("2.5"),
+            depth_imbalance=Decimal("-0.18"),
+            total_depth=Decimal("145"),
         )
         (trade,) = self.journal.open_trades(_SYMBOL)
         self.assertEqual(trade.trade_id, trade_id)
@@ -736,6 +774,10 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade.adx, Decimal("31.5"))
         self.assertEqual(trade.book_imbalance, Decimal("0.58"))
         self.assertEqual(trade.confluence_votes, 2)
+        self.assertEqual(trade.spread_bps, Decimal("4.2"))
+        self.assertEqual(trade.relative_volume, Decimal("2.5"))
+        self.assertEqual(trade.depth_imbalance, Decimal("-0.18"))
+        self.assertEqual(trade.total_depth, Decimal("145"))
         self.assertTrue(trade.is_long)
 
     def test_performance_snapshot_aggregates(self) -> None:

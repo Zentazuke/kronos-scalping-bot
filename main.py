@@ -868,6 +868,10 @@ class TradingSupervisor:
                     p_down=prediction.p_down,
                     confluence_votes=confluence.votes,
                     meta_p_win=meta_p,
+                    spread_bps=regime.spread_bps,
+                    relative_volume=regime.relative_volume,
+                    depth_imbalance=regime.depth_imbalance,
+                    total_depth=regime.total_depth,
                 )
                 self._publish_performance()
         except asyncio.CancelledError:

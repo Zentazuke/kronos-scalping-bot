@@ -163,6 +163,32 @@ User wants maximum trade throughput for training data. execution.py now has:
   NEVER enable it on a real-money account; it exists for the data farm.
 - Suite: 93 tests.
 
+### BUILT — Phase A microstructure (2026-06-11 night, suite 98)
+Journal-first integration of scalping microstructure (user provided the
+indicator list; principle: COMPUTE + JOURNAL as meta features, never bolt on
+new entry gates — only promote to gates with evidence; spread is the one
+exception because it is execution COST, not signal):
+- gatekeeper.RegimeReport grew: spread_bps, relative_volume (candle/avg),
+  depth_imbalance and total_depth within ±0.25% of mid (`_microstructure`).
+- journal: 4 new TEXT columns, auto-migrating; plumbed through main.py.
+- learner FEATURE_NAMES now 9 (spread_bps, rel_volume, depth_align).
+  Safe because no trained model exists yet; MetaModel.load refuses
+  feature-name mismatches anyway.
+- execution: MAX_SPREAD_BPS env → ABORT_SPREAD sieve (disabled when unset;
+  .env runs 25 bps).
+PHASE B (next): order-flow/trade imbalance + micro-VWAP need a watchTrades
+consumer in feed.py with rolling aggressive-buy/sell windows — journal-first
+again. DEFERRED: sub-minute momentum/vol burst (bot is bar-driven),
+liquidations/funding/OI (spot has none), Tier-3 sentiment (noise at 5m).
+
+### ALSO — dashboards (2026-06-11)
+- dashboard_server.py + dashboard.html: real-time localhost dashboard
+  (10s polling, LAN-accessible, read-only; equity heartbeat line in
+  main.py `_drawdown_check` feeds wallet cards). Decision-chain modal:
+  click any trade → 6-step pipeline view from journaled context.
+- Cowork artifact + Vercel `dashboard` branch exist but are PAUSED
+  (hourly refresh task disabled); localhost is the maintained one.
+
 ### ACTIVE — main account switched to HARVESTER mode (2026-06-11 evening)
 User chose to maximize training data on the existing testnet account while
 the 2 extra accounts don't exist yet. `.env` now runs: VARIANT=harvester,

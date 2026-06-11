@@ -118,6 +118,7 @@ class ExecutionStatus(str, Enum):
     ABORT_SLIPPAGE = "ABORT_SLIPPAGE"
     ABORT_LIQUIDITY = "ABORT_LIQUIDITY"
     ABORT_MIN_SIZE = "ABORT_MIN_SIZE"
+    ABORT_SPREAD = "ABORT_SPREAD"
     ABORT_ENTRY_TIMEOUT = "ABORT_ENTRY_TIMEOUT"
     ABORT_BRACKET_FAILED = "ABORT_BRACKET_FAILED"
     ERROR = "ERROR"
@@ -242,6 +243,7 @@ class ExecutionRouter:
         order_timeout_s: float = ORDER_TIMEOUT_S,
         fixed_trade_notional: Optional[Decimal] = None,
         max_open_trades: int = 1,
+        max_spread_bps: Optional[Decimal] = None,
     ) -> None:
         self._verify_sandbox(exchange, require_sandbox)
         self._exchange: Any = exchange
@@ -310,6 +312,28 @@ class ExecutionRouter:
                 f"(0 = unlimited), found {max_open_trades}"
             )
         self._max_open_trades: int = max_open_trades
+
+        # Spread sieve (Phase A microstructure). A wide spread is a cost the
+        # bracket must overcome before the trade has any edge at all, so it
+        # blocks at execution time. Disabled when unset.
+        if max_spread_bps is None:
+            env_spread: str = os.getenv("MAX_SPREAD_BPS", "").strip()
+            if env_spread:
+                try:
+                    max_spread_bps = Decimal(env_spread)
+                except ArithmeticError as exc:
+                    raise RuntimeError(
+                        "BOOT REFUSED: MAX_SPREAD_BPS is not a valid decimal: "
+                        f"{env_spread!r}"
+                    ) from exc
+        if max_spread_bps is not None and (
+            not max_spread_bps.is_finite() or max_spread_bps <= _ZERO
+        ):
+            raise RuntimeError(
+                "BOOT REFUSED: MAX_SPREAD_BPS must be a positive finite "
+                f"number of basis points, found {max_spread_bps}"
+            )
+        self._max_spread_bps: Optional[Decimal] = max_spread_bps
         if self._max_open_trades != 1:
             logger.warning(
                 "MAX_OPEN_TRADES_PER_SYMBOL=%s — one-position state machine "
@@ -627,6 +651,38 @@ class ExecutionRouter:
                 market_price=market_price,
                 deviation=deviation,
             )
+
+        # -- Sieve 1½: spread (execution cost) ------------------------------ #
+        if self._max_spread_bps is not None and l2_order_book.is_populated:
+            best_bid: Decimal = Decimal(str(l2_order_book.bids[0][0]))
+            best_ask: Decimal = Decimal(str(l2_order_book.asks[0][0]))
+            if best_bid > _ZERO and best_ask >= best_bid:
+                mid: Decimal = (best_bid + best_ask) / Decimal("2")
+                spread_bps: Decimal = (
+                    (best_ask - best_bid) / mid * Decimal("10000")
+                )
+                if spread_bps > self._max_spread_bps:
+                    self._set_state(symbol, AssetState.IDLE)
+                    logger.warning(
+                        "%s: spread abort — %s bps > %s bps allowed "
+                        "(bid %s / ask %s)",
+                        symbol,
+                        spread_bps,
+                        self._max_spread_bps,
+                        best_bid,
+                        best_ask,
+                    )
+                    return ExecutionResult(
+                        status=ExecutionStatus.ABORT_SPREAD,
+                        symbol=symbol,
+                        direction=direction,
+                        reason=(
+                            f"spread {spread_bps:.2f} bps exceeds "
+                            f"{self._max_spread_bps} bps limit"
+                        ),
+                        trigger_price=trigger_price,
+                        market_price=market_price,
+                    )
 
         # -- Sieve 2: volatility capital sizer ----------------------------- #
         report: RegimeReport = self._gatekeeper.evaluate(dataframe, l2_order_book)
@@ -1286,6 +1342,43 @@ class ExecutionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, ExecutionStatus.EXECUTED)
         # requested 10 base units, but 5% of top-3 depth (1.0) caps it.
         self.assertEqual(result.executed_amount, Decimal("0.050"))
+
+    async def test_spread_sieve_blocks_wide_markets(self) -> None:
+        exchange = _FakeExchange(mid_price=self.mid)
+        router = ExecutionRouter(
+            exchange,
+            fixed_trade_notional=self.trigger,
+            max_spread_bps=Decimal("0.5"),
+        )
+        # _book builds bid=mid-0.01 / ask=mid+0.01 -> ~0.67 bps at mid~298.
+        book = _book(self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100))
+        result = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, book, self.trigger
+        )
+        self.assertEqual(result.status, ExecutionStatus.ABORT_SPREAD)
+        self.assertEqual(exchange.orders, [])
+        self.assertEqual(router.state(_SYMBOL), AssetState.IDLE)
+
+    async def test_spread_sieve_admits_tight_markets(self) -> None:
+        exchange = _FakeExchange(mid_price=self.mid)
+        router = ExecutionRouter(
+            exchange,
+            fixed_trade_notional=self.trigger,
+            max_spread_bps=Decimal("5"),
+        )
+        book = _book(self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100))
+        result = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, book, self.trigger
+        )
+        self.assertEqual(result.status, ExecutionStatus.EXECUTED)
+
+    def test_bad_spread_limit_refuses_boot(self) -> None:
+        os.environ["MAX_SPREAD_BPS"] = "-3"
+        try:
+            with self.assertRaises(RuntimeError):
+                ExecutionRouter(_FakeExchange(mid_price=self.mid))
+        finally:
+            del os.environ["MAX_SPREAD_BPS"]
 
     async def test_unlimited_mode_routes_concurrent_brackets(self) -> None:
         exchange = _FakeExchange(mid_price=self.mid)
