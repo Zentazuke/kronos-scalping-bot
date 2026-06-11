@@ -1,6 +1,14 @@
+"""dash_data.py — feeds the Cowork trades-dashboard artifact.
+
+Prints ONE JSON line: {'source', 'trades', 'events', 'error', 'ts'}.
+Trades come from journal.db (full columns) or bot.log (fallback);
+events are notable bot.log lines (brackets, closes, aborts, vetoes, boots).
+"""
 import glob, json, os, re, shutil, sqlite3, time
+
 folder_list = glob.glob('/sessions/*/mnt/Trading Bot')
-out = {'source': None, 'trades': [], 'error': '', 'folder': folder_list[0] if folder_list else None, 'ts': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
+out = {'source': None, 'trades': [], 'events': [], 'error': '',
+       'ts': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
 
 def from_db(folder):
     src = os.path.join(folder, 'journal.db')
@@ -8,12 +16,14 @@ def from_db(folder):
     shutil.copy(src, dst)
     c = sqlite3.connect('file:' + dst + '?mode=ro', uri=True)
     c.row_factory = sqlite3.Row
-    rows = [dict(r) for r in c.execute('SELECT id, ts_open, ts_close, symbol, direction, amount, entry_price, tp_price, sl_price, exit_price, pnl, status, variant, confluence_votes, p_up, p_down, adx, rsi FROM trades ORDER BY id')]
+    rows = [dict(r) for r in c.execute(
+        'SELECT id, ts_open, ts_close, symbol, direction, amount, entry_price,'
+        ' tp_price, sl_price, exit_price, pnl, status, variant,'
+        ' confluence_votes, p_up, p_down, adx, rsi FROM trades ORDER BY id')]
     c.close()
     return rows
 
-def from_log(folder):
-    txt = open(os.path.join(folder, 'bot.log'), encoding='utf-8', errors='replace').read()
+def from_log(txt):
     brackets = {}
     for m in re.finditer(r'^([\d-]+ [\d:]+).*?([A-Z]+/[A-Z]+): bracket live — (STRAT_\w+) ([\d.]+) @ ([\d.]+) \| TP ([\d.]+) \| SL ([\d.]+)', txt, re.M):
         brackets[(m.group(2), m.group(4), m.group(5))] = m.groups()
@@ -21,31 +31,60 @@ def from_log(folder):
     for m in re.finditer(r'^([\d-]+ [\d:]+).*?([A-Z]+/[A-Z]+): trade #(\d+) journaled — (STRAT_\w+) ([\d.]+) @ ([\d.]+)', txt, re.M):
         ts, sym, tid, d, amt, entry = m.groups()
         b = brackets.get((sym, amt, entry))
-        trades[int(tid)] = {'id': int(tid), 'ts_open': ts, 'ts_close': None, 'symbol': sym,
-            'direction': d, 'amount': amt, 'entry_price': entry,
+        trades[int(tid)] = {'id': int(tid), 'ts_open': ts, 'ts_close': None,
+            'symbol': sym, 'direction': d, 'amount': amt, 'entry_price': entry,
             'tp_price': b[5] if b else None, 'sl_price': b[6] if b else None,
             'exit_price': None, 'pnl': None, 'status': 'OPEN', 'variant': None,
-            'confluence_votes': None, 'p_up': None, 'p_down': None, 'adx': None, 'rsi': None}
+            'confluence_votes': None, 'p_up': None, 'p_down': None,
+            'adx': None, 'rsi': None}
     for m in re.finditer(r'^([\d-]+ [\d:]+).*?([A-Z]+/[A-Z]+): trade #(\d+) closed (\w+) — entry ([\d.]+) exit ([\d.]+) pnl (-?[\d.]+)', txt, re.M):
         ts, sym, tid, st, entry, exitp, pnl = m.groups()
-        t = trades.setdefault(int(tid), {'id': int(tid), 'ts_open': None, 'symbol': sym,
-            'direction': '?', 'amount': None, 'entry_price': entry, 'tp_price': None,
-            'sl_price': None, 'variant': None, 'confluence_votes': None,
-            'p_up': None, 'p_down': None, 'adx': None, 'rsi': None})
+        t = trades.setdefault(int(tid), {'id': int(tid), 'ts_open': None,
+            'symbol': sym, 'direction': '?', 'amount': None,
+            'entry_price': entry, 'tp_price': None, 'sl_price': None,
+            'variant': None, 'confluence_votes': None, 'p_up': None,
+            'p_down': None, 'adx': None, 'rsi': None})
         t.update({'status': st, 'exit_price': exitp, 'pnl': pnl, 'ts_close': ts})
     return [trades[k] for k in sorted(trades)]
 
-if out['folder']:
+LINE = re.compile(r'^([\d-]+ [\d:]+),\d+ (\w+)\s+([\w.]+) — (.*)$')
+KEEP = re.compile(
+    r'bracket live|closed (WIN|LOSS|SCRATCH|UNKNOWN)|journaled|ABORT|BLOCKED'
+    r'|veto|slippage abort|emergency|flatten|naked position|supervisor boot'
+    r'|kill.?switch|drawdown|BOOT REFUSED|REGIME_ENFORCE|CONFLUENCE_ENFORCE'
+    r'|FIXED_TRADE_NOTIONAL|MAX_OPEN_TRADES|bracket placement failed'
+    r'|insufficient', re.I)
+
+def events_from_log(txt):
+    evs = []
+    for line in txt.splitlines():
+        m = LINE.match(line)
+        if not m:
+            continue
+        ts, lvl, mod, msg = m.groups()
+        if KEEP.search(msg):
+            evs.append({'ts': ts, 'level': lvl, 'msg': msg[:240]})
+    return evs[-150:]
+
+if folder_list:
+    folder = folder_list[0]
+    try:
+        log_txt = open(os.path.join(folder, 'bot.log'),
+                       encoding='utf-8', errors='replace').read()
+    except Exception as e:
+        log_txt = ''
+        out['error'] += 'log read: %s' % e
+    out['events'] = events_from_log(log_txt)
     for attempt in range(3):
         try:
-            out['trades'] = from_db(out['folder']); out['source'] = 'db'; break
+            out['trades'] = from_db(folder); out['source'] = 'db'; break
         except Exception as e:
-            out['error'] = 'db: ' + str(e); time.sleep(2)
-    if out['source'] is None:
+            out['error'] = 'db: %s' % e; time.sleep(2)
+    if out['source'] is None and log_txt:
         try:
-            out['trades'] = from_log(out['folder']); out['source'] = 'log'
+            out['trades'] = from_log(log_txt); out['source'] = 'log'
         except Exception as e:
-            out['error'] += ' | log: ' + str(e)
+            out['error'] += ' | log parse: %s' % e
 else:
     out['error'] = 'Trading Bot folder not mounted in this session'
 print(json.dumps(out))
