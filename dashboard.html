@@ -132,6 +132,7 @@
 const POLL_MS = 3000;
 let PAYLOAD = { trades: [], events: [], ts: '' };
 let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '', lastJson = '';
+let pollCount = 0;
 
 function n(x) { const v = parseFloat(x); return isNaN(v) ? null : v; }
 function fmt(x, d) { const v = n(x); return v === null ? '—' : v.toLocaleString('en-US', {maximumFractionDigits: d ?? 2}); }
@@ -139,13 +140,14 @@ function fmt(x, d) { const v = n(x); return v === null ? '—' : v.toLocaleStrin
 async function poll() {
   const dot = document.getElementById('dot');
   try {
-    const res = await fetch('/data', { cache: 'no-store' });
+    const res = await fetch('/data?t=' + Date.now(), { cache: 'no-store' });
     const text = await res.text();
     dot.className = 'dot ok';
     PAYLOAD = JSON.parse(text);
     ALL = PAYLOAD.trades || [];
+    pollCount += 1;
     document.getElementById('meta').innerHTML =
-      `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · auto-refresh ${POLL_MS/1000}s`;
+      `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
     const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions]);
@@ -154,8 +156,18 @@ async function poll() {
     const b = document.getElementById('banner');
     if (PAYLOAD.error) { b.style.display = 'block'; b.textContent = 'Journal read warning: ' + PAYLOAD.error; }
     else b.style.display = 'none';
-    buildFilters();
-    render(); renderLive(); renderFeed(); renderSide();
+    // A rendering bug must never look like a connection problem — report it
+    // in the banner and keep polling.
+    try {
+      buildFilters();
+      render(); renderLive(); renderFeed(); renderSide();
+    } catch (re) {
+      const bb = document.getElementById('banner');
+      bb.style.display = 'block';
+      bb.textContent = 'Page render error (data is fine, tell Claude): ' + re.message;
+      console.error(re);
+    }
+    return;
   } catch (e) {
     dot.className = 'dot bad';
     document.getElementById('meta').innerHTML =
@@ -513,6 +525,12 @@ function renderFeed() {
 
 poll();
 setInterval(poll, POLL_MS);
+// Browsers throttle timers in background tabs — catch up the moment the
+// tab is visible again instead of waiting for the next throttled tick.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) poll();
+});
+window.addEventListener('focus', () => poll());
 </script>
 </body>
 </html>
