@@ -138,15 +138,17 @@ function n(x) { const v = parseFloat(x); return isNaN(v) ? null : v; }
 function fmt(x, d) { const v = n(x); return v === null ? '—' : v.toLocaleString('en-US', {maximumFractionDigits: d ?? 2}); }
 
 async function poll() {
-  const dot = document.getElementById('dot');
+  // NOTE: never cache the dot element — meta.innerHTML is rewritten every
+  // poll, and the first version dropped the id in the rewrite, so poll #2
+  // crashed on a null element (the "frozen at poll #1" bug).
+  const meta = document.getElementById('meta');
   try {
     const res = await fetch('/data?t=' + Date.now(), { cache: 'no-store' });
     const text = await res.text();
-    dot.className = 'dot ok';
     PAYLOAD = JSON.parse(text);
     ALL = PAYLOAD.trades || [];
     pollCount += 1;
-    document.getElementById('meta').innerHTML =
+    meta.innerHTML =
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
@@ -169,8 +171,7 @@ async function poll() {
     }
     return;
   } catch (e) {
-    dot.className = 'dot bad';
-    document.getElementById('meta').innerHTML =
+    meta.innerHTML =
       `<span class="dot bad"></span>connection lost (${e.message}) — retrying every ${POLL_MS/1000}s. Is dashboard_server.py still running?`;
   }
 }
