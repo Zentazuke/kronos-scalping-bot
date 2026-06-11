@@ -1,0 +1,19 @@
+# Secrets — never commit exchange keys
+.env
+
+# Runtime state and data
+bot.lock
+emergency_lock.lock
+bot.log
+journal.db
+*.db
+meta_model.json
+
+# Third-party clone (pull with: git clone --depth 1 https://github.com/shiyu-coder/Kronos.git)
+Kronos/
+
+# Python
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/

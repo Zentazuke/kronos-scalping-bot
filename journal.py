@@ -1,0 +1,791 @@
+"""journal.py — Phase 7: trade journal, outcome detection, Kelly feedback.
+
+The learning foundation. Every routed bracket is recorded with the full
+decision context the bot had at entry time (regime metrics, Monte Carlo
+probabilities, confluence votes); the ``OutcomeMonitor`` later detects which
+bracket leg filled on the venue, computes realized PnL, and feeds the result
+into the ``PerformanceTracker`` so Kelly sizing adapts to real performance.
+
+Components:
+  * ``TradeJournal``    — SQLite persistence (stdlib ``sqlite3``). Decimal
+                          values are stored as TEXT and round-trip exactly;
+                          the binary float domain never touches this file.
+                          Writes are single-row and millisecond-cheap, so
+                          they run inline on the event loop by design.
+  * ``OutcomeMonitor``  — polls the exchange for each OPEN trade's TP/SL
+                          order pair. One leg filled => WIN/LOSS recorded,
+                          the sibling leg cancelled (spot OCO already
+                          auto-cancels — OrderNotFound is tolerated), PnL
+                          journaled and folded into the tracker.
+  * ``replay_into``     — on boot, closed-trade history re-seeds a fresh
+                          PerformanceTracker so the Kelly state survives
+                          restarts without any extra state file.
+
+PnL convention (quote currency): LONG => (exit - entry) * amount,
+SHORT => (entry - exit) * amount. Exit-side fees are subtracted when the
+venue reports them in the quote currency; entry fees are not modelled.
+Scratch trades (pnl == 0) are journaled but carry no Kelly information.
+
+Strict typing: annotated for ``mypy --strict``. Embedded unittest suite runs
+with a fake exchange and a temp database (``python -m unittest journal``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sqlite3
+import unittest
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Dict, Final, List, Optional, Sequence, Tuple
+
+from ccxt.base.errors import OrderNotFound  # type: ignore[import-untyped]
+
+from execution import ExecutionResult, PerformanceTracker
+
+__all__ = [
+    "TradeJournal",
+    "OutcomeMonitor",
+    "TradeRecord",
+    "TradeOutcome",
+    "PerformanceSnapshot",
+]
+
+logger: Final[logging.Logger] = logging.getLogger("bot.journal")
+
+_ZERO: Final[Decimal] = Decimal("0")
+
+#: Trade lifecycle states persisted in the ``status`` column.
+STATUS_OPEN: Final[str] = "OPEN"
+STATUS_WIN: Final[str] = "WIN"
+STATUS_LOSS: Final[str] = "LOSS"
+STATUS_SCRATCH: Final[str] = "SCRATCH"
+STATUS_UNKNOWN: Final[str] = "UNKNOWN"  # both legs vanished without a fill
+
+_SCHEMA: Final[str] = """
+CREATE TABLE IF NOT EXISTS trades (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_open         TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    amount          TEXT NOT NULL,
+    entry_price     TEXT NOT NULL,
+    tp_price        TEXT,
+    sl_price        TEXT,
+    tp_order_id     TEXT,
+    sl_order_id     TEXT,
+    adx             TEXT,
+    atr             TEXT,
+    atr_sma         TEXT,
+    rsi             TEXT,
+    plus_di         TEXT,
+    minus_di        TEXT,
+    book_imbalance  TEXT,
+    p_up            TEXT,
+    p_down          TEXT,
+    confluence_votes INTEGER,
+    meta_p_win      TEXT,
+    status          TEXT NOT NULL DEFAULT 'OPEN',
+    ts_close        TEXT,
+    exit_price      TEXT,
+    pnl             TEXT,
+    fees            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol, status);
+"""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _to_text(value: Optional[Decimal]) -> Optional[str]:
+    return None if value is None else str(value)
+
+
+def _to_decimal(value: Optional[str]) -> Optional[Decimal]:
+    return None if value is None else Decimal(value)
+
+
+# --------------------------------------------------------------------------- #
+# Records                                                                      #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class TradeRecord:
+    """One journaled trade — entry context plus (eventually) its outcome."""
+
+    trade_id: int
+    ts_open: str
+    symbol: str
+    direction: str  # SignalDirection.value, e.g. "STRAT_LONG"
+    amount: Decimal
+    entry_price: Decimal
+    tp_price: Optional[Decimal]
+    sl_price: Optional[Decimal]
+    tp_order_id: Optional[str]
+    sl_order_id: Optional[str]
+    adx: Optional[Decimal]
+    atr: Optional[Decimal]
+    atr_sma: Optional[Decimal]
+    rsi: Optional[Decimal]
+    plus_di: Optional[Decimal]
+    minus_di: Optional[Decimal]
+    book_imbalance: Optional[Decimal]
+    p_up: Optional[Decimal]
+    p_down: Optional[Decimal]
+    confluence_votes: Optional[int]
+    meta_p_win: Optional[Decimal]
+    status: str
+    ts_close: Optional[str]
+    exit_price: Optional[Decimal]
+    pnl: Optional[Decimal]
+    fees: Optional[Decimal]
+
+    @property
+    def is_long(self) -> bool:
+        return self.direction.endswith("LONG")
+
+
+@dataclass(frozen=True, slots=True)
+class TradeOutcome:
+    """A freshly detected close, returned by ``OutcomeMonitor.poll``."""
+
+    trade_id: int
+    symbol: str
+    direction: str
+    amount: Decimal
+    entry_price: Decimal
+    exit_price: Optional[Decimal]
+    pnl: Decimal
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceSnapshot:
+    """Aggregate realized results across the whole journal."""
+
+    wins: int
+    losses: int
+    scratches: int
+    open_trades: int
+    realized_pnl: Decimal
+
+    @property
+    def closed_trades(self) -> int:
+        return self.wins + self.losses + self.scratches
+
+    @property
+    def win_rate(self) -> Optional[Decimal]:
+        decided: int = self.wins + self.losses
+        if decided == 0:
+            return None
+        return Decimal(self.wins) / Decimal(decided)
+
+
+# --------------------------------------------------------------------------- #
+# Journal                                                                      #
+# --------------------------------------------------------------------------- #
+
+
+class TradeJournal:
+    """Append-mostly SQLite ledger of every bracket the bot has placed."""
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path: Path = db_path
+        self._conn: sqlite3.Connection = sqlite3.connect(str(db_path))
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # -- writes --------------------------------------------------------- #
+
+    def open_trade(
+        self,
+        result: ExecutionResult,
+        *,
+        adx: Optional[Decimal] = None,
+        atr: Optional[Decimal] = None,
+        atr_sma: Optional[Decimal] = None,
+        rsi: Optional[Decimal] = None,
+        plus_di: Optional[Decimal] = None,
+        minus_di: Optional[Decimal] = None,
+        book_imbalance: Optional[Decimal] = None,
+        p_up: Optional[Decimal] = None,
+        p_down: Optional[Decimal] = None,
+        confluence_votes: Optional[int] = None,
+        meta_p_win: Optional[Decimal] = None,
+    ) -> int:
+        """Journal one EXECUTED bracket with its full decision context."""
+        if result.executed_amount is None or result.entry_fill_price is None:
+            raise ValueError("an executed bracket must carry amount and fill price")
+        cursor: sqlite3.Cursor = self._conn.execute(
+            """
+            INSERT INTO trades (
+                ts_open, symbol, direction, amount, entry_price,
+                tp_price, sl_price, tp_order_id, sl_order_id,
+                adx, atr, atr_sma, rsi, plus_di, minus_di, book_imbalance,
+                p_up, p_down, confluence_votes, meta_p_win, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _utc_now(),
+                result.symbol,
+                result.direction.value,
+                str(result.executed_amount),
+                str(result.entry_fill_price),
+                _to_text(result.take_profit_price),
+                _to_text(result.stop_loss_price),
+                result.take_profit_order_id,
+                result.stop_loss_order_id,
+                _to_text(adx),
+                _to_text(atr),
+                _to_text(atr_sma),
+                _to_text(rsi),
+                _to_text(plus_di),
+                _to_text(minus_di),
+                _to_text(book_imbalance),
+                _to_text(p_up),
+                _to_text(p_down),
+                confluence_votes,
+                _to_text(meta_p_win),
+                STATUS_OPEN,
+            ),
+        )
+        self._conn.commit()
+        trade_id: int = int(cursor.lastrowid or 0)
+        logger.info(
+            "%s: trade #%d journaled — %s %s @ %s",
+            result.symbol,
+            trade_id,
+            result.direction.value,
+            result.executed_amount,
+            result.entry_fill_price,
+        )
+        return trade_id
+
+    def close_trade(
+        self,
+        trade_id: int,
+        *,
+        status: str,
+        exit_price: Optional[Decimal],
+        pnl: Decimal,
+        fees: Decimal = _ZERO,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE trades
+            SET status = ?, ts_close = ?, exit_price = ?, pnl = ?, fees = ?
+            WHERE id = ?
+            """,
+            (status, _utc_now(), _to_text(exit_price), str(pnl), str(fees), trade_id),
+        )
+        self._conn.commit()
+
+    # -- reads ----------------------------------------------------------- #
+
+    @staticmethod
+    def _record(row: sqlite3.Row) -> TradeRecord:
+        return TradeRecord(
+            trade_id=int(row["id"]),
+            ts_open=str(row["ts_open"]),
+            symbol=str(row["symbol"]),
+            direction=str(row["direction"]),
+            amount=Decimal(str(row["amount"])),
+            entry_price=Decimal(str(row["entry_price"])),
+            tp_price=_to_decimal(row["tp_price"]),
+            sl_price=_to_decimal(row["sl_price"]),
+            tp_order_id=row["tp_order_id"],
+            sl_order_id=row["sl_order_id"],
+            adx=_to_decimal(row["adx"]),
+            atr=_to_decimal(row["atr"]),
+            atr_sma=_to_decimal(row["atr_sma"]),
+            rsi=_to_decimal(row["rsi"]),
+            plus_di=_to_decimal(row["plus_di"]),
+            minus_di=_to_decimal(row["minus_di"]),
+            book_imbalance=_to_decimal(row["book_imbalance"]),
+            p_up=_to_decimal(row["p_up"]),
+            p_down=_to_decimal(row["p_down"]),
+            confluence_votes=(
+                int(row["confluence_votes"])
+                if row["confluence_votes"] is not None
+                else None
+            ),
+            meta_p_win=_to_decimal(row["meta_p_win"]),
+            status=str(row["status"]),
+            ts_close=row["ts_close"],
+            exit_price=_to_decimal(row["exit_price"]),
+            pnl=_to_decimal(row["pnl"]),
+            fees=_to_decimal(row["fees"]),
+        )
+
+    def open_trades(self, symbol: Optional[str] = None) -> List[TradeRecord]:
+        if symbol is None:
+            rows: List[sqlite3.Row] = self._conn.execute(
+                "SELECT * FROM trades WHERE status = ? ORDER BY id", (STATUS_OPEN,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM trades WHERE status = ? AND symbol = ? ORDER BY id",
+                (STATUS_OPEN, symbol),
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
+    def closed_trades(self) -> List[TradeRecord]:
+        rows: List[sqlite3.Row] = self._conn.execute(
+            "SELECT * FROM trades WHERE status != ? ORDER BY id", (STATUS_OPEN,)
+        ).fetchall()
+        return [self._record(row) for row in rows]
+
+    def performance(self) -> PerformanceSnapshot:
+        wins = losses = scratches = open_count = 0
+        realized: Decimal = _ZERO
+        for row in self._conn.execute(
+            "SELECT status, pnl FROM trades"
+        ).fetchall():
+            status: str = str(row["status"])
+            if status == STATUS_OPEN:
+                open_count += 1
+                continue
+            if status == STATUS_WIN:
+                wins += 1
+            elif status == STATUS_LOSS:
+                losses += 1
+            else:
+                scratches += 1
+            pnl: Optional[Decimal] = _to_decimal(row["pnl"])
+            if pnl is not None:
+                realized += pnl
+        return PerformanceSnapshot(
+            wins=wins,
+            losses=losses,
+            scratches=scratches,
+            open_trades=open_count,
+            realized_pnl=realized,
+        )
+
+    def replay_into(self, tracker: PerformanceTracker) -> int:
+        """Fold every realized PnL into a fresh tracker. Returns the count."""
+        replayed: int = 0
+        for trade in self.closed_trades():
+            if trade.pnl is not None and trade.status in (STATUS_WIN, STATUS_LOSS):
+                tracker.record_trade(trade.pnl)
+                replayed += 1
+        if replayed:
+            logger.info(
+                "Kelly state restored from journal: %d realized trades replayed",
+                replayed,
+            )
+        return replayed
+
+
+# --------------------------------------------------------------------------- #
+# Outcome monitor                                                              #
+# --------------------------------------------------------------------------- #
+
+
+class OutcomeMonitor:
+    """Detects bracket resolutions on the venue and records them.
+
+    Polled once per confirmed bar — outcome *detection* may lag the fill by
+    up to one bar, but the recorded PnL is exact because it derives from the
+    filled order's own average price, not from the detection-time market.
+    """
+
+    def __init__(
+        self,
+        exchange: Any,
+        journal: TradeJournal,
+        tracker: PerformanceTracker,
+        *,
+        quote_currency: str = "USDT",
+    ) -> None:
+        self._exchange: Any = exchange
+        self._journal: TradeJournal = journal
+        self._tracker: PerformanceTracker = tracker
+        self._quote: str = quote_currency
+
+    async def poll(self, symbol: str) -> List[TradeOutcome]:
+        """Check every OPEN trade for ``symbol``; record and return closes."""
+        outcomes: List[TradeOutcome] = []
+        for trade in self._journal.open_trades(symbol):
+            try:
+                outcome: Optional[TradeOutcome] = await self._check(trade)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — monitor must never kill a bar
+                logger.error(
+                    "%s: outcome check failed for trade #%d — retrying next bar",
+                    symbol,
+                    trade.trade_id,
+                    exc_info=True,
+                )
+                continue
+            if outcome is not None:
+                outcomes.append(outcome)
+        return outcomes
+
+    # -- internals ------------------------------------------------------- #
+
+    async def _fetch_order(
+        self, order_id: Optional[str], symbol: str
+    ) -> Optional[Dict[str, Any]]:
+        if not order_id:
+            return None
+        order: Any = await self._exchange.fetch_order(order_id, symbol)
+        return order if isinstance(order, dict) else None
+
+    @staticmethod
+    def _is_filled(order: Optional[Dict[str, Any]]) -> bool:
+        return order is not None and str(order.get("status")) == "closed"
+
+    @staticmethod
+    def _is_gone(order: Optional[Dict[str, Any]]) -> bool:
+        return order is None or str(order.get("status")) in (
+            "canceled",
+            "cancelled",
+            "expired",
+            "rejected",
+        )
+
+    def _exit_price(
+        self, order: Dict[str, Any], fallback: Optional[Decimal]
+    ) -> Optional[Decimal]:
+        raw: Any = order.get("average") or order.get("price")
+        if raw is not None:
+            return Decimal(str(raw))
+        return fallback
+
+    def _quote_fee(self, order: Dict[str, Any]) -> Decimal:
+        fee: Any = order.get("fee")
+        if (
+            isinstance(fee, dict)
+            and fee.get("cost") is not None
+            and str(fee.get("currency")) == self._quote
+        ):
+            return Decimal(str(fee["cost"]))
+        return _ZERO
+
+    async def _cancel_sibling(self, order_id: Optional[str], symbol: str) -> None:
+        """Cancel the surviving bracket leg (no-op when the venue already did:
+        spot OCO auto-cancels and answers OrderNotFound)."""
+        if not order_id:
+            return
+        try:
+            await self._exchange.cancel_order(order_id, symbol)
+        except OrderNotFound:
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "%s: failed to cancel surviving bracket leg %s",
+                symbol,
+                order_id,
+                exc_info=True,
+            )
+
+    async def _check(self, trade: TradeRecord) -> Optional[TradeOutcome]:
+        tp_order: Optional[Dict[str, Any]] = await self._fetch_order(
+            trade.tp_order_id, trade.symbol
+        )
+        sl_order: Optional[Dict[str, Any]] = await self._fetch_order(
+            trade.sl_order_id, trade.symbol
+        )
+
+        # If both legs simultaneously report filled (pathological), treat the
+        # stop as the exit — the conservative reading.
+        if self._is_filled(sl_order):
+            assert sl_order is not None
+            exit_price = self._exit_price(sl_order, trade.sl_price)
+            fees = self._quote_fee(sl_order)
+            await self._cancel_sibling(trade.tp_order_id, trade.symbol)
+            return self._record_close(trade, exit_price, fees)
+        if self._is_filled(tp_order):
+            assert tp_order is not None
+            exit_price = self._exit_price(tp_order, trade.tp_price)
+            fees = self._quote_fee(tp_order)
+            await self._cancel_sibling(trade.sl_order_id, trade.symbol)
+            return self._record_close(trade, exit_price, fees)
+
+        if self._is_gone(tp_order) and self._is_gone(sl_order):
+            # Both legs vanished without a fill — manual cancel or venue
+            # cleanup. Position state is unknown; journal it honestly.
+            logger.warning(
+                "%s: trade #%d bracket legs disappeared without a fill — "
+                "recorded UNKNOWN, manual check advised",
+                trade.symbol,
+                trade.trade_id,
+            )
+            self._journal.close_trade(
+                trade.trade_id,
+                status=STATUS_UNKNOWN,
+                exit_price=None,
+                pnl=_ZERO,
+            )
+            return TradeOutcome(
+                trade_id=trade.trade_id,
+                symbol=trade.symbol,
+                direction=trade.direction,
+                amount=trade.amount,
+                entry_price=trade.entry_price,
+                exit_price=None,
+                pnl=_ZERO,
+                status=STATUS_UNKNOWN,
+            )
+        return None  # both legs still resting — trade remains open
+
+    def _record_close(
+        self,
+        trade: TradeRecord,
+        exit_price: Optional[Decimal],
+        fees: Decimal,
+    ) -> TradeOutcome:
+        if exit_price is None:
+            gross: Decimal = _ZERO
+        elif trade.is_long:
+            gross = (exit_price - trade.entry_price) * trade.amount
+        else:
+            gross = (trade.entry_price - exit_price) * trade.amount
+        pnl: Decimal = gross - fees
+        if pnl > _ZERO:
+            status: str = STATUS_WIN
+        elif pnl < _ZERO:
+            status = STATUS_LOSS
+        else:
+            status = STATUS_SCRATCH
+
+        self._journal.close_trade(
+            trade.trade_id,
+            status=status,
+            exit_price=exit_price,
+            pnl=pnl,
+            fees=fees,
+        )
+        self._tracker.record_trade(pnl)
+        logger.info(
+            "%s: trade #%d closed %s — entry %s exit %s pnl %s %s (fees %s)",
+            trade.symbol,
+            trade.trade_id,
+            status,
+            trade.entry_price,
+            exit_price,
+            pnl,
+            self._quote,
+            fees,
+        )
+        return TradeOutcome(
+            trade_id=trade.trade_id,
+            symbol=trade.symbol,
+            direction=trade.direction,
+            amount=trade.amount,
+            entry_price=trade.entry_price,
+            exit_price=exit_price,
+            pnl=pnl,
+            status=status,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Embedded tests                                                               #
+# --------------------------------------------------------------------------- #
+
+from predictor import SignalDirection  # noqa: E402  (test-only convenience)
+from execution import ExecutionStatus  # noqa: E402
+
+_SYMBOL: Final[str] = "BTC/USDT"
+
+
+def _executed_result(
+    direction: SignalDirection = SignalDirection.LONG,
+    *,
+    amount: str = "0.010",
+    fill: str = "64000",
+    tp: str = "64100",
+    sl: str = "63800",
+) -> ExecutionResult:
+    return ExecutionResult(
+        status=ExecutionStatus.EXECUTED,
+        symbol=_SYMBOL,
+        direction=direction,
+        reason="test bracket",
+        executed_amount=Decimal(amount),
+        entry_fill_price=Decimal(fill),
+        take_profit_price=Decimal(tp),
+        stop_loss_price=Decimal(sl),
+        take_profit_order_id="tp-1",
+        stop_loss_order_id="sl-1",
+    )
+
+
+class _FakeOrderExchange:
+    """Venue truth for the monitor: a dict of order states per id."""
+
+    def __init__(self, orders: Dict[str, Dict[str, Any]]) -> None:
+        self.orders: Dict[str, Dict[str, Any]] = orders
+        self.cancelled: List[str] = []
+        self.cancel_raises_not_found: bool = False
+
+    async def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        if order_id not in self.orders:
+            raise OrderNotFound(f"unknown order {order_id}")
+        return dict(self.orders[order_id])
+
+    async def cancel_order(self, order_id: str, symbol: str) -> None:
+        if self.cancel_raises_not_found:
+            raise OrderNotFound("already gone")
+        self.cancelled.append(order_id)
+
+
+class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.journal: TradeJournal = TradeJournal(Path(self._tmp.name) / "j.db")
+
+    def tearDown(self) -> None:
+        self.journal.close()
+        self._tmp.cleanup()
+
+    def test_open_trade_round_trips_decimal_context(self) -> None:
+        trade_id: int = self.journal.open_trade(
+            _executed_result(),
+            adx=Decimal("31.5"),
+            rsi=Decimal("62.1"),
+            book_imbalance=Decimal("0.58"),
+            p_up=Decimal("0.6"),
+            confluence_votes=2,
+        )
+        (trade,) = self.journal.open_trades(_SYMBOL)
+        self.assertEqual(trade.trade_id, trade_id)
+        self.assertEqual(trade.amount, Decimal("0.010"))
+        self.assertEqual(trade.entry_price, Decimal("64000"))
+        self.assertEqual(trade.adx, Decimal("31.5"))
+        self.assertEqual(trade.book_imbalance, Decimal("0.58"))
+        self.assertEqual(trade.confluence_votes, 2)
+        self.assertTrue(trade.is_long)
+
+    def test_performance_snapshot_aggregates(self) -> None:
+        first: int = self.journal.open_trade(_executed_result())
+        second: int = self.journal.open_trade(_executed_result())
+        self.journal.open_trade(_executed_result())  # stays open
+        self.journal.close_trade(
+            first, status=STATUS_WIN, exit_price=Decimal("64100"), pnl=Decimal("1.0")
+        )
+        self.journal.close_trade(
+            second, status=STATUS_LOSS, exit_price=Decimal("63800"), pnl=Decimal("-2.0")
+        )
+        snapshot: PerformanceSnapshot = self.journal.performance()
+        self.assertEqual((snapshot.wins, snapshot.losses), (1, 1))
+        self.assertEqual(snapshot.open_trades, 1)
+        self.assertEqual(snapshot.realized_pnl, Decimal("-1.0"))
+        self.assertEqual(snapshot.win_rate, Decimal("0.5"))
+
+    def test_replay_restores_kelly_state(self) -> None:
+        first: int = self.journal.open_trade(_executed_result())
+        self.journal.close_trade(
+            first, status=STATUS_WIN, exit_price=Decimal("64100"), pnl=Decimal("1.0")
+        )
+        fresh = PerformanceTracker()
+        baseline: Decimal = PerformanceTracker().win_rate
+        replayed: int = self.journal.replay_into(fresh)
+        self.assertEqual(replayed, 1)
+        self.assertGreater(fresh.win_rate, baseline)  # the win moved the posterior
+
+    async def test_monitor_records_tp_win_and_cancels_sibling(self) -> None:
+        trade_id: int = self.journal.open_trade(_executed_result())
+        exchange = _FakeOrderExchange(
+            {
+                "tp-1": {"status": "closed", "average": 64100.0,
+                         "fee": {"cost": 0.05, "currency": "USDT"}},
+                "sl-1": {"status": "open"},
+            }
+        )
+        tracker = PerformanceTracker()
+        monitor = OutcomeMonitor(exchange, self.journal, tracker)
+        (outcome,) = await monitor.poll(_SYMBOL)
+        self.assertEqual(outcome.status, STATUS_WIN)
+        # (64100 - 64000) * 0.010 = 1.0 gross, minus 0.05 quote fee.
+        self.assertEqual(outcome.pnl, Decimal("0.95"))
+        self.assertIn("sl-1", exchange.cancelled)
+        self.assertEqual(self.journal.open_trades(_SYMBOL), [])
+        self.assertEqual(self.journal.performance().wins, 1)
+        self.assertEqual(tracker._wins, 1)  # fed straight into Kelly
+
+    async def test_monitor_records_sl_loss_for_short(self) -> None:
+        trade_id: int = self.journal.open_trade(
+            _executed_result(
+                SignalDirection.SHORT, fill="64000", tp="63900", sl="64200"
+            )
+        )
+        exchange = _FakeOrderExchange(
+            {
+                "tp-1": {"status": "canceled"},
+                "sl-1": {"status": "closed", "average": 64200.0},
+            }
+        )
+        tracker = PerformanceTracker()
+        monitor = OutcomeMonitor(exchange, self.journal, tracker)
+        (outcome,) = await monitor.poll(_SYMBOL)
+        self.assertEqual(outcome.status, STATUS_LOSS)
+        # Short: (64000 - 64200) * 0.010 = -2.0
+        self.assertEqual(outcome.pnl, Decimal("-2.0"))
+        self.assertEqual(tracker._losses, 1)
+
+    async def test_monitor_leaves_resting_brackets_open(self) -> None:
+        self.journal.open_trade(_executed_result())
+        exchange = _FakeOrderExchange(
+            {"tp-1": {"status": "open"}, "sl-1": {"status": "open"}}
+        )
+        monitor = OutcomeMonitor(exchange, self.journal, PerformanceTracker())
+        self.assertEqual(await monitor.poll(_SYMBOL), [])
+        self.assertEqual(len(self.journal.open_trades(_SYMBOL)), 1)
+
+    async def test_monitor_flags_vanished_brackets_unknown(self) -> None:
+        self.journal.open_trade(_executed_result())
+        exchange = _FakeOrderExchange(
+            {"tp-1": {"status": "canceled"}, "sl-1": {"status": "canceled"}}
+        )
+        tracker = PerformanceTracker()
+        monitor = OutcomeMonitor(exchange, self.journal, tracker)
+        (outcome,) = await monitor.poll(_SYMBOL)
+        self.assertEqual(outcome.status, STATUS_UNKNOWN)
+        self.assertEqual(outcome.pnl, _ZERO)
+        self.assertEqual(tracker._wins + tracker._losses, 0)  # no false signal
+
+    async def test_monitor_tolerates_oco_auto_cancel(self) -> None:
+        self.journal.open_trade(_executed_result())
+        exchange = _FakeOrderExchange(
+            {"tp-1": {"status": "closed", "average": 64100.0},
+             "sl-1": {"status": "open"}}
+        )
+        exchange.cancel_raises_not_found = True  # venue already removed it
+        monitor = OutcomeMonitor(exchange, self.journal, PerformanceTracker())
+        (outcome,) = await monitor.poll(_SYMBOL)
+        self.assertEqual(outcome.status, STATUS_WIN)  # close still recorded
+
+    async def test_monitor_fetch_failure_is_contained(self) -> None:
+        self.journal.open_trade(_executed_result())
+
+        class _Broken:
+            async def fetch_order(self, order_id: str, symbol: str) -> None:
+                raise RuntimeError("venue hiccup")
+
+        monitor = OutcomeMonitor(_Broken(), self.journal, PerformanceTracker())
+        self.assertEqual(await monitor.poll(_SYMBOL), [])  # no crash, stays open
+        self.assertEqual(len(self.journal.open_trades(_SYMBOL)), 1)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    unittest.main()
