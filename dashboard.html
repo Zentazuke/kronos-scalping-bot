@@ -66,6 +66,22 @@
   .chain .close { float: right; cursor: pointer; border: none; background: #f1f5f9;
     border-radius: 6px; padding: 4px 12px; font-size: 13px; }
   .clickhint { font-size: 11px; color: #94a3b8; margin: 6px 0 0; }
+  .layout { display: flex; gap: 12px; align-items: flex-start; }
+  .side { flex: 0 0 280px; display: flex; flex-direction: column; gap: 12px;
+    position: sticky; top: 12px; }
+  .main { flex: 1 1 auto; min-width: 0; }
+  @media (max-width: 1100px) { .layout { flex-direction: column; } .side { position: static; flex: none; width: 100%; } }
+  .scard h2 { display: flex; justify-content: space-between; align-items: baseline; }
+  .scard .bar { font-size: 10.5px; color: #94a3b8; font-weight: 400; }
+  .srow { display: flex; gap: 7px; padding: 5px 0; border-bottom: 1px solid #f1f5f9;
+    font-size: 11.5px; line-height: 1.45; color: #475569; }
+  .srow:last-child { border-bottom: none; }
+  .srow .lbl { flex: 0 0 52px; font-weight: 600; color: #334155; }
+  .srow .txt { overflow-wrap: anywhere; }
+  .sdot { flex: 0 0 9px; width: 9px; height: 9px; border-radius: 50%; margin-top: 3px; background: #cbd5e1; }
+  .sdot.ok { background: #16a34a; } .sdot.no { background: #dc2626; }
+  .sdot.warn { background: #f59e0b; } .sdot.na { background: #cbd5e1; }
+  .srow.stale { opacity: .45; }
 </style>
 </head>
 <body>
@@ -73,7 +89,9 @@
 <div class="sub" id="meta"><span class="dot ok" id="dot"></span>connecting…</div>
 <div class="banner warn" id="banner"></div>
 
-<div id="content">
+<div id="content" class="layout">
+  <div class="side" id="side"></div>
+  <div class="main">
   <div class="filters">
     <label style="font-size:12.5px;color:#475569">Variant
       <select id="fVariant"><option value="">All</option></select>
@@ -103,6 +121,7 @@
     <p class="clickhint">Click any row to see the full decision chain that opened that position.</p>
     <div id="grid"></div>
   </div>
+  </div><!-- /main -->
 </div>
 
 <div class="overlay" id="overlay">
@@ -129,14 +148,14 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · auto-refresh ${POLL_MS/1000}s`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
     if (PAYLOAD.error) { b.style.display = 'block'; b.textContent = 'Journal read warning: ' + PAYLOAD.error; }
     else b.style.display = 'none';
     buildFilters();
-    render(); renderLive(); renderFeed();
+    render(); renderLive(); renderFeed(); renderSide();
   } catch (e) {
     dot.className = 'dot bad';
     document.getElementById('meta').innerHTML =
@@ -376,6 +395,90 @@ function openChain(id) {
 document.addEventListener('click', (e) => {
   if (e.target.id === 'overlay') document.getElementById('overlay').classList.remove('show');
 });
+
+function decRow(cls, label, text, stale) {
+  return `<div class="srow${stale ? ' stale' : ''}"><span class="sdot ${cls}"></span>` +
+         `<span class="lbl">${label}</span><span class="txt">${text}</span></div>`;
+}
+
+function tsSec(ts) { return ts ? Date.parse(ts.replace(' ', 'T')) / 1000 : 0; }
+
+function renderSide() {
+  const D = PAYLOAD.decisions || {};
+  const symbols = Object.keys(D).sort();
+  const side = document.getElementById('side');
+  if (!symbols.length) {
+    side.innerHTML = '<div class="panel scard"><h2>Pipeline</h2>' +
+      '<div class="empty">Waiting for the bot\'s first bar…</div></div>';
+    return;
+  }
+  side.innerHTML = symbols.map(sym => {
+    const d = D[sym];
+    const newest = Math.max(...Object.values(d).map(e => tsSec(e.ts)));
+    const isStale = (e) => !e || newest - tsSec(e.ts) > 90;  // older bar
+    const rows = [];
+
+    // 1 · Regime
+    const rj = d.regime_reject;
+    if (rj && !isStale(rj)) {
+      const bits = (rj.text.match(/\((.*)\)/) || [,''])[1]
+        .replace(/data=|trend=|volatility=|volume=|book=/g, s => s.replace('=',' '))
+        .replace(/True/g, '✓').replace(/False/g, '✗');
+      rows.push(decRow(d.regime_bypass && !isStale(d.regime_bypass) ? 'warn' : 'no',
+        'Regime', bits + (d.regime_bypass && !isStale(d.regime_bypass) ? ' — not enforced, continuing' : ' — skipped'), false));
+    } else {
+      rows.push(decRow('ok', 'Regime', 'passed — market admitted', false));
+    }
+
+    // 2 · Brain
+    const sg = d.signal, nt = d.neutral;
+    if (nt && (!sg || tsSec(nt.ts) >= tsSec(sg.ts))) {
+      rows.push(decRow('na', 'Brain', nt.text.replace(sym + ': ', ''), isStale(nt)));
+    } else if (sg) {
+      const m = sg.text.match(/(STRAT_\w+) \| paths up\/down\/flat=(\d+)\/(\d+)\/(\d+) p_up=([\d.]+) p_down=([\d.]+)/);
+      rows.push(decRow('ok', 'Brain', m
+        ? `${m[1].replace('STRAT_','')} — ${m[1] === 'STRAT_LONG' ? m[2] : m[3]}/30 paths agree (p ${m[1] === 'STRAT_LONG' ? m[5] : m[6]})`
+        : sg.text, isStale(sg)));
+    } else {
+      rows.push(decRow('na', 'Brain', 'no signal this bar yet', false));
+    }
+
+    // 3 · Votes
+    const cv = d.conf_veto;
+    if (cv && !isStale(cv)) {
+      const m = cv.text.match(/(\d)\/(\d) votes \(DI=(\w+) RSI=(\w+) BOOK=(\w+)/);
+      rows.push(decRow(d.conf_bypass && !isStale(d.conf_bypass) ? 'warn' : 'no', 'Votes', m
+        ? `${m[1]}/${m[2]} — DI ${m[3]==='True'?'✓':'✗'} RSI ${m[4]==='True'?'✓':'✗'} Book ${m[5]==='True'?'✗✓'.slice(1):'✗'}` +
+          (d.conf_bypass && !isStale(d.conf_bypass) ? ' — not enforced' : '')
+        : cv.text, false));
+    } else if (sg && !isStale(sg)) {
+      rows.push(decRow('ok', 'Votes', 'confluence confirmed the side', false));
+    } else {
+      rows.push(decRow('na', 'Votes', '—', false));
+    }
+
+    // 4 · Meta
+    const mt = d.meta;
+    rows.push(mt && !isStale(mt)
+      ? decRow('warn', 'Meta', mt.text.replace(sym + ': ', ''), false)
+      : decRow('na', 'Meta', 'dormant (needs 100 decided trades)', false));
+
+    // 5 · Route
+    const oc = d.outcome, br = d.bracket;
+    if (br && (!oc || tsSec(br.ts) >= tsSec(oc.ts))) {
+      rows.push(decRow('ok', 'Route', br.text.replace(sym + ': ', '').replace('bracket live — ', 'IN TRADE: '), isStale(br)));
+    } else if (oc) {
+      const status = (oc.text.match(/routing outcome (\w+)/) || [,''])[1];
+      const cls = status === 'EXECUTED' ? 'ok' : (status.startsWith('BLOCKED') ? 'warn' : 'no');
+      rows.push(decRow(cls, 'Route', oc.text.replace(sym + ': ', '').replace('routing outcome ', ''), isStale(oc)));
+    } else {
+      rows.push(decRow('na', 'Route', 'nothing routed yet', false));
+    }
+
+    const barTime = newest ? new Date(newest * 1000).toTimeString().slice(0, 8) : '—';
+    return `<div class="panel scard"><h2>${sym}<span class="bar">bar ${barTime}</span></h2>${rows.join('')}</div>`;
+  }).join('');
+}
 
 function renderLive() {
   const open = filtered().filter(t => t.status === 'OPEN');

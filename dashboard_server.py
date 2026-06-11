@@ -76,6 +76,38 @@ def _events() -> List[Dict[str, str]]:
     return events[-150:]
 
 
+_SYM_MSG = re.compile(r"([A-Z]+/[A-Z]+): (.*)")
+_DECISION_PATTERNS = (
+    ("regime_reject", re.compile(r"regime rejected — no inference this bar \((.*)\)")),
+    ("regime_bypass", re.compile(r"REGIME_ENFORCE=false")),
+    ("signal", re.compile(r"STRAT_\w+ \| paths")),
+    ("neutral", re.compile(r"STRAT_NEUTRAL — standing down")),
+    ("conf_veto", re.compile(r"confluence veto on")),
+    ("conf_bypass", re.compile(r"CONFLUENCE_ENFORCE=false")),
+    ("meta", re.compile(r"META (SHADOW|VETO)")),
+    ("outcome", re.compile(r"routing outcome ")),
+    ("bracket", re.compile(r"bracket live — ")),
+)
+
+
+def _decisions(text: str) -> Dict[str, Dict[str, Dict[str, str]]]:
+    """Last decision-pipeline line of each kind, per symbol (log tail)."""
+    out: Dict[str, Dict[str, Dict[str, str]]] = {}
+    for line in text.splitlines()[-600:]:
+        match = _LINE.match(line)
+        if not match:
+            continue
+        ts, _lvl, _mod, msg = match.group(1), match.group(2), match.group(3), match.group(4)
+        sym_match = _SYM_MSG.match(msg)
+        if not sym_match:
+            continue
+        sym, rest = sym_match.group(1), sym_match.group(2)
+        for key, pattern in _DECISION_PATTERNS:
+            if pattern.search(rest):
+                out.setdefault(sym, {})[key] = {"ts": ts, "text": rest[:220]}
+    return out
+
+
 _EQUITY = re.compile(
     r"^([\d-]+ [\d:]+),\d+ .*EQUITY ([\d.]+) baseline ([\d.]+)", re.M
 )
@@ -101,6 +133,7 @@ def _payload() -> bytes:
         "trades": [],
         "events": [],
         "equity": None,
+        "decisions": {},
         "error": "",
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -114,6 +147,12 @@ def _payload() -> bytes:
     try:
         out["events"] = _events()
         out["equity"] = _equity()
+        if LOG_PATH.exists():
+            with LOG_PATH.open("rb") as fh:
+                fh.seek(max(0, LOG_PATH.stat().st_size - LOG_TAIL_BYTES))
+                out["decisions"] = _decisions(
+                    fh.read().decode("utf-8", errors="replace")
+                )
     except OSError as exc:
         out["error"] += f" | log: {exc}"
     return json.dumps(out, default=str).encode("utf-8")
