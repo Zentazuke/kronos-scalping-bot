@@ -118,11 +118,15 @@ python learner.py train --db A/journal.db --db C/journal.db  # pooled variants
 
 ### RESOLVED — GitHub push (2026-06-11)
 - Private repo live at https://github.com/Zentazuke/kronos-scalping-bot
-  (branch `main`). Pushed via OAuth device flow from the Cowork sandbox —
-  no token persisted anywhere in the repo.
-- Local branch may still be named `master` tracking nothing; if so:
-  `git branch -m master main && git fetch origin &&
-   git branch --set-upstream-to=origin/main main`
+  (branch `main`).
+- AUTO-PUSH: a PAT lives in `.env` as `GITHUB_TOKEN` (gitignored, never
+  staged, never echoed into logs or commits). Push with a one-off URL so the
+  token never lands in `.git/config`:
+  `git push https://x-access-token:<GITHUB_TOKEN>@github.com/Zentazuke/kronos-scalping-bot.git HEAD:main`
+- Cowork-sandbox note: if the mount serves a stale/corrupt `.git` view,
+  copy `.git` to /tmp, fix its config, commit there with
+  `--git-dir/--work-tree`, push, then copy objects + refs back to the
+  mount's `.git` (objects are immutable, refs are single-line files).
 - Never stage `.env` (gitignore covers it).
 
 ### BUILT — multi-variant data farm plumbing (2026-06-11)
