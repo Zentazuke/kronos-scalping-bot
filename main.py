@@ -347,10 +347,16 @@ class TradingSupervisor:
 
         # Testnet venues are throttled: default to a 2 s order boundary there
         # (the live matching engine setting is 0.2 s — set ORDER_TIMEOUT_S).
+        # TP_ATR_MULT / SL_ATR_MULT: bracket distances (walk-forward 2026-06-11
+        # favoured TP 2.5 / SL 2.5 over the original 1.5 / 2.5).
+        # SLIPPAGE_LIMIT: max trigger-to-market deviation (0.0005 = 0.05%).
         self._router: ExecutionRouter = router or ExecutionRouter(
             self._exchange,
             tracker=self._tracker,
             order_timeout_s=float(os.getenv("ORDER_TIMEOUT_S", "2.0")),
+            take_profit_atr_mult=Decimal(os.getenv("TP_ATR_MULT", "1.5")),
+            stop_loss_atr_mult=Decimal(os.getenv("SL_ATR_MULT", "2.5")),
+            slippage_limit=Decimal(os.getenv("SLIPPAGE_LIMIT", "0.0005")),
         )
         self._feed.add_reconciliation_hook(self._router.on_reconnect)
 

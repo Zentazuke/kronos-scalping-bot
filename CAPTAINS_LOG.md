@@ -142,7 +142,25 @@ All four pieces implemented + tested (12 new tests, suite now 89):
   (pooling across variants is CORRECT for the meta-labeler); missing DB
   files are skipped with a warning, not fatal.
 - `main.py` also gained tuning knobs: REGIME_MIN_ADX, EDGE_THRESHOLD,
-  DEAD_BAND_LOW, DEAD_BAND_HIGH (constructor-validated).
+  DEAD_BAND_LOW, DEAD_BAND_HIGH, TP_ATR_MULT, SL_ATR_MULT, SLIPPAGE_LIMIT
+  (constructor-validated).
+
+### ACTIVE — main account switched to HARVESTER mode (2026-06-11 evening)
+User chose to maximize training data on the existing testnet account while
+the 2 extra accounts don't exist yet. `.env` now runs: VARIANT=harvester,
+REGIME_ENFORCE=false, CONFLUENCE_ENFORCE=false, FIXED_TRADE_NOTIONAL=25,
+EDGE_THRESHOLD=0.51 + dead band 0.49–0.51 (narrowest legal),
+TP/SL 2.5/2.5 (walk-forward pick), SLIPPAGE_LIMIT=0.0015,
+RISK_TOTAL_DRAWDOWN_LIMIT=0.50 (bug-catcher only — RESTORE 0.03 before
+anything resembling real money). Rationale: prod's Kelly benched itself
+after 4 trades (2W/2L, payoff ~0.33); harvester sizing ignores Kelly so it
+keeps journaling. Trade #2 (2026-06-11) slipped 0.22% past its stop —
+testnet books are thin. Kronos calibration is the big open question: it
+emitted 28–30/30 paths DOWN repeatedly while price rose; the journal now
+captures every such call for a future calibration report (Phase 9½ idea:
+offline Kronos replay over history to score p_up/p_down vs realized).
+Walk-forward (30d, 3 folds): ADX>30 won all folds, TP 2.5 all folds,
+SL unstable 2.0/2.5, validation expectancy +0.37/+0.66/−0.09 ATR.
 
 ### NEXT — deploy the farm (user-side prerequisites first)
 1. User creates 2 extra Binance Spot Testnet accounts + API keys.
