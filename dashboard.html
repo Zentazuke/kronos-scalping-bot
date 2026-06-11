@@ -46,6 +46,26 @@
   .livetable th { text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; padding: 4px 8px; border-bottom: 1px solid #e2e8f0; }
   .livetable td { padding: 5px 8px; border-bottom: 1px solid #f1f5f9; }
   .empty { color: #94a3b8; font-size: 13px; padding: 14px 4px; }
+  .overlay { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: none;
+    align-items: flex-start; justify-content: center; padding: 30px 12px; overflow-y: auto; z-index: 50; }
+  .overlay.show { display: flex; }
+  .chain { background: #fff; border-radius: 12px; max-width: 580px; width: 100%; padding: 18px 20px; }
+  .chain h2 { margin: 0 0 2px; font-size: 15px; }
+  .chain .when { color: #64748b; font-size: 12px; margin-bottom: 14px; }
+  .step { border-left: 3px solid #cbd5e1; margin-left: 8px; padding: 8px 0 12px 16px; position: relative; }
+  .step:last-child { border-left-color: transparent; }
+  .step::before { content: ''; position: absolute; left: -8px; top: 12px; width: 13px; height: 13px;
+    border-radius: 50%; background: #cbd5e1; border: 2px solid #fff; }
+  .step.ok::before { background: #16a34a; } .step.no::before { background: #dc2626; }
+  .step.na::before { background: #94a3b8; }
+  .step h3 { margin: 0 0 4px; font-size: 13px; color: #1e293b; }
+  .step .d { font-size: 12px; color: #475569; line-height: 1.7; }
+  .step .d b { color: #1e293b; }
+  .vote { display: inline-block; margin-right: 10px; }
+  .vote.yes { color: #15803d; } .vote.nope { color: #b91c1c; }
+  .chain .close { float: right; cursor: pointer; border: none; background: #f1f5f9;
+    border-radius: 6px; padding: 4px 12px; font-size: 13px; }
+  .clickhint { font-size: 11px; color: #94a3b8; margin: 6px 0 0; }
 </style>
 </head>
 <body>
@@ -80,8 +100,13 @@
 
   <div class="panel">
     <h2>All trades — entry, targets, exit</h2>
+    <p class="clickhint">Click any row to see the full decision chain that opened that position.</p>
     <div id="grid"></div>
   </div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="chain" id="chainbox"></div>
 </div>
 
 <script>
@@ -163,7 +188,15 @@ function render() {
   const grossLost = lossArr.reduce((a,t)=>a+(n(t.pnl)||0),0);
   const deployed = T.filter(t => t.status === 'OPEN')
                     .reduce((a,t)=>a+(notional(t)||0),0);
-  const volume = T.reduce((a,t)=>a+(notional(t)||0),0);
+  let bought = 0, sold = 0;
+  for (const t of T) {
+    const entryN = notional(t);
+    const exN = (n(t.exit_price) !== null && n(t.amount) !== null)
+      ? n(t.exit_price) * n(t.amount) : null;
+    const isLong = t.direction === 'STRAT_LONG';
+    if (entryN !== null) { if (isLong) bought += entryN; else sold += entryN; }
+    if (exN !== null)    { if (isLong) sold += exN;     else bought += exN; }
+  }
   const wPcts = winsArr.map(pnlPct).filter(v => v !== null);
   const lPcts = lossArr.map(pnlPct).filter(v => v !== null);
   const avgWPct = wPcts.length ? wPcts.reduce((a,b)=>a+b,0)/wPcts.length : null;
@@ -184,7 +217,8 @@ function render() {
         ? `${sessD >= 0 ? '+' : ''}${fmt(sessD, 2)} $ (${sessP >= 0 ? '+' : ''}${fmt(sessP, 3)}%)` : '—',
       sessD === null ? 'neutral' : (sessD >= 0 ? 'pos' : 'neg'), 'wallet move incl. open positions'],
     ['Deployed now', fmt(deployed, 2) + ' $', 'neutral', open + ' open position' + (open === 1 ? '' : 's')],
-    ['Total traded', fmt(volume, 2) + ' $', 'neutral', T.length + ' entries (notional)'],
+    ['Bought', fmt(bought, 2) + ' $', 'neutral', 'long entries + short exits'],
+    ['Sold', fmt(sold, 2) + ' $', 'neutral', 'short entries + long exits'],
     ['Realized PnL', fmt(pnl, 2) + ' $', pnl >= 0 ? 'pos' : 'neg', 'decided trades only'],
     ['Won / Lost', `+${fmt(grossWon, 2)} / ${fmt(grossLost, 2)} $`, 'neutral', wins + 'W · ' + losses + 'L'],
     ['Win rate', decided.length ? Math.round(100*wins/decided.length) + '%' : '—', 'neutral',
@@ -238,6 +272,7 @@ function render() {
   ]);
 
   if (grid) { grid.updateConfig({ data: rows }).forceRender(); return; }
+  // (grid created below on first render; row clicks open the decision chain)
   grid = new gridjs.Grid({
     columns: [
       { name: '#', width: '52px' }, { name: 'Opened', width: '128px' }, 'Symbol',
@@ -254,7 +289,86 @@ function render() {
     pagination: { limit: 25 },
     style: { th: { 'background': '#f8fafc' } },
   }).render(document.getElementById('grid'));
+  grid.on('rowClick', (e, row) => openChain(row.cells[0].data));
 }
+
+function v(x, d) { return x === null || x === undefined ? '<i>not recorded</i>' : fmt(x, d ?? 2); }
+
+function openChain(id) {
+  const t = ALL.find(x => x.id === id);
+  if (!t) return;
+  const isLong = t.direction === 'STRAT_LONG';
+  const side = isLong ? 'LONG' : 'SHORT';
+  const adx = n(t.adx), atr = n(t.atr), atrSma = n(t.atr_sma), rsi = n(t.rsi);
+  const pdi = n(t.plus_di), mdi = n(t.minus_di), imb = n(t.book_imbalance);
+  const pUp = n(t.p_up), pDown = n(t.p_down), pSide = isLong ? pUp : pDown;
+  const meta = n(t.meta_p_win);
+  const entry = n(t.entry_price), amt = n(t.amount), tp = n(t.tp_price), sl = n(t.sl_price);
+  const sizeD = notional(t);
+  const exitP = n(t.exit_price);
+  const exitD = exitP !== null && amt !== null ? exitP * amt : null;
+
+  // Recomputed verdicts (default thresholds; gates are journaled but not
+  // enforced in harvester mode):
+  const trendOk = adx !== null ? adx > 25 : null;
+  const volOk = atr !== null && atrSma !== null ? atr > atrSma : null;
+  const diVote  = pdi !== null && mdi !== null ? (isLong ? pdi > mdi : mdi > pdi) : null;
+  const rsiVote = rsi !== null ? (isLong ? rsi < 70 : rsi > 30) : null;
+  const bookVote = imb !== null ? (isLong ? imb > 0.5 : imb < 0.5) : null;
+  const votes = t.confluence_votes;
+
+  const mark = (ok) => ok === null ? 'na' : (ok ? 'ok' : 'no');
+  const tick = (ok, label, detail) =>
+    `<span class="vote ${ok === null ? '' : (ok ? 'yes' : 'nope')}">${ok === null ? '·' : (ok ? '✓' : '✗')} ${label}${detail ? ' (' + detail + ')' : ''}</span>`;
+
+  const tpPct = tp !== null && entry ? Math.abs(tp - entry) / entry * 100 : null;
+  const slPct = sl !== null && entry ? Math.abs(sl - entry) / entry * 100 : null;
+
+  const steps = [
+    [mark(trendOk !== null && volOk !== null ? (trendOk && volOk) : null),
+     '1 · Regime gate — is this market worth trading?',
+     `${tick(trendOk, 'Trend', adx !== null ? 'ADX ' + fmt(adx, 1) + ' vs 25' : '')}` +
+     `${tick(volOk, 'Volatility', atr !== null && atrSma !== null ? 'ATR ' + fmt(atr, 4) + ' vs avg ' + fmt(atrSma, 4) : '')}<br>` +
+     `Harvester mode journals this verdict but does not block on it.`],
+    [pSide !== null ? (pSide >= 0.5 ? 'ok' : 'no') : 'na',
+     '2 · Kronos brain — 30-path Monte Carlo forecast',
+     `p(up) <b>${v(pUp)}</b> · p(down) <b>${v(pDown)}</b> → proposed <b>${side}</b>` +
+     (pSide !== null ? ` with <b>${fmt(pSide * 100, 1)}%</b> of simulated paths agreeing` : '')],
+    [mark(diVote !== null && rsiVote !== null && bookVote !== null ? ((diVote?1:0)+(rsiVote?1:0)+(bookVote?1:0) >= 2) : null),
+     '3 · Confluence — three independent confirmations vote',
+     tick(diVote, 'DI trend direction', pdi !== null ? '+DI ' + fmt(pdi, 1) + ' / −DI ' + fmt(mdi, 1) : '') +
+     tick(rsiVote, 'RSI room', rsi !== null ? 'RSI ' + fmt(rsi, 1) : '') +
+     tick(bookVote, 'Order-book lean', imb !== null ? fmt(imb * 100, 1) + '% bids' : '') +
+     `<br>Recorded votes: <b>${votes ?? '—'}</b> (needs 2 of 3 when enforced)`],
+    [meta === null ? 'na' : (meta >= 0.5 ? 'ok' : 'no'),
+     '4 · Meta-filter — learned P(win) for this setup',
+     meta === null ? 'Dormant (needs 100 decided trades to train)' :
+       `Model scored this setup <b>${fmt(meta * 100, 1)}%</b> likely to win (floor 50%)`],
+    ['ok',
+     '5 · Execution — money in, bracket out',
+     `${isLong ? 'Bought' : 'Sold'} <b>${v(amt, 6)} ${(t.symbol || '').split('/')[0]}</b> ` +
+     `for <b>${v(sizeD)} $</b> @ ${v(entry, 4)}<br>` +
+     `TP ${v(tp, 4)} (${tpPct !== null ? fmt(tpPct, 2) + '% away' : '—'}) · ` +
+     `SL ${v(sl, 4)} (${slPct !== null ? fmt(slPct, 2) + '% away' : '—'})`],
+    [t.status === 'WIN' ? 'ok' : t.status === 'LOSS' ? 'no' : 'na',
+     '6 · Outcome',
+     t.status === 'OPEN' ? 'Still open — waiting for TP or SL to fill.' :
+       `${t.status} — ${isLong ? 'sold' : 'bought back'} for <b>${v(exitD)} $</b> @ ${v(exitP, 4)}` +
+       ` → PnL <b>${v(n(t.pnl), 4)} $</b>` +
+       (pnlPct(t) !== null ? ` (<b>${pnlPct(t) >= 0 ? '+' : ''}${fmt(pnlPct(t), 2)}%</b>)` : '')],
+  ];
+
+  document.getElementById('chainbox').innerHTML =
+    `<button class="close" onclick="document.getElementById('overlay').classList.remove('show')">✕ close</button>` +
+    `<h2>Trade #${t.id} — ${t.symbol} ${side}</h2>` +
+    `<div class="when">opened ${(t.ts_open || '—').replace('T', ' ').slice(0, 19)} · variant ${t.variant || '—'}</div>` +
+    steps.map(s => `<div class="step ${s[0]}"><h3>${s[1]}</h3><div class="d">${s[2]}</div></div>`).join('');
+  document.getElementById('overlay').classList.add('show');
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'overlay') document.getElementById('overlay').classList.remove('show');
+});
 
 function renderLive() {
   const open = filtered().filter(t => t.status === 'OPEN');
