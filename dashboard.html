@@ -89,13 +89,13 @@
   <div class="cards" id="cards"></div>
 
   <div class="row">
-    <div class="panel"><h2>Live — open positions (waiting on TP or SL)</h2><div id="livebox"></div></div>
-    <div class="panel"><h2>Activity feed — what the bot is doing (newest first)</h2><div class="feed" id="feed"></div></div>
+    <div class="panel"><h2>Cumulative PnL (USDT, decided trades)</h2><div class="chartbox"><canvas id="cumChart"></canvas></div></div>
+    <div class="panel"><h2>PnL per trade (USDT)</h2><div class="chartbox"><canvas id="barChart"></canvas></div></div>
   </div>
 
   <div class="row">
-    <div class="panel"><h2>Cumulative PnL (USDT, decided trades)</h2><div class="chartbox"><canvas id="cumChart"></canvas></div></div>
-    <div class="panel"><h2>PnL per trade (USDT)</h2><div class="chartbox"><canvas id="barChart"></canvas></div></div>
+    <div class="panel"><h2>Live — open positions (waiting on TP or SL)</h2><div id="livebox"></div></div>
+    <div class="panel"><h2>Activity feed — what the bot is doing (newest first)</h2><div class="feed" id="feed"></div></div>
   </div>
 
   <div class="panel">
@@ -110,9 +110,9 @@
 </div>
 
 <script>
-const POLL_MS = 10000;
+const POLL_MS = 3000;
 let PAYLOAD = { trades: [], events: [], ts: '' };
-let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '';
+let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '', lastJson = '';
 
 function n(x) { const v = parseFloat(x); return isNaN(v) ? null : v; }
 function fmt(x, d) { const v = n(x); return v === null ? '—' : v.toLocaleString('en-US', {maximumFractionDigits: d ?? 2}); }
@@ -121,11 +121,17 @@ async function poll() {
   const dot = document.getElementById('dot');
   try {
     const res = await fetch('/data', { cache: 'no-store' });
-    PAYLOAD = await res.json();
-    ALL = PAYLOAD.trades || [];
+    const text = await res.text();
     dot.className = 'dot ok';
+    PAYLOAD = JSON.parse(text);
+    ALL = PAYLOAD.trades || [];
     document.getElementById('meta').innerHTML =
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · auto-refresh ${POLL_MS/1000}s`;
+    // Re-render only when the underlying data actually changed — keeps the
+    // charts perfectly still between updates.
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity]);
+    if (sig === lastJson) return;
+    lastJson = sig;
     const b = document.getElementById('banner');
     if (PAYLOAD.error) { b.style.display = 'block'; b.textContent = 'Journal read warning: ' + PAYLOAD.error; }
     else b.style.display = 'none';
