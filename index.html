@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kronos Bot — Trade Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.js" integrity="sha384-iU8HYtnGQ8Cy4zl7gbNMOhsDTTKX02BTXptVP/vqAWIaTfM7isw76iyZCsjL2eVi" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/gridjs.umd.js" integrity="sha384-/XXDzxe4FsGiAe50i/u9pY/Vy/uX654MHB1xoc1BJNnH1WXHhqHga9g3q5tF4gj7" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/theme/mermaid.min.css" integrity="sha384-jZvDSsmGB9oGGT/4l9bHXGoAv1OxvG/cFmSo0dZaSqmBgvQTKDBFAMftlXTmMbNW" crossorigin="anonymous">
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; font-family: "Segoe UI", system-ui, sans-serif; background: #f6f7f9; color: #1a202c; }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub { color: #64748b; font-size: 12px; margin-bottom: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
+  .card .k { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 20px; font-weight: 700; margin-top: 2px; }
+  .pos { color: #16a34a; } .neg { color: #dc2626; } .neutral { color: #1a202c; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+  @media (max-width: 760px) { .row { grid-template-columns: 1fr; } }
+  .panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; }
+  .panel h2 { font-size: 13px; margin: 0 0 8px; color: #334155; }
+  .chartbox { position: relative; height: 220px; }
+  .filters { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  select { padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 7px; background: #fff; font-size: 13px; }
+  .banner { padding: 8px 12px; border-radius: 8px; font-size: 12.5px; margin-bottom: 12px; }
+  .banner.info { background: #e0f2fe; border: 1px solid #38bdf8; color: #075985; }
+  .gridjs-wrapper { border-radius: 8px; }
+  td.gridjs-td, th.gridjs-th { padding: 6px 9px; font-size: 12.5px; }
+  .pill { display:inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.WIN { background:#dcfce7; color:#15803d; } .pill.LOSS { background:#fee2e2; color:#b91c1c; }
+  .pill.OPEN { background:#dbeafe; color:#1d4ed8; } .pill.SCRATCH { background:#f1f5f9; color:#475569; }
+  .pill.UNKNOWN { background:#fef9c3; color:#854d0e; }
+  .long { color:#16a34a; font-weight:600; } .short { color:#dc2626; font-weight:600; }
+  button.refresh { padding: 6px 14px; border: 1px solid #2563eb; background: #2563eb; color: #fff;
+    border-radius: 7px; font-size: 13px; cursor: pointer; }
+  button.refresh:disabled { opacity: .55; cursor: default; }
+  .feed { max-height: 280px; overflow-y: auto; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11.5px; line-height: 1.55; }
+  .feed div { padding: 1px 5px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ev-bad  { color: #b91c1c; background: #fef2f2; }
+  .ev-warn { color: #92400e; }
+  .ev-good { color: #15803d; }
+  .ev-info { color: #64748b; }
+  .livetable { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .livetable th { text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; padding: 4px 8px; border-bottom: 1px solid #e2e8f0; }
+  .livetable td { padding: 5px 8px; border-bottom: 1px solid #f1f5f9; }
+  .empty { color: #94a3b8; font-size: 13px; padding: 14px 4px; }
+</style>
+</head>
+<body>
+<h1>Kronos Scalping Bot — Trades</h1>
+<div class="sub" id="meta"></div>
+<div class="banner info" id="banner" style="display:none"></div>
+
+<div id="content">
+  <div class="filters">
+    <button class="refresh" id="btnRefresh">Refresh data</button>
+    <label style="font-size:12.5px;color:#475569">Variant
+      <select id="fVariant"><option value="">All</option></select>
+    </label>
+    <label style="font-size:12.5px;color:#475569">Status
+      <select id="fStatus"><option value="">All</option><option>OPEN</option><option>WIN</option><option>LOSS</option><option>SCRATCH</option><option>UNKNOWN</option></select>
+    </label>
+    <label style="font-size:12.5px;color:#475569">Symbol
+      <select id="fSymbol"><option value="">All</option></select>
+    </label>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="row">
+    <div class="panel"><h2>Live — open positions (waiting on TP or SL)</h2><div id="livebox"></div></div>
+    <div class="panel"><h2>Activity feed — what the bot is doing (newest first)</h2><div class="feed" id="feed"></div></div>
+  </div>
+
+  <div class="row">
+    <div class="panel"><h2>Cumulative PnL (USDT, decided trades)</h2><div class="chartbox"><canvas id="cumChart"></canvas></div></div>
+    <div class="panel"><h2>PnL per trade (USDT)</h2><div class="chartbox"><canvas id="barChart"></canvas></div></div>
+  </div>
+
+  <div class="panel">
+    <h2>All trades — entry, targets, exit</h2>
+    <div id="grid"></div>
+  </div>
+</div>
+
+<script>
+// Data is baked in by the "refresh-trades-dashboard" scheduled task, which
+// re-reads journal.db / bot.log and rewrites this artifact. The Refresh
+// button triggers that task on demand.
+const PAYLOAD = /*DATA_START*/{"source": "log", "trades": [{"id": 1, "ts_open": "2026-06-11 13:10:15", "ts_close": "2026-06-11 13:25:03", "symbol": "BTC/USDT", "direction": "STRAT_SHORT", "amount": "0.00519", "entry_price": "63026.31", "tp_price": "62732.50", "sl_price": "63516.00", "exit_price": "62732.5", "pnl": "1.5248739", "status": "WIN", "variant": null, "confluence_votes": null, "p_up": null, "p_down": null, "adx": null, "rsi": null}, {"id": 2, "ts_open": "2026-06-11 13:25:07", "ts_close": "2026-06-11 13:35:03", "symbol": "BTC/USDT", "direction": "STRAT_SHORT", "amount": "0.00565", "entry_price": "62715.63", "tp_price": "62413.66", "sl_price": "63218.91", "exit_price": "63360.41", "pnl": "-3.6430070", "status": "LOSS", "variant": null, "confluence_votes": null, "p_up": null, "p_down": null, "adx": null, "rsi": null}, {"id": 3, "ts_open": "2026-06-11 13:50:06", "ts_close": "2026-06-11 14:25:03", "symbol": "BTC/USDT", "direction": "STRAT_SHORT", "amount": "0.00300", "entry_price": "62929.65", "tp_price": "62563.95", "sl_price": "63539.15", "exit_price": "62563.95", "pnl": "1.0971000", "status": "WIN", "variant": null, "confluence_votes": null, "p_up": null, "p_down": null, "adx": null, "rsi": null}, {"id": 4, "ts_open": "2026-06-11 14:25:09", "ts_close": "2026-06-11 14:45:03", "symbol": "BTC/USDT", "direction": "STRAT_SHORT", "amount": "0.00516", "entry_price": "62820.03", "tp_price": "62341.68", "sl_price": "63617.27", "exit_price": "63646.43", "pnl": "-4.2642240", "status": "LOSS", "variant": null, "confluence_votes": null, "p_up": null, "p_down": null, "adx": null, "rsi": null}], "events": [{"ts": "2026-06-10 15:34:56", "level": "INFO", "msg": "supervisor boot: symbols=BTC/USDT, ADA/USDT drawdown_limit=3.00%"}, {"ts": "2026-06-10 18:40:10", "level": "CRITICAL", "msg": "BTC/USDT: bracket placement failed after a FILLED entry — emergency flatten engaged"}, {"ts": "2026-06-10 18:40:11", "level": "INFO", "msg": "BTC/USDT: routing outcome ABORT_BRACKET_FAILED — bracket legs failed post-fill — position flattened"}, {"ts": "2026-06-10 18:45:09", "level": "CRITICAL", "msg": "BTC/USDT: bracket placement failed after a FILLED entry — emergency flatten engaged"}, {"ts": "2026-06-10 19:05:09", "level": "CRITICAL", "msg": "BTC/USDT: bracket placement failed after a FILLED entry — emergency flatten engaged"}, {"ts": "2026-06-10 19:15:08", "level": "CRITICAL", "msg": "BTC/USDT: bracket placement failed after a FILLED entry — emergency flatten engaged"}, {"ts": "2026-06-10 22:55:09", "level": "INFO", "msg": "BTC/USDT: routing outcome BLOCKED_EXCHANGE_TRUTH — exchange truth shows active exposure or is unverifiable"}, {"ts": "2026-06-11 11:43:32", "level": "INFO", "msg": "supervisor boot: symbols=BTC/USDT, ADA/USDT drawdown_limit=3.00%"}, {"ts": "2026-06-11 12:20:41", "level": "CRITICAL", "msg": "BOOT REFUSED: bot.lock already exists — another instance appears to be running"}, {"ts": "2026-06-11 12:58:08", "level": "INFO", "msg": "supervisor boot: symbols=BTC/USDT, ADA/USDT drawdown_limit=3.00%"}, {"ts": "2026-06-11 13:05:07", "level": "WARNING", "msg": "BTC/USDT: slippage abort — trigger=63050.75 market=63084.325 deviation 0.053% > 0.05%"}, {"ts": "2026-06-11 13:10:15", "level": "INFO", "msg": "BTC/USDT: bracket live — STRAT_SHORT 0.00519 @ 63026.31 | TP 62732.50 | SL 63516.00"}, {"ts": "2026-06-11 13:25:03", "level": "INFO", "msg": "BTC/USDT: trade #1 closed WIN — entry 63026.31 exit 62732.5 pnl 1.5248739 USDT"}, {"ts": "2026-06-11 13:25:07", "level": "INFO", "msg": "BTC/USDT: bracket live — STRAT_SHORT 0.00565 @ 62715.63 | TP 62413.66 | SL 63218.91"}, {"ts": "2026-06-11 13:35:03", "level": "INFO", "msg": "BTC/USDT: trade #2 closed LOSS — entry 62715.63 exit 63360.41 pnl -3.6430070 USDT"}, {"ts": "2026-06-11 13:50:06", "level": "INFO", "msg": "BTC/USDT: bracket live — STRAT_SHORT 0.00300 @ 62929.65 | TP 62563.95 | SL 63539.15"}, {"ts": "2026-06-11 14:25:03", "level": "INFO", "msg": "BTC/USDT: trade #3 closed WIN — entry 62929.65 exit 62563.95 pnl 1.0971000 USDT"}, {"ts": "2026-06-11 14:25:09", "level": "INFO", "msg": "BTC/USDT: bracket live — STRAT_SHORT 0.00516 @ 62820.03 | TP 62341.68 | SL 63617.27"}, {"ts": "2026-06-11 14:45:03", "level": "INFO", "msg": "BTC/USDT: trade #4 closed LOSS — entry 62820.03 exit 63646.43 pnl -4.2642240 USDT"}, {"ts": "2026-06-11 14:45:08", "level": "INFO", "msg": "BTC/USDT: routing outcome ABORT_MIN_SIZE — quantized size below venue minimum (old Kelly sizing — fixed by harvester mode)"}, {"ts": "2026-06-11 16:10:07", "level": "INFO", "msg": "BTC/USDT: routing outcome ABORT_MIN_SIZE — quantized size below venue minimum (old Kelly sizing — fixed by harvester mode)"}], "error": "", "folder": "", "ts": "2026-06-11 17:29:36 UTC"}/*DATA_END*/;
+
+const ALL = PAYLOAD.trades || [];
+let cumChart = null, barChart = null, grid = null;
+
+function n(x) { const v = parseFloat(x); return isNaN(v) ? null : v; }
+function fmt(x, d) { const v = n(x); return v === null ? '—' : v.toLocaleString('en-US', {maximumFractionDigits: d ?? 2}); }
+
+document.getElementById('meta').textContent =
+  `${ALL.length} trades · data as of ${PAYLOAD.ts} · source: ${PAYLOAD.source === 'db' ? 'journal.db' : 'bot.log'} · auto-refreshes hourly`;
+
+if (PAYLOAD.source === 'log') {
+  const b = document.getElementById('banner');
+  b.style.display = 'block';
+  b.textContent = 'This snapshot was parsed from bot.log (journal.db was mid-write during refresh) — variant, votes and model-confidence columns are unavailable. They return on the next clean refresh.';
+}
+
+document.getElementById('btnRefresh').onclick = async function () {
+  const btn = this;
+  btn.disabled = true; btn.textContent = 'Refreshing…';
+  try {
+    await window.cowork.runScheduledTask('refresh-trades-dashboard');
+    btn.textContent = 'Refresh started — reopen this page in ~1 min';
+  } catch (e) {
+    btn.textContent = 'Refresh failed — try again';
+    btn.disabled = false;
+  }
+};
+
+function buildFilters() {
+  const vSel = document.getElementById('fVariant'), sSel = document.getElementById('fSymbol');
+  const variants = [...new Set(ALL.map(t => t.variant).filter(Boolean))];
+  const symbols  = [...new Set(ALL.map(t => t.symbol).filter(Boolean))];
+  vSel.innerHTML = '<option value="">All</option>' + variants.map(v => `<option>${v}</option>`).join('');
+  sSel.innerHTML = '<option value="">All</option>' + symbols.map(s => `<option>${s}</option>`).join('');
+  const saved = JSON.parse(localStorage.getItem('kronos_dash_filters') || '{}');
+  if (saved.variant && variants.includes(saved.variant)) vSel.value = saved.variant;
+  if (saved.symbol && symbols.includes(saved.symbol)) sSel.value = saved.symbol;
+  if (saved.status) document.getElementById('fStatus').value = saved.status;
+  for (const id of ['fVariant','fStatus','fSymbol']) document.getElementById(id).onchange = () => {
+    localStorage.setItem('kronos_dash_filters', JSON.stringify({
+      variant: vSel.value, status: document.getElementById('fStatus').value, symbol: sSel.value }));
+    render();
+  };
+}
+
+function filtered() {
+  const v = document.getElementById('fVariant').value,
+        s = document.getElementById('fStatus').value,
+        y = document.getElementById('fSymbol').value;
+  return ALL.filter(t => (!v || t.variant === v) && (!s || t.status === s) && (!y || t.symbol === y));
+}
+
+function render() {
+  const T = filtered();
+  const decided = T.filter(t => t.status === 'WIN' || t.status === 'LOSS');
+  const wins = decided.filter(t => t.status === 'WIN').length;
+  const open = T.filter(t => t.status === 'OPEN').length;
+  const pnl = decided.reduce((a, t) => a + (n(t.pnl) || 0), 0);
+  const losses = decided.length - wins;
+  const avgW = wins ? decided.filter(t=>t.status==='WIN').reduce((a,t)=>a+(n(t.pnl)||0),0)/wins : 0;
+  const avgL = losses ? decided.filter(t=>t.status==='LOSS').reduce((a,t)=>a+(n(t.pnl)||0),0)/losses : 0;
+
+  document.getElementById('cards').innerHTML = [
+    ['Trades', T.length, 'neutral'],
+    ['Open', open, 'neutral'],
+    ['Wins / Losses', wins + ' / ' + losses, 'neutral'],
+    ['Win rate', decided.length ? Math.round(100*wins/decided.length) + '%' : '—', 'neutral'],
+    ['Total PnL', fmt(pnl, 2) + ' $', pnl >= 0 ? 'pos' : 'neg'],
+    ['Avg win', fmt(avgW, 2) + ' $', 'pos'],
+    ['Avg loss', fmt(avgL, 2) + ' $', 'neg'],
+  ].map(c => `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
+
+  const dec = decided.slice().sort((a,b) => a.id - b.id);
+  let run = 0;
+  const cum = dec.map(t => { run += n(t.pnl) || 0; return +run.toFixed(4); });
+  const labels = dec.map(t => '#' + t.id);
+
+  if (cumChart) cumChart.destroy();
+  cumChart = new Chart(document.getElementById('cumChart'), {
+    type: 'line',
+    data: { labels, datasets: [{ data: cum, borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,.08)', fill: true, tension: .25, pointRadius: 2 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { y: { grid: { color: '#eef2f7' } }, x: { grid: { display: false } } } }
+  });
+
+  if (barChart) barChart.destroy();
+  barChart = new Chart(document.getElementById('barChart'), {
+    type: 'bar',
+    data: { labels, datasets: [{ data: dec.map(t => n(t.pnl)), backgroundColor: dec.map(t => (n(t.pnl)||0) >= 0 ? '#16a34a' : '#dc2626') }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { y: { grid: { color: '#eef2f7' } }, x: { grid: { display: false } } } }
+  });
+
+  const rows = T.slice().sort((a,b) => b.id - a.id).map(t => [
+    t.id,
+    (t.ts_open || '').replace('T', ' ').slice(0, 16),
+    t.symbol,
+    t.direction ? t.direction.replace('STRAT_', '') : '?',
+    fmt(t.amount, 6),
+    fmt(t.entry_price, 2),
+    fmt(t.tp_price, 2),
+    fmt(t.sl_price, 2),
+    fmt(t.exit_price, 2),
+    t.pnl === null || t.pnl === undefined ? null : n(t.pnl),
+    t.status,
+    t.variant || '—',
+    t.confluence_votes ?? '—',
+    t.direction === 'STRAT_LONG' ? (t.p_up !== null && t.p_up !== undefined ? fmt(t.p_up, 2) : '—')
+                                 : (t.p_down !== null && t.p_down !== undefined ? fmt(t.p_down, 2) : '—'),
+  ]);
+
+  if (grid) { grid.updateConfig({ data: rows }).forceRender(); return; }
+  grid = new gridjs.Grid({
+    columns: [
+      { name: '#', width: '52px' }, { name: 'Opened', width: '128px' }, 'Symbol',
+      { name: 'Side', formatter: c => gridjs.html(`<span class="${c==='LONG'?'long':'short'}">${c}</span>`) },
+      'Amount', 'Entry', 'TP', 'SL', 'Exit',
+      { name: 'PnL $', formatter: c => c === null ? '—' :
+          gridjs.html(`<span class="${c >= 0 ? 'long' : 'short'}">${c.toFixed(3)}</span>`) },
+      { name: 'Status', formatter: c => gridjs.html(`<span class="pill ${c}">${c}</span>`) },
+      'Variant', { name: 'Votes', width: '64px' }, { name: 'Model p', width: '76px' },
+    ],
+    data: rows, sort: true, search: true,
+    pagination: { limit: 25 },
+    style: { th: { 'background': '#f8fafc' } },
+  }).render(document.getElementById('grid'));
+}
+
+function renderLive() {
+  const open = ALL.filter(t => t.status === 'OPEN');
+  const box = document.getElementById('livebox');
+  if (!open.length) {
+    box.innerHTML = '<div class="empty">No open positions in this snapshot — next entry comes on a 5-minute bar close with a signal.</div>';
+    return;
+  }
+  box.innerHTML = '<table class="livetable"><tr><th>#</th><th>Symbol</th><th>Side</th><th>Amount</th><th>Entry</th><th>TP target</th><th>SL stop</th><th>Opened</th></tr>' +
+    open.map(t => `<tr><td>${t.id}</td><td>${t.symbol}</td>` +
+      `<td><span class="${t.direction === 'STRAT_LONG' ? 'long' : 'short'}">${(t.direction || '?').replace('STRAT_', '')}</span></td>` +
+      `<td>${fmt(t.amount, 6)}</td><td>${fmt(t.entry_price, 4)}</td><td>${fmt(t.tp_price, 4)}</td><td>${fmt(t.sl_price, 4)}</td>` +
+      `<td>${(t.ts_open || '—').slice(5, 16)}</td></tr>`).join('') + '</table>';
+}
+
+function evClass(msg) {
+  if (/ABORT_BRACKET|EMERGENCY|REFUSED|placement failed|insufficient|closed LOSS|FLATTEN FAILED/i.test(msg)) return 'ev-bad';
+  if (/closed WIN|bracket live|journaled/i.test(msg)) return 'ev-good';
+  if (/veto|slippage|ABORT_|BLOCKED_/i.test(msg)) return 'ev-warn';
+  return 'ev-info';
+}
+
+function renderFeed() {
+  const feed = document.getElementById('feed');
+  const evs = (PAYLOAD.events || []).slice().reverse();
+  feed.innerHTML = evs.length
+    ? evs.map(e => `<div class="${evClass(e.msg)}" title="${e.msg.replace(/"/g, '&quot;')}">${e.ts.slice(5)} · ${e.msg}</div>`).join('')
+    : '<div class="empty">No activity captured yet.</div>';
+}
+
+buildFilters();
+render();
+renderLive();
+renderFeed();
+</script>
+</body>
+</html>
