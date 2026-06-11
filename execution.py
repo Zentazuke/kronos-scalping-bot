@@ -935,10 +935,10 @@ class ExecutionRouter:
             )
             legs: Dict[str, Any] = {
                 "aboveType": "LIMIT_MAKER",
-                "abovePrice": float(tp_price),
+                "abovePrice": f"{tp_price:f}",
                 "belowType": "STOP_LOSS_LIMIT",
-                "belowStopPrice": float(sl_price),
-                "belowPrice": float(sl_limit),
+                "belowStopPrice": f"{sl_price:f}",
+                "belowPrice": f"{sl_limit:f}",
                 "belowTimeInForce": "GTC",
             }
         else:
@@ -948,16 +948,21 @@ class ExecutionRouter:
             )
             legs = {
                 "belowType": "LIMIT_MAKER",
-                "belowPrice": float(tp_price),
+                "belowPrice": f"{tp_price:f}",
                 "aboveType": "STOP_LOSS_LIMIT",
-                "aboveStopPrice": float(sl_price),
-                "abovePrice": float(sl_limit),
+                "aboveStopPrice": f"{sl_price:f}",
+                "abovePrice": f"{sl_limit:f}",
                 "aboveTimeInForce": "GTC",
             }
+        # Fixed-point strings, never floats: Python renders small floats in
+        # scientific notation ("9e-05"), which Binance rejects with -1100
+        # "Illegal characters found in parameter 'quantity'". Decimal's "f"
+        # format always emits plain digits, and every value here is already
+        # quantized to the venue's step grid.
         request: Dict[str, Any] = {
             "symbol": market.get("id") or symbol.replace("/", ""),
             "side": exit_side.upper(),
-            "quantity": float(amount),
+            "quantity": f"{amount:f}",
             **legs,
         }
         response: Dict[str, Any] = await self._exchange.privatePostOrderListOco(request)
@@ -1617,6 +1622,28 @@ class ExecutionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(router.state(_SYMBOL), AssetState.IDLE)
 
     # -- spot venue routing -------------------------------------------------- #
+
+    async def test_oco_request_uses_fixed_point_strings(self) -> None:
+        """Tiny quantities must never serialize as scientific notation.
+
+        Binance rejects "9e-05" with -1100 Illegal characters — the exact
+        failure observed live on 2026-06-11 with venue-minimum BTC sizes.
+        """
+        exchange = _FakeSpotExchange(mid_price=self.mid)
+        router = _router(exchange)
+        await router._place_spot_oco(
+            _SYMBOL,
+            "buy",  # closing a short
+            Decimal("9E-5"),
+            Decimal("297.10"),
+            Decimal("299.30"),
+        )
+        (request,) = exchange.oco_requests
+        self.assertEqual(request["quantity"], "0.00009")
+        for key in ("quantity", "belowPrice", "aboveStopPrice", "abovePrice"):
+            value = str(request[key])
+            self.assertNotIn("e", value.lower(), f"{key} -> {value}")
+            self.assertRegex(value, r"^[0-9]+(\.[0-9]+)?$")
 
     async def test_spot_bracket_rides_single_oco_list(self) -> None:
         exchange = _FakeSpotExchange(mid_price=self.mid)
