@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kronos Bot — Live Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/gridjs.umd.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/theme/mermaid.min.css">
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; font-family: "Segoe UI", system-ui, sans-serif; background: #f6f7f9; color: #1a202c; }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub { color: #64748b; font-size: 12px; margin-bottom: 14px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:baseline; }
+  .dot.ok { background:#16a34a; } .dot.bad { background:#dc2626; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
+  .card .k { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 20px; font-weight: 700; margin-top: 2px; }
+  .pos { color: #16a34a; } .neg { color: #dc2626; } .neutral { color: #1a202c; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+  @media (max-width: 760px) { .row { grid-template-columns: 1fr; } }
+  .panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; }
+  .panel h2 { font-size: 13px; margin: 0 0 8px; color: #334155; }
+  .chartbox { position: relative; height: 220px; }
+  .filters { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  select { padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 7px; background: #fff; font-size: 13px; }
+  .banner { padding: 8px 12px; border-radius: 8px; font-size: 12.5px; margin-bottom: 12px; display:none; }
+  .banner.warn { background: #fef3c7; border: 1px solid #f59e0b; color: #78350f; }
+  .gridjs-wrapper { border-radius: 8px; }
+  td.gridjs-td, th.gridjs-th { padding: 6px 9px; font-size: 12.5px; }
+  .pill { display:inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.WIN { background:#dcfce7; color:#15803d; } .pill.LOSS { background:#fee2e2; color:#b91c1c; }
+  .pill.OPEN { background:#dbeafe; color:#1d4ed8; } .pill.SCRATCH { background:#f1f5f9; color:#475569; }
+  .pill.UNKNOWN { background:#fef9c3; color:#854d0e; }
+  .long { color:#16a34a; font-weight:600; } .short { color:#dc2626; font-weight:600; }
+  .feed { max-height: 280px; overflow-y: auto; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11.5px; line-height: 1.55; }
+  .feed div { padding: 1px 5px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ev-bad  { color: #b91c1c; background: #fef2f2; }
+  .ev-warn { color: #92400e; }
+  .ev-good { color: #15803d; }
+  .ev-info { color: #64748b; }
+  .livetable { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .livetable th { text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; padding: 4px 8px; border-bottom: 1px solid #e2e8f0; }
+  .livetable td { padding: 5px 8px; border-bottom: 1px solid #f1f5f9; }
+  .empty { color: #94a3b8; font-size: 13px; padding: 14px 4px; }
+</style>
+</head>
+<body>
+<h1>Kronos Scalping Bot — Live</h1>
+<div class="sub" id="meta"><span class="dot ok" id="dot"></span>connecting…</div>
+<div class="banner warn" id="banner"></div>
+
+<div id="content">
+  <div class="filters">
+    <label style="font-size:12.5px;color:#475569">Variant
+      <select id="fVariant"><option value="">All</option></select>
+    </label>
+    <label style="font-size:12.5px;color:#475569">Status
+      <select id="fStatus"><option value="">All</option><option>OPEN</option><option>WIN</option><option>LOSS</option><option>SCRATCH</option><option>UNKNOWN</option></select>
+    </label>
+    <label style="font-size:12.5px;color:#475569">Symbol
+      <select id="fSymbol"><option value="">All</option></select>
+    </label>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="row">
+    <div class="panel"><h2>Live — open positions (waiting on TP or SL)</h2><div id="livebox"></div></div>
+    <div class="panel"><h2>Activity feed — what the bot is doing (newest first)</h2><div class="feed" id="feed"></div></div>
+  </div>
+
+  <div class="row">
+    <div class="panel"><h2>Cumulative PnL (USDT, decided trades)</h2><div class="chartbox"><canvas id="cumChart"></canvas></div></div>
+    <div class="panel"><h2>PnL per trade (USDT)</h2><div class="chartbox"><canvas id="barChart"></canvas></div></div>
+  </div>
+
+  <div class="panel">
+    <h2>All trades — entry, targets, exit</h2>
+    <div id="grid"></div>
+  </div>
+</div>
+
+<script>
+const POLL_MS = 10000;
+let PAYLOAD = { trades: [], events: [], ts: '' };
+let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '';
+
+function n(x) { const v = parseFloat(x); return isNaN(v) ? null : v; }
+function fmt(x, d) { const v = n(x); return v === null ? '—' : v.toLocaleString('en-US', {maximumFractionDigits: d ?? 2}); }
+
+async function poll() {
+  const dot = document.getElementById('dot');
+  try {
+    const res = await fetch('/data', { cache: 'no-store' });
+    PAYLOAD = await res.json();
+    ALL = PAYLOAD.trades || [];
+    dot.className = 'dot ok';
+    document.getElementById('meta').innerHTML =
+      `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · auto-refresh ${POLL_MS/1000}s`;
+    const b = document.getElementById('banner');
+    if (PAYLOAD.error) { b.style.display = 'block'; b.textContent = 'Journal read warning: ' + PAYLOAD.error; }
+    else b.style.display = 'none';
+    buildFilters();
+    render(); renderLive(); renderFeed();
+  } catch (e) {
+    dot.className = 'dot bad';
+    document.getElementById('meta').innerHTML =
+      `<span class="dot bad"></span>connection lost (${e.message}) — retrying every ${POLL_MS/1000}s. Is dashboard_server.py still running?`;
+  }
+}
+
+function buildFilters() {
+  const vSel = document.getElementById('fVariant'), sSel = document.getElementById('fSymbol');
+  const variants = [...new Set(ALL.map(t => t.variant).filter(Boolean))];
+  const symbols  = [...new Set(ALL.map(t => t.symbol).filter(Boolean))];
+  const sig = variants.join(',') + '|' + symbols.join(',');
+  if (sig === filterSig) return;  // options unchanged — keep user's selection
+  filterSig = sig;
+  vSel.innerHTML = '<option value="">All</option>' + variants.map(v => `<option>${v}</option>`).join('');
+  sSel.innerHTML = '<option value="">All</option>' + symbols.map(s => `<option>${s}</option>`).join('');
+  const saved = JSON.parse(localStorage.getItem('kronos_dash_filters') || '{}');
+  if (saved.variant && variants.includes(saved.variant)) vSel.value = saved.variant;
+  if (saved.symbol && symbols.includes(saved.symbol)) sSel.value = saved.symbol;
+  if (saved.status) document.getElementById('fStatus').value = saved.status;
+  for (const id of ['fVariant','fStatus','fSymbol']) document.getElementById(id).onchange = () => {
+    localStorage.setItem('kronos_dash_filters', JSON.stringify({
+      variant: vSel.value, status: document.getElementById('fStatus').value, symbol: sSel.value }));
+    render(); renderLive();
+  };
+}
+
+function filtered() {
+  const v = document.getElementById('fVariant').value,
+        s = document.getElementById('fStatus').value,
+        y = document.getElementById('fSymbol').value;
+  return ALL.filter(t => (!v || t.variant === v) && (!s || t.status === s) && (!y || t.symbol === y));
+}
+
+function render() {
+  const T = filtered();
+  const decided = T.filter(t => t.status === 'WIN' || t.status === 'LOSS');
+  const wins = decided.filter(t => t.status === 'WIN').length;
+  const open = T.filter(t => t.status === 'OPEN').length;
+  const pnl = decided.reduce((a, t) => a + (n(t.pnl) || 0), 0);
+  const losses = decided.length - wins;
+  const avgW = wins ? decided.filter(t=>t.status==='WIN').reduce((a,t)=>a+(n(t.pnl)||0),0)/wins : 0;
+  const avgL = losses ? decided.filter(t=>t.status==='LOSS').reduce((a,t)=>a+(n(t.pnl)||0),0)/losses : 0;
+
+  document.getElementById('cards').innerHTML = [
+    ['Trades', T.length, 'neutral'],
+    ['Open', open, 'neutral'],
+    ['Wins / Losses', wins + ' / ' + losses, 'neutral'],
+    ['Win rate', decided.length ? Math.round(100*wins/decided.length) + '%' : '—', 'neutral'],
+    ['Total PnL', fmt(pnl, 2) + ' $', pnl >= 0 ? 'pos' : 'neg'],
+    ['Avg win', fmt(avgW, 2) + ' $', 'pos'],
+    ['Avg loss', fmt(avgL, 2) + ' $', 'neg'],
+  ].map(c => `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
+
+  const dec = decided.slice().sort((a,b) => a.id - b.id);
+  let run = 0;
+  const cum = dec.map(t => { run += n(t.pnl) || 0; return +run.toFixed(4); });
+  const labels = dec.map(t => '#' + t.id);
+
+  if (cumChart) cumChart.destroy();
+  cumChart = new Chart(document.getElementById('cumChart'), {
+    type: 'line',
+    data: { labels, datasets: [{ data: cum, borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,.08)', fill: true, tension: .25, pointRadius: 2 }] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false } },
+      scales: { y: { grid: { color: '#eef2f7' } }, x: { grid: { display: false } } } }
+  });
+
+  if (barChart) barChart.destroy();
+  barChart = new Chart(document.getElementById('barChart'), {
+    type: 'bar',
+    data: { labels, datasets: [{ data: dec.map(t => n(t.pnl)), backgroundColor: dec.map(t => (n(t.pnl)||0) >= 0 ? '#16a34a' : '#dc2626') }] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false } },
+      scales: { y: { grid: { color: '#eef2f7' } }, x: { grid: { display: false } } } }
+  });
+
+  const rows = T.slice().sort((a,b) => b.id - a.id).map(t => [
+    t.id,
+    (t.ts_open || '').replace('T', ' ').slice(0, 16),
+    t.symbol,
+    t.direction ? t.direction.replace('STRAT_', '') : '?',
+    fmt(t.amount, 6),
+    fmt(t.entry_price, 4),
+    fmt(t.tp_price, 4),
+    fmt(t.sl_price, 4),
+    fmt(t.exit_price, 4),
+    t.pnl === null || t.pnl === undefined ? null : n(t.pnl),
+    t.status,
+    t.variant || '—',
+    t.confluence_votes ?? '—',
+    t.direction === 'STRAT_LONG' ? (t.p_up !== null && t.p_up !== undefined ? fmt(t.p_up, 2) : '—')
+                                 : (t.p_down !== null && t.p_down !== undefined ? fmt(t.p_down, 2) : '—'),
+  ]);
+
+  if (grid) { grid.updateConfig({ data: rows }).forceRender(); return; }
+  grid = new gridjs.Grid({
+    columns: [
+      { name: '#', width: '52px' }, { name: 'Opened', width: '128px' }, 'Symbol',
+      { name: 'Side', formatter: c => gridjs.html(`<span class="${c==='LONG'?'long':'short'}">${c}</span>`) },
+      'Amount', 'Entry', 'TP', 'SL', 'Exit',
+      { name: 'PnL $', formatter: c => c === null ? '—' :
+          gridjs.html(`<span class="${c >= 0 ? 'long' : 'short'}">${c.toFixed(3)}</span>`) },
+      { name: 'Status', formatter: c => gridjs.html(`<span class="pill ${c}">${c}</span>`) },
+      'Variant', { name: 'Votes', width: '64px' }, { name: 'Model p', width: '76px' },
+    ],
+    data: rows, sort: true, search: true,
+    pagination: { limit: 25 },
+    style: { th: { 'background': '#f8fafc' } },
+  }).render(document.getElementById('grid'));
+}
+
+function renderLive() {
+  const open = filtered().filter(t => t.status === 'OPEN');
+  const box = document.getElementById('livebox');
+  if (!open.length) {
+    box.innerHTML = '<div class="empty">No open positions right now — next entry comes on a 5-minute bar close with a signal.</div>';
+    return;
+  }
+  box.innerHTML = '<table class="livetable"><tr><th>#</th><th>Symbol</th><th>Side</th><th>Amount</th><th>Entry</th><th>TP target</th><th>SL stop</th><th>Opened</th></tr>' +
+    open.map(t => `<tr><td>${t.id}</td><td>${t.symbol}</td>` +
+      `<td><span class="${t.direction === 'STRAT_LONG' ? 'long' : 'short'}">${(t.direction || '?').replace('STRAT_', '')}</span></td>` +
+      `<td>${fmt(t.amount, 6)}</td><td>${fmt(t.entry_price, 4)}</td><td>${fmt(t.tp_price, 4)}</td><td>${fmt(t.sl_price, 4)}</td>` +
+      `<td>${(t.ts_open || '—').slice(5, 16)}</td></tr>`).join('') + '</table>';
+}
+
+function evClass(msg) {
+  if (/ABORT_BRACKET|EMERGENCY|REFUSED|placement failed|insufficient|closed LOSS|FLATTEN FAILED/i.test(msg)) return 'ev-bad';
+  if (/closed WIN|bracket live|journaled/i.test(msg)) return 'ev-good';
+  if (/veto|slippage|ABORT_|BLOCKED_/i.test(msg)) return 'ev-warn';
+  return 'ev-info';
+}
+
+function renderFeed() {
+  const feed = document.getElementById('feed');
+  const atTop = feed.scrollTop < 8;
+  const evs = (PAYLOAD.events || []).slice().reverse();
+  feed.innerHTML = evs.length
+    ? evs.map(e => `<div class="${evClass(e.msg)}" title="${(e.msg || '').replace(/"/g, '&quot;')}">${e.ts.slice(5)} · ${e.msg}</div>`).join('')
+    : '<div class="empty">No activity captured yet.</div>';
+  if (!atTop) feed.scrollTop = 0;
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
