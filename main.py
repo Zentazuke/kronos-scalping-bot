@@ -612,6 +612,11 @@ class TradingSupervisor:
 
         current: Decimal = await self._fetch_total_equity()
         drawdown: Decimal = (baseline - current) / baseline
+        # Equity heartbeat — parsed by the local/web dashboards. Keep the
+        # format stable: "EQUITY <current> baseline <baseline> <quote>".
+        logger.info(
+            "EQUITY %s baseline %s %s", current, baseline, self._quote_currency
+        )
         tripped: bool = drawdown >= self._drawdown_limit
         self._publish(
             EquityUpdate(

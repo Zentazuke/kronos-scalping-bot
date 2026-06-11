@@ -140,25 +140,61 @@ function filtered() {
   return ALL.filter(t => (!v || t.variant === v) && (!s || t.status === s) && (!y || t.symbol === y));
 }
 
+function notional(t) {
+  const e = n(t.entry_price), a = n(t.amount);
+  return e !== null && a !== null ? e * a : null;
+}
+function pnlPct(t) {
+  const p = n(t.pnl), nt = notional(t);
+  return p !== null && nt ? (p / nt) * 100 : null;
+}
+
 function render() {
   const T = filtered();
   const decided = T.filter(t => t.status === 'WIN' || t.status === 'LOSS');
-  const wins = decided.filter(t => t.status === 'WIN').length;
+  const winsArr = decided.filter(t => t.status === 'WIN');
+  const lossArr = decided.filter(t => t.status === 'LOSS');
+  const wins = winsArr.length, losses = lossArr.length;
   const open = T.filter(t => t.status === 'OPEN').length;
   const pnl = decided.reduce((a, t) => a + (n(t.pnl) || 0), 0);
-  const losses = decided.length - wins;
-  const avgW = wins ? decided.filter(t=>t.status==='WIN').reduce((a,t)=>a+(n(t.pnl)||0),0)/wins : 0;
-  const avgL = losses ? decided.filter(t=>t.status==='LOSS').reduce((a,t)=>a+(n(t.pnl)||0),0)/losses : 0;
+  const avgW = wins ? winsArr.reduce((a,t)=>a+(n(t.pnl)||0),0)/wins : 0;
+  const avgL = losses ? lossArr.reduce((a,t)=>a+(n(t.pnl)||0),0)/losses : 0;
+  const grossWon  = winsArr.reduce((a,t)=>a+(n(t.pnl)||0),0);
+  const grossLost = lossArr.reduce((a,t)=>a+(n(t.pnl)||0),0);
+  const deployed = T.filter(t => t.status === 'OPEN')
+                    .reduce((a,t)=>a+(notional(t)||0),0);
+  const volume = T.reduce((a,t)=>a+(notional(t)||0),0);
+  const wPcts = winsArr.map(pnlPct).filter(v => v !== null);
+  const lPcts = lossArr.map(pnlPct).filter(v => v !== null);
+  const avgWPct = wPcts.length ? wPcts.reduce((a,b)=>a+b,0)/wPcts.length : null;
+  const avgLPct = lPcts.length ? lPcts.reduce((a,b)=>a+b,0)/lPcts.length : null;
+
+  // Wallet cards come from the bot's EQUITY heartbeat in bot.log.
+  const eq = PAYLOAD.equity;
+  const eqV = eq ? n(eq.equity) : null, bsV = eq ? n(eq.baseline) : null;
+  const sessD = eqV !== null && bsV !== null ? eqV - bsV : null;
+  const sessP = sessD !== null && bsV ? (sessD / bsV) * 100 : null;
 
   document.getElementById('cards').innerHTML = [
-    ['Trades', T.length, 'neutral'],
-    ['Open', open, 'neutral'],
-    ['Wins / Losses', wins + ' / ' + losses, 'neutral'],
-    ['Win rate', decided.length ? Math.round(100*wins/decided.length) + '%' : '—', 'neutral'],
-    ['Total PnL', fmt(pnl, 2) + ' $', pnl >= 0 ? 'pos' : 'neg'],
-    ['Avg win', fmt(avgW, 2) + ' $', 'pos'],
-    ['Avg loss', fmt(avgL, 2) + ' $', 'neg'],
-  ].map(c => `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
+    ['Wallet equity', eqV !== null ? fmt(eqV, 2) + ' $' : 'waiting…', 'neutral',
+      eq ? 'as of ' + eq.ts.slice(11) : 'restart bot to enable heartbeat'],
+    ['Daily baseline', bsV !== null ? fmt(bsV, 2) + ' $' : '—', 'neutral',
+      'snapshot at 00:00 UTC / boot'],
+    ['Today vs baseline', sessD !== null
+        ? `${sessD >= 0 ? '+' : ''}${fmt(sessD, 2)} $ (${sessP >= 0 ? '+' : ''}${fmt(sessP, 3)}%)` : '—',
+      sessD === null ? 'neutral' : (sessD >= 0 ? 'pos' : 'neg'), 'wallet move incl. open positions'],
+    ['Deployed now', fmt(deployed, 2) + ' $', 'neutral', open + ' open position' + (open === 1 ? '' : 's')],
+    ['Total traded', fmt(volume, 2) + ' $', 'neutral', T.length + ' entries (notional)'],
+    ['Realized PnL', fmt(pnl, 2) + ' $', pnl >= 0 ? 'pos' : 'neg', 'decided trades only'],
+    ['Won / Lost', `+${fmt(grossWon, 2)} / ${fmt(grossLost, 2)} $`, 'neutral', wins + 'W · ' + losses + 'L'],
+    ['Win rate', decided.length ? Math.round(100*wins/decided.length) + '%' : '—', 'neutral',
+      decided.length + ' decided'],
+    ['Avg win', `${fmt(avgW, 2)} $` + (avgWPct !== null ? ` (+${fmt(avgWPct, 2)}%)` : ''), 'pos',
+      'per winning trade'],
+    ['Avg loss', `${fmt(avgL, 2)} $` + (avgLPct !== null ? ` (${fmt(avgLPct, 2)}%)` : ''), 'neg',
+      'per losing trade'],
+  ].map(c => `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div>` +
+       `<div class="k" style="text-transform:none;margin-top:2px">${c[3]}</div></div>`).join('');
 
   const dec = decided.slice().sort((a,b) => a.id - b.id);
   let run = 0;
@@ -187,11 +223,13 @@ function render() {
     t.symbol,
     t.direction ? t.direction.replace('STRAT_', '') : '?',
     fmt(t.amount, 6),
+    notional(t) === null ? '—' : fmt(notional(t), 2),
     fmt(t.entry_price, 4),
     fmt(t.tp_price, 4),
     fmt(t.sl_price, 4),
     fmt(t.exit_price, 4),
     t.pnl === null || t.pnl === undefined ? null : n(t.pnl),
+    pnlPct(t),
     t.status,
     t.variant || '—',
     t.confluence_votes ?? '—',
@@ -204,9 +242,11 @@ function render() {
     columns: [
       { name: '#', width: '52px' }, { name: 'Opened', width: '128px' }, 'Symbol',
       { name: 'Side', formatter: c => gridjs.html(`<span class="${c==='LONG'?'long':'short'}">${c}</span>`) },
-      'Amount', 'Entry', 'TP', 'SL', 'Exit',
+      'Amount', { name: 'Size $', width: '76px' }, 'Entry', 'TP', 'SL', 'Exit',
       { name: 'PnL $', formatter: c => c === null ? '—' :
           gridjs.html(`<span class="${c >= 0 ? 'long' : 'short'}">${c.toFixed(3)}</span>`) },
+      { name: 'PnL %', width: '78px', formatter: c => c === null ? '—' :
+          gridjs.html(`<span class="${c >= 0 ? 'long' : 'short'}">${c >= 0 ? '+' : ''}${c.toFixed(2)}%</span>`) },
       { name: 'Status', formatter: c => gridjs.html(`<span class="pill ${c}">${c}</span>`) },
       'Variant', { name: 'Votes', width: '64px' }, { name: 'Model p', width: '76px' },
     ],

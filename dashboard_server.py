@@ -75,11 +75,31 @@ def _events() -> List[Dict[str, str]]:
     return events[-150:]
 
 
+_EQUITY = re.compile(
+    r"^([\d-]+ [\d:]+),\d+ .*EQUITY ([\d.]+) baseline ([\d.]+)", re.M
+)
+
+
+def _equity() -> Dict[str, str] | None:
+    """Latest equity heartbeat from bot.log (None until the bot logs one)."""
+    if not LOG_PATH.exists():
+        return None
+    with LOG_PATH.open("rb") as fh:
+        fh.seek(max(0, LOG_PATH.stat().st_size - LOG_TAIL_BYTES))
+        text = fh.read().decode("utf-8", errors="replace")
+    matches = _EQUITY.findall(text)
+    if not matches:
+        return None
+    ts, equity, baseline = matches[-1]
+    return {"ts": ts, "equity": equity, "baseline": baseline}
+
+
 def _payload() -> bytes:
     out: Dict[str, Any] = {
         "source": "db",
         "trades": [],
         "events": [],
+        "equity": None,
         "error": "",
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -92,6 +112,7 @@ def _payload() -> bytes:
             time.sleep(0.3)
     try:
         out["events"] = _events()
+        out["equity"] = _equity()
     except OSError as exc:
         out["error"] += f" | log: {exc}"
     return json.dumps(out, default=str).encode("utf-8")

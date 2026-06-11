@@ -7,8 +7,8 @@ events are notable bot.log lines (brackets, closes, aborts, vetoes, boots).
 import glob, json, os, re, shutil, sqlite3, time
 
 folder_list = glob.glob('/sessions/*/mnt/Trading Bot')
-out = {'source': None, 'trades': [], 'events': [], 'error': '',
-       'ts': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
+out = {'source': None, 'trades': [], 'events': [], 'equity': None,
+       'error': '', 'ts': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
 
 def from_db(folder):
     src = os.path.join(folder, 'journal.db')
@@ -75,6 +75,11 @@ if folder_list:
         log_txt = ''
         out['error'] += 'log read: %s' % e
     out['events'] = events_from_log(log_txt)
+    eq = re.findall(r'^([\d-]+ [\d:]+),\d+ .*EQUITY ([\d.]+) baseline ([\d.]+)',
+                    log_txt, re.M)
+    if eq:
+        out['equity'] = {'ts': eq[-1][0], 'equity': eq[-1][1],
+                         'baseline': eq[-1][2]}
     for attempt in range(3):
         try:
             out['trades'] = from_db(folder); out['source'] = 'db'; break
