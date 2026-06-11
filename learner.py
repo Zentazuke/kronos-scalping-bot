@@ -268,22 +268,42 @@ def train_model(
     )
 
 
-def train_from_journal(db_path: Path, model_path: Path) -> Optional[TrainingMetrics]:
-    """CLI worker: decided trades -> features/labels -> trained model file."""
-    journal: TradeJournal = TradeJournal(db_path)
-    try:
-        decided: List[TradeRecord] = [
-            t
-            for t in journal.closed_trades()
-            if t.status in (STATUS_WIN, STATUS_LOSS)
-        ]
-    finally:
-        journal.close()
+def train_from_journal(
+    db_paths: "Path | Sequence[Path]", model_path: Path
+) -> Optional[TrainingMetrics]:
+    """CLI worker: decided trades -> features/labels -> trained model file.
+
+    Accepts one journal or several. Pooling across data-farm variants is
+    deliberate and CORRECT here: the meta-labeler estimates
+    P(win | setup features), and the harvester's unfiltered setups remove
+    exactly the selection bias that a single enforced journal suffers from.
+    (Kelly replay, by contrast, must never pool — that stays variant-scoped
+    in journal.py.)
+    """
+    paths: List[Path] = (
+        [db_paths] if isinstance(db_paths, Path) else [Path(p) for p in db_paths]
+    )
+    decided: List[TradeRecord] = []
+    for db_path in paths:
+        if not db_path.exists():
+            logger.warning("journal %s does not exist — skipped", db_path)
+            continue
+        journal: TradeJournal = TradeJournal(db_path)
+        try:
+            found: List[TradeRecord] = [
+                t
+                for t in journal.closed_trades()
+                if t.status in (STATUS_WIN, STATUS_LOSS)
+            ]
+        finally:
+            journal.close()
+        logger.info("%s: %d decided trades", db_path, len(found))
+        decided.extend(found)
 
     if len(decided) < META_MIN_SAMPLES:
         logger.warning(
             "refusing to train: %d decided trades < %d required — "
-            "keep the bot journaling",
+            "keep the bot(s) journaling",
             len(decided),
             META_MIN_SAMPLES,
         )
@@ -371,12 +391,19 @@ class MetaFilter:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train the meta-label filter")
     parser.add_argument("command", choices=["train"])
-    parser.add_argument("--db", default="journal.db")
+    parser.add_argument(
+        "--db",
+        action="append",
+        default=None,
+        help="journal database; repeat to pool across data-farm variants "
+        "(e.g. --db prod/journal.db --db harvester/journal.db)",
+    )
     parser.add_argument("--out", default="meta_model.json")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
+    db_args: List[str] = args.db if args.db else ["journal.db"]
     metrics: Optional[TrainingMetrics] = train_from_journal(
-        Path(args.db), Path(args.out)
+        [Path(p) for p in db_args], Path(args.out)
     )
     return 0 if metrics is not None else 1
 
@@ -407,7 +434,87 @@ def _synthetic_dataset(n: int = 240) -> Tuple[List[List[float]], List[float]]:
     return features, labels
 
 
+def _seed_journal(db: Path, variant: str, n_decided: int) -> None:
+    """Populate a journal with n_decided WIN/LOSS trades carrying features."""
+    from execution import ExecutionResult, ExecutionStatus
+    from predictor import SignalDirection
+
+    journal = TradeJournal(db, variant=variant)
+    try:
+        for i in range(n_decided):
+            winning: bool = i % 2 == 0
+            result = ExecutionResult(
+                status=ExecutionStatus.EXECUTED,
+                symbol="BTC/USDT",
+                direction=SignalDirection.LONG,
+                reason="seed",
+                executed_amount=Decimal("0.01"),
+                entry_fill_price=Decimal("64000"),
+                take_profit_price=Decimal("64100"),
+                stop_loss_price=Decimal("63800"),
+                take_profit_order_id=f"tp-{variant}-{i}",
+                stop_loss_order_id=f"sl-{variant}-{i}",
+            )
+            trade_id: int = journal.open_trade(
+                result,
+                adx=Decimal("32" if winning else "26"),
+                atr=Decimal("2"),
+                atr_sma=Decimal("2"),
+                rsi=Decimal("55" if winning else "67"),
+                plus_di=Decimal("30" if winning else "22"),
+                minus_di=Decimal("12" if winning else "20"),
+                book_imbalance=Decimal("0.62" if winning else "0.48"),
+                p_up=Decimal("0.62" if winning else "0.54"),
+                p_down=Decimal("0.30"),
+                confluence_votes=3 if winning else 1,
+            )
+            journal.close_trade(
+                trade_id,
+                status=STATUS_WIN if winning else STATUS_LOSS,
+                exit_price=Decimal("64100" if winning else "63800"),
+                pnl=Decimal("1" if winning else "-2"),
+            )
+    finally:
+        journal.close()
+
+
 class LearnerTests(unittest.TestCase):
+    def test_pooled_training_across_variant_journals(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            # Each journal alone is below META_MIN_SAMPLES; pooled they pass.
+            half: int = META_MIN_SAMPLES // 2 + 10
+            _seed_journal(base / "prod.db", "prod", half)
+            _seed_journal(base / "harvester.db", "harvester", half)
+            out: Path = base / "model.json"
+            # Single journal: refused.
+            self.assertIsNone(train_from_journal(base / "prod.db", out))
+            self.assertFalse(out.exists())
+            # Pooled: trains.
+            metrics = train_from_journal(
+                [base / "prod.db", base / "harvester.db"], out
+            )
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertEqual(
+                metrics.n_train + metrics.n_holdout, half * 2
+            )
+            self.assertTrue(out.exists())
+
+    def test_missing_journal_is_skipped_not_fatal(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            _seed_journal(base / "prod.db", "prod", META_MIN_SAMPLES + 20)
+            out: Path = base / "model.json"
+            metrics = train_from_journal(
+                [base / "prod.db", base / "missing.db"], out
+            )
+            self.assertIsNotNone(metrics)
+
     def test_learns_separable_outcomes(self) -> None:
         features, labels = _synthetic_dataset()
         model, metrics = train_model(features, labels)

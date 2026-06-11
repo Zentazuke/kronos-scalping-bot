@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import unittest
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
@@ -239,11 +240,43 @@ class ExecutionRouter:
         stop_loss_atr_mult: Decimal = STOP_LOSS_ATR_MULT,
         take_profit_atr_mult: Decimal = TAKE_PROFIT_ATR_MULT,
         order_timeout_s: float = ORDER_TIMEOUT_S,
+        fixed_trade_notional: Optional[Decimal] = None,
     ) -> None:
         self._verify_sandbox(exchange, require_sandbox)
         self._exchange: Any = exchange
         self._gatekeeper: MarketGatekeeper = gatekeeper or MarketGatekeeper()
         self._tracker: PerformanceTracker = tracker or PerformanceTracker()
+
+        # Fixed-notional sizing (data-farm harvester). When set — by argument
+        # or FIXED_TRADE_NOTIONAL in the environment — every trade requests
+        # exactly this much quote currency instead of Kelly × equity. The
+        # liquidity cap, quantization, and venue-minimum sieves still apply;
+        # only the capital-allocation arithmetic is replaced.
+        if fixed_trade_notional is None:
+            env_notional: str = os.getenv("FIXED_TRADE_NOTIONAL", "").strip()
+            if env_notional:
+                try:
+                    fixed_trade_notional = Decimal(env_notional)
+                except ArithmeticError as exc:
+                    raise RuntimeError(
+                        "BOOT REFUSED: FIXED_TRADE_NOTIONAL is not a valid "
+                        f"decimal: {env_notional!r}"
+                    ) from exc
+        if fixed_trade_notional is not None and (
+            not fixed_trade_notional.is_finite() or fixed_trade_notional <= _ZERO
+        ):
+            raise RuntimeError(
+                "BOOT REFUSED: FIXED_TRADE_NOTIONAL must be a positive finite "
+                f"number, found {fixed_trade_notional}"
+            )
+        self._fixed_notional: Optional[Decimal] = fixed_trade_notional
+        if self._fixed_notional is not None:
+            logger.warning(
+                "FIXED_TRADE_NOTIONAL=%s — Kelly sizing bypassed, every "
+                "trade requests a fixed %s quote notional (harvester mode)",
+                self._fixed_notional,
+                self._fixed_notional,
+            )
         self._slippage_limit: Decimal = slippage_limit
         self._liquidity_tiers: int = liquidity_tiers
         self._liquidity_cap_fraction: Decimal = liquidity_cap_fraction
@@ -537,9 +570,15 @@ class ExecutionRouter:
         atr: Decimal = report.atr
         atr_sma: Decimal = report.atr_sma
 
-        equity: Decimal = await self._fetch_quote_equity(symbol)
-        fraction: Decimal = self._allocation_fraction(atr, atr_sma)
-        requested_amount: Decimal = (equity * fraction) / market_price
+        requested_amount: Decimal
+        if self._fixed_notional is not None:
+            # Harvester mode: constant tiny notional, no Kelly, no equity
+            # read — sizing must not depend on the variant's own record.
+            requested_amount = self._fixed_notional / market_price
+        else:
+            equity: Decimal = await self._fetch_quote_equity(symbol)
+            fraction: Decimal = self._allocation_fraction(atr, atr_sma)
+            requested_amount = (equity * fraction) / market_price
 
         # -- Sieve 3: liquidity -------------------------------------------- #
         resting_depth: Decimal = self._top_tier_depth(l2_order_book, direction)
@@ -1115,6 +1154,62 @@ class ExecutionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             router._volatility_modifier(Decimal("4"), Decimal("2")), Decimal("0.5")
         )
+
+    # -- fixed-notional (harvester) sizing -------------------------------- #
+
+    async def test_fixed_notional_bypasses_kelly_and_equity(self) -> None:
+        exchange = _FakeExchange(mid_price=self.mid)
+        # A deliberately terrible tracker: Kelly would allocate zero.
+        tracker = PerformanceTracker()
+        for _ in range(50):
+            tracker.record_trade(Decimal("-1"))
+        router = ExecutionRouter(
+            exchange,
+            tracker=tracker,
+            fixed_trade_notional=self.trigger,  # exactly 1.0 base unit worth
+        )
+        deep = _book(self.mid, ask_sizes=(100, 100, 100), bid_sizes=(100, 100, 100))
+        result = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, deep, self.trigger
+        )
+        self.assertEqual(result.status, ExecutionStatus.EXECUTED)
+        # notional/price = 1.0 — routed despite the zero-Kelly record.
+        self.assertEqual(result.executed_amount, Decimal("1.000"))
+
+    async def test_fixed_notional_still_obeys_liquidity_cap(self) -> None:
+        exchange = _FakeExchange(mid_price=self.mid)
+        router = ExecutionRouter(
+            exchange, fixed_trade_notional=self.trigger * Decimal("10")
+        )
+        shallow = _book(
+            self.mid, ask_sizes=(0.4, 0.3, 0.3, 99.0), bid_sizes=(50, 50, 50)
+        )
+        result = await router.route_trade(
+            _SYMBOL, SignalDirection.LONG, self.frame, shallow, self.trigger
+        )
+        self.assertEqual(result.status, ExecutionStatus.EXECUTED)
+        # requested 10 base units, but 5% of top-3 depth (1.0) caps it.
+        self.assertEqual(result.executed_amount, Decimal("0.050"))
+
+    def test_fixed_notional_env_is_honoured_and_validated(self) -> None:
+        os.environ["FIXED_TRADE_NOTIONAL"] = "25"
+        try:
+            router = ExecutionRouter(_FakeExchange(mid_price=self.mid))
+            self.assertEqual(router._fixed_notional, Decimal("25"))
+        finally:
+            del os.environ["FIXED_TRADE_NOTIONAL"]
+        os.environ["FIXED_TRADE_NOTIONAL"] = "-5"
+        try:
+            with self.assertRaises(RuntimeError):
+                ExecutionRouter(_FakeExchange(mid_price=self.mid))
+        finally:
+            del os.environ["FIXED_TRADE_NOTIONAL"]
+        os.environ["FIXED_TRADE_NOTIONAL"] = "not-a-number"
+        try:
+            with self.assertRaises(RuntimeError):
+                ExecutionRouter(_FakeExchange(mid_price=self.mid))
+        finally:
+            del os.environ["FIXED_TRADE_NOTIONAL"]
 
     # -- slippage sieve ---------------------------------------------------- #
 

@@ -112,6 +112,20 @@ _ZERO: Final[Decimal] = Decimal("0")
 # --------------------------------------------------------------------------- #
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean environment flag (true/false, case-insensitive)."""
+    raw: str = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    raise RuntimeError(
+        f"BOOT REFUSED: {name} must be true or false, found {raw!r}"
+    )
+
+
 def load_env_file(path: Path) -> None:
     """Fold ``KEY=VALUE`` lines from ``.env`` into the environment.
 
@@ -267,10 +281,39 @@ class TradingSupervisor:
         # CONFLUENCE_MIN_VOTES (0..3, default 2): how many of the three
         # directional confirmations (DI, RSI, book imbalance) must agree
         # with the model before a trade may route. 0 disables the veto.
+        # REGIME_MIN_ADX (default 25): trend sieve floor — variant B runs 20.
         self._gatekeeper: MarketGatekeeper = gatekeeper or MarketGatekeeper(
-            confluence_min_votes=int(os.getenv("CONFLUENCE_MIN_VOTES", "2"))
+            confluence_min_votes=int(os.getenv("CONFLUENCE_MIN_VOTES", "2")),
+            adx_threshold=Decimal(os.getenv("REGIME_MIN_ADX", "25")),
         )
-        self._engine: KronosInferenceEngine = engine or KronosInferenceEngine()
+        # EDGE_THRESHOLD / DEAD_BAND_LOW / DEAD_BAND_HIGH: Monte Carlo gate.
+        # The engine refuses combinations violating
+        # dead_band_low < dead_band_high <= edge_threshold, so a relaxed
+        # variant lowering the edge must lower the dead band with it
+        # (e.g. EDGE_THRESHOLD=0.50 DEAD_BAND_LOW=0.48 DEAD_BAND_HIGH=0.50).
+        self._engine: KronosInferenceEngine = engine or KronosInferenceEngine(
+            edge_threshold=Decimal(os.getenv("EDGE_THRESHOLD", "0.53")),
+            dead_band_low=Decimal(os.getenv("DEAD_BAND_LOW", "0.48")),
+            dead_band_high=Decimal(os.getenv("DEAD_BAND_HIGH", "0.52")),
+        )
+
+        # Multi-variant data farm (harvester support): the regime and
+        # confluence gates are ALWAYS computed and journaled, but a variant
+        # may choose not to enforce them so that vetoed setups stop being
+        # censored data. Safety rails (sandbox check, drawdown breaker,
+        # insufficient-data skip, execution sieves) are NOT affected.
+        self._regime_enforce: bool = _env_flag("REGIME_ENFORCE", True)
+        self._confluence_enforce: bool = _env_flag("CONFLUENCE_ENFORCE", True)
+        if not self._regime_enforce:
+            logger.warning(
+                "REGIME_ENFORCE=false — regime verdicts are journaled but "
+                "do NOT block inference (data-harvester mode)"
+            )
+        if not self._confluence_enforce:
+            logger.warning(
+                "CONFLUENCE_ENFORCE=false — confluence votes are journaled "
+                "but do NOT block routing (data-harvester mode)"
+            )
 
         # Phase 7 — trade journal + Kelly feedback. The tracker is re-seeded
         # from realized journal history on every boot, so position sizing
@@ -642,7 +685,18 @@ class TradingSupervisor:
                     regime.volume_ok,
                     regime.book_fresh,
                 )
-                return
+                # An unwarmed indicator window is never bypassable — the
+                # indicators are None and every downstream stage would be
+                # reasoning about nothing.
+                if not regime.sufficient_data:
+                    return
+                if self._regime_enforce:
+                    return
+                logger.info(
+                    "%s: REGIME_ENFORCE=false — proceeding past failed "
+                    "regime for the journal's sake",
+                    symbol,
+                )
 
             # Step C — Monte Carlo edge sieve, with the predictor's safe-state
             # boundary replicated here so the full report reaches the panel.
@@ -700,7 +754,13 @@ class TradingSupervisor:
                     confluence.rsi,
                     confluence.book_imbalance,
                 )
-                return
+                if self._confluence_enforce:
+                    return
+                logger.info(
+                    "%s: CONFLUENCE_ENFORCE=false — proceeding past failed "
+                    "confluence for the journal's sake",
+                    symbol,
+                )
 
             # Step C¾ — meta-label filter (Phase 9). Shadow mode observes
             # and journals its opinion; veto mode may refuse the trade.
@@ -1236,6 +1296,54 @@ class TradingSupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gatekeeper.calls, 1)
         self.assertEqual(engine.calls, 0)  # inference never reached
         self.assertEqual(router.routed, [])
+
+    async def test_regime_enforce_false_harvests_past_failed_regime(self) -> None:
+        os.environ["REGIME_ENFORCE"] = "false"
+        try:
+            supervisor, _, gatekeeper, engine, router = _supervisor(
+                equity_sequence=[10_000.0, 10_000.0],
+                events=1,
+                regime_ok=False,
+                direction=SignalDirection.LONG,
+                lockfile=self.lockfile,
+            )
+            self.assertEqual(await supervisor.run(), EXIT_OK)
+            self.assertEqual(gatekeeper.calls, 1)  # gate still computed...
+            self.assertEqual(engine.calls, 1)  # ...but inference proceeded
+            self.assertEqual(len(router.routed), 1)  # and the trade routed
+        finally:
+            os.environ.pop("REGIME_ENFORCE", None)
+
+    async def test_confluence_enforce_false_harvests_past_veto(self) -> None:
+        os.environ["CONFLUENCE_ENFORCE"] = "false"
+        try:
+            supervisor, _, gatekeeper, engine, router = _supervisor(
+                equity_sequence=[10_000.0, 10_000.0],
+                events=1,
+                regime_ok=True,
+                direction=SignalDirection.LONG,
+                lockfile=self.lockfile,
+                confluence_ok=False,
+            )
+            self.assertEqual(await supervisor.run(), EXIT_OK)
+            self.assertEqual(gatekeeper.confluence_calls, 1)  # vote journaled
+            self.assertEqual(len(router.routed), 1)  # veto not enforced
+        finally:
+            os.environ.pop("CONFLUENCE_ENFORCE", None)
+
+    async def test_bad_enforce_flag_refuses_boot(self) -> None:
+        os.environ["REGIME_ENFORCE"] = "maybe"
+        try:
+            with self.assertRaises(RuntimeError):
+                _supervisor(
+                    equity_sequence=[10_000.0, 10_000.0],
+                    events=1,
+                    regime_ok=True,
+                    direction=SignalDirection.LONG,
+                    lockfile=self.lockfile,
+                )
+        finally:
+            os.environ.pop("REGIME_ENFORCE", None)
 
     async def test_neutral_signal_never_routes(self) -> None:
         supervisor, _, _, engine, router = _supervisor(

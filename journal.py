@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 import unittest
 from dataclasses import dataclass
@@ -65,6 +66,16 @@ STATUS_LOSS: Final[str] = "LOSS"
 STATUS_SCRATCH: Final[str] = "SCRATCH"
 STATUS_UNKNOWN: Final[str] = "UNKNOWN"  # both legs vanished without a fill
 
+#: Variant identity of THIS bot instance (multi-variant data farm).
+#: Every journaled trade is stamped with it; Kelly replay and the live
+#: dashboard only ever read their own variant, so a harvester's deliberately
+#: bad record can never shrink prod sizing. Defaults to "prod".
+DEFAULT_VARIANT: Final[str] = "prod"
+
+
+def _env_variant() -> str:
+    return os.getenv("VARIANT", DEFAULT_VARIANT).strip() or DEFAULT_VARIANT
+
 _SCHEMA: Final[str] = """
 CREATE TABLE IF NOT EXISTS trades (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,6 +99,7 @@ CREATE TABLE IF NOT EXISTS trades (
     p_down          TEXT,
     confluence_votes INTEGER,
     meta_p_win      TEXT,
+    variant         TEXT NOT NULL DEFAULT 'prod',
     status          TEXT NOT NULL DEFAULT 'OPEN',
     ts_close        TEXT,
     exit_price      TEXT,
@@ -97,6 +109,12 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol, status);
 """
+
+#: Created AFTER migration — a legacy table has no ``variant`` column yet,
+#: so this index cannot live inside ``_SCHEMA``.
+_VARIANT_INDEX: Final[str] = (
+    "CREATE INDEX IF NOT EXISTS idx_trades_variant ON trades (variant, status)"
+)
 
 
 def _utc_now() -> str:
@@ -141,6 +159,7 @@ class TradeRecord:
     p_down: Optional[Decimal]
     confluence_votes: Optional[int]
     meta_p_win: Optional[Decimal]
+    variant: str
     status: str
     ts_close: Optional[str]
     exit_price: Optional[Decimal]
@@ -196,12 +215,35 @@ class PerformanceSnapshot:
 class TradeJournal:
     """Append-mostly SQLite ledger of every bracket the bot has placed."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, variant: Optional[str] = None) -> None:
         self._db_path: Path = db_path
+        self._variant: str = variant if variant is not None else _env_variant()
         self._conn: sqlite3.Connection = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+        self._conn.execute(_VARIANT_INDEX)
         self._conn.commit()
+
+    @property
+    def variant(self) -> str:
+        return self._variant
+
+    def _migrate(self) -> None:
+        """Add columns that predate-this-version databases are missing.
+
+        Existing rows get DEFAULT 'prod' — correct, because every trade
+        journaled before the data farm existed WAS the prod variant.
+        """
+        columns: set[str] = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        if "variant" not in columns:
+            self._conn.execute(
+                "ALTER TABLE trades ADD COLUMN variant TEXT NOT NULL DEFAULT 'prod'"
+            )
+            logger.info("journal migrated: variant column added (existing rows = prod)")
 
     def close(self) -> None:
         self._conn.close()
@@ -233,8 +275,8 @@ class TradeJournal:
                 ts_open, symbol, direction, amount, entry_price,
                 tp_price, sl_price, tp_order_id, sl_order_id,
                 adx, atr, atr_sma, rsi, plus_di, minus_di, book_imbalance,
-                p_up, p_down, confluence_votes, meta_p_win, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                p_up, p_down, confluence_votes, meta_p_win, variant, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _utc_now(),
@@ -257,6 +299,7 @@ class TradeJournal:
                 _to_text(p_down),
                 confluence_votes,
                 _to_text(meta_p_win),
+                self._variant,
                 STATUS_OPEN,
             ),
         )
@@ -321,6 +364,7 @@ class TradeJournal:
                 else None
             ),
             meta_p_win=_to_decimal(row["meta_p_win"]),
+            variant=str(row["variant"]),
             status=str(row["status"]),
             ts_close=row["ts_close"],
             exit_price=_to_decimal(row["exit_price"]),
@@ -329,28 +373,41 @@ class TradeJournal:
         )
 
     def open_trades(self, symbol: Optional[str] = None) -> List[TradeRecord]:
+        """OPEN trades belonging to THIS variant (monitor must never touch
+        a sibling bot's brackets, even if journals are ever pooled)."""
         if symbol is None:
             rows: List[sqlite3.Row] = self._conn.execute(
-                "SELECT * FROM trades WHERE status = ? ORDER BY id", (STATUS_OPEN,)
+                "SELECT * FROM trades WHERE status = ? AND variant = ? ORDER BY id",
+                (STATUS_OPEN, self._variant),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT * FROM trades WHERE status = ? AND symbol = ? ORDER BY id",
-                (STATUS_OPEN, symbol),
+                "SELECT * FROM trades"
+                " WHERE status = ? AND symbol = ? AND variant = ? ORDER BY id",
+                (STATUS_OPEN, symbol, self._variant),
             ).fetchall()
         return [self._record(row) for row in rows]
 
-    def closed_trades(self) -> List[TradeRecord]:
-        rows: List[sqlite3.Row] = self._conn.execute(
-            "SELECT * FROM trades WHERE status != ? ORDER BY id", (STATUS_OPEN,)
-        ).fetchall()
+    def closed_trades(self, *, variant: Optional[str] = None) -> List[TradeRecord]:
+        """Closed trades — ALL variants by default (the meta-labeler pools
+        across variants on purpose); pass ``variant=`` to scope."""
+        if variant is None:
+            rows: List[sqlite3.Row] = self._conn.execute(
+                "SELECT * FROM trades WHERE status != ? ORDER BY id", (STATUS_OPEN,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM trades WHERE status != ? AND variant = ? ORDER BY id",
+                (STATUS_OPEN, variant),
+            ).fetchall()
         return [self._record(row) for row in rows]
 
     def performance(self) -> PerformanceSnapshot:
+        """Aggregate results for THIS variant only (dashboard/session tally)."""
         wins = losses = scratches = open_count = 0
         realized: Decimal = _ZERO
         for row in self._conn.execute(
-            "SELECT status, pnl FROM trades"
+            "SELECT status, pnl FROM trades WHERE variant = ?", (self._variant,)
         ).fetchall():
             status: str = str(row["status"])
             if status == STATUS_OPEN:
@@ -374,15 +431,21 @@ class TradeJournal:
         )
 
     def replay_into(self, tracker: PerformanceTracker) -> int:
-        """Fold every realized PnL into a fresh tracker. Returns the count."""
+        """Fold OWN-variant realized PnL into a fresh tracker. Returns count.
+
+        Variant-scoped on purpose: the harvester journals deliberately
+        unfiltered trades, and its win rate must never leak into another
+        variant's Kelly posterior.
+        """
         replayed: int = 0
-        for trade in self.closed_trades():
+        for trade in self.closed_trades(variant=self._variant):
             if trade.pnl is not None and trade.status in (STATUS_WIN, STATUS_LOSS):
                 tracker.record_trade(trade.pnl)
                 replayed += 1
         if replayed:
             logger.info(
-                "Kelly state restored from journal: %d realized trades replayed",
+                "Kelly state restored from journal (variant=%s): %d trades replayed",
+                self._variant,
                 replayed,
             )
         return replayed
@@ -774,6 +837,79 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
         (outcome,) = await monitor.poll(_SYMBOL)
         self.assertEqual(outcome.status, STATUS_WIN)  # close still recorded
 
+    def test_variant_stamped_and_replay_is_variant_scoped(self) -> None:
+        db: Path = Path(self._tmp.name) / "farm.db"
+        prod = TradeJournal(db, variant="prod")
+        harvester = TradeJournal(db, variant="harvester")
+        try:
+            p_id: int = prod.open_trade(_executed_result())
+            h_id: int = harvester.open_trade(_executed_result())
+            prod.close_trade(
+                p_id, status=STATUS_WIN, exit_price=Decimal("64100"), pnl=Decimal("1.0")
+            )
+            harvester.close_trade(
+                h_id, status=STATUS_LOSS, exit_price=Decimal("63800"), pnl=Decimal("-2.0")
+            )
+            # Records carry their variant.
+            self.assertEqual(
+                {t.variant for t in prod.closed_trades()}, {"prod", "harvester"}
+            )
+            # replay_into only sees OWN variant: prod replays 1 win, no loss.
+            fresh = PerformanceTracker()
+            self.assertEqual(prod.replay_into(fresh), 1)
+            self.assertEqual((fresh._wins, fresh._losses), (1, 0))
+            # performance() is variant-scoped too.
+            self.assertEqual(prod.performance().wins, 1)
+            self.assertEqual(prod.performance().losses, 0)
+            self.assertEqual(harvester.performance().losses, 1)
+        finally:
+            prod.close()
+            harvester.close()
+
+    def test_open_trades_scoped_to_own_variant(self) -> None:
+        db: Path = Path(self._tmp.name) / "farm2.db"
+        prod = TradeJournal(db, variant="prod")
+        relaxed = TradeJournal(db, variant="relaxed")
+        try:
+            prod.open_trade(_executed_result())
+            relaxed.open_trade(_executed_result())
+            self.assertEqual(len(prod.open_trades(_SYMBOL)), 1)
+            self.assertEqual(prod.open_trades(_SYMBOL)[0].variant, "prod")
+            self.assertEqual(len(relaxed.open_trades()), 1)
+        finally:
+            prod.close()
+            relaxed.close()
+
+    def test_legacy_db_migrates_to_prod_variant(self) -> None:
+        db: Path = Path(self._tmp.name) / "legacy.db"
+        legacy_conn = sqlite3.connect(str(db))
+        legacy_conn.executescript(
+            _SCHEMA.replace("    variant         TEXT NOT NULL DEFAULT 'prod',\n", "")
+        )
+        legacy_conn.execute(
+            "INSERT INTO trades (ts_open, symbol, direction, amount, entry_price,"
+            " status, pnl) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_utc_now(), _SYMBOL, "STRAT_LONG", "0.01", "64000", STATUS_WIN, "1.0"),
+        )
+        legacy_conn.commit()
+        legacy_conn.close()
+        migrated = TradeJournal(db)  # VARIANT env unset => "prod"
+        try:
+            (trade,) = migrated.closed_trades()
+            self.assertEqual(trade.variant, "prod")
+            self.assertEqual(migrated.performance().wins, 1)
+        finally:
+            migrated.close()
+
+    def test_variant_defaults_from_env(self) -> None:
+        os.environ["VARIANT"] = "relaxed"
+        try:
+            j = TradeJournal(Path(self._tmp.name) / "env.db")
+            self.assertEqual(j.variant, "relaxed")
+            j.close()
+        finally:
+            del os.environ["VARIANT"]
+
     async def test_monitor_fetch_failure_is_contained(self) -> None:
         self.journal.open_trade(_executed_result())
 
@@ -789,3 +925,4 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     unittest.main()
+# end of journal.py

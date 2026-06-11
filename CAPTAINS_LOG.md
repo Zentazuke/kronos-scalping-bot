@@ -14,7 +14,7 @@ phases, each phase one module, each module with an embedded unittest suite.
 Project root: `C:\Users\Ricardo\Desktop\Work\PROJECTOS\Trading Bot`
 (NOT the WANDERING PIXELS folder — that is an unrelated project.)
 
-**Current test count: 77 passing** — run with:
+**Current test count: 89 passing** — run with:
 ```
 python -m unittest gatekeeper predictor execution journal backtest learner main
 ```
@@ -69,6 +69,10 @@ python -m unittest gatekeeper predictor execution journal backtest learner main
 - Embedded test fakes: `_FakeExchange` (futures-ish) vs `_FakeSpotExchange`
   (OCO path) in execution.py; supervisor fakes in main.py accept
   `confluence_ok`, order_states for the OutcomeMonitor, etc.
+- **Cowork mount sync can serve stale/truncated views of recently edited
+  files to the sandbox shell** (Windows-side files stay correct). Workaround:
+  rebuild from `git show HEAD:<file>` + re-apply patches, or transfer under a
+  new filename; verify with `ast.parse` before running anything.
 
 ## 5. Environment (`.env` — real file is NOT in git; see `.env.example`)
 
@@ -78,6 +82,10 @@ EXCHANGE_API_KEY/SECRET      (Binance Spot Testnet keys, 64-char)
 RISK_TOTAL_DRAWDOWN_LIMIT=0.03   ORDER_TIMEOUT_S=2.0 (testnet; ~0.2 live)
 KRONOS_REPO_PATH=./Kronos    CONFLUENCE_MIN_VOTES=2
 META_FILTER_MODE=shadow      META_MIN_PWIN=0.5
+Variant farm: VARIANT=prod|relaxed|harvester, REGIME_ENFORCE=true|false,
+CONFLUENCE_ENFORCE=true|false, FIXED_TRADE_NOTIONAL=<quote amount, unset=Kelly>
+Tuning knobs: REGIME_MIN_ADX=25, EDGE_THRESHOLD=0.53,
+DEAD_BAND_LOW=0.48, DEAD_BAND_HIGH=0.52
 Optional: JOURNAL_DB, HEADLESS=true, CONFLUENCE_MIN_VOTES=0 to disable veto
 ```
 
@@ -96,6 +104,7 @@ python backtest.py BTC/USDT --days 14  # offline replay (public data, no keys)
 python backtest.py BTC/USDT --days 30 --walk-forward
 python learner.py train                # trains meta model from journal.db
                                        # (refuses < 100 decided trades)
+python learner.py train --db A/journal.db --db C/journal.db  # pooled variants
 ```
 
 ## 7. State of play (as of 2026-06-11)
@@ -107,35 +116,47 @@ python learner.py train                # trains meta model from journal.db
 - Kelly sizing now learns from real outcomes and survives restarts.
 - Meta filter is in shadow mode, dormant until 100 decided trades.
 
-### UNRESOLVED — GitHub push (was mid-flight when session ended)
-- Local repo initialized, single commit `5a2d68c` (9 modules + .gitignore +
-  .env.example; **.env/journal/logs/Kronos correctly excluded**).
-- `gh` CLI v2.93 installed via winget. Device-flow auth COMPLETED once
-  ("Authentication complete") but a fresh shell then said "not logged in" —
-  token likely stored under the login shell's credential context only.
-- NEXT STEP: run `gh auth status`; if logged out, `gh auth login` again
-  (same browser device flow), then:
-  `gh repo create kronos-scalping-bot --private --source . --push`
-- The repo MUST be private. Never stage `.env` (gitignore already covers it).
+### RESOLVED — GitHub push (2026-06-11)
+- Private repo live at https://github.com/Zentazuke/kronos-scalping-bot
+  (branch `main`). Pushed via OAuth device flow from the Cowork sandbox —
+  no token persisted anywhere in the repo.
+- Local branch may still be named `master` tracking nothing; if so:
+  `git branch -m master main && git fetch origin &&
+   git branch --set-upstream-to=origin/main main`
+- Never stage `.env` (gitignore covers it).
 
-### AGREED NEXT BUILD — multi-variant data farm (user approved)
-Three parallel bots on **separate testnet accounts + separate folders**
-(shared wallet is a hard blocker: reconcile blocks on any exposure; one bot's
-kill switch would flatten the sibling's brackets; drawdown breaker reads
-shared equity):
-- **A: prod** — exactly as-is.
-- **B: relaxed** — ADX>20, votes=1, edge 0.50. Same tiny sizing.
-- **C: free-for-all harvester** — gates computed+journaled but NOT enforced,
-  every non-dead-band signal, tiny fixed notional. Purpose: kill the
-  journal's selection bias (vetoed setups are censored data today).
+### BUILT — multi-variant data farm plumbing (2026-06-11)
+All four pieces implemented + tested (12 new tests, suite now 89):
+- `journal.py`: `variant` column (legacy DBs auto-migrate, old rows = prod);
+  VARIANT env / constructor arg; `open_trades()`, `performance()`, and
+  `replay_into()` are variant-scoped (harvester's record can never shrink
+  prod's Kelly); `closed_trades()` returns all variants by default for the
+  meta-labeler, `variant=` kwarg to scope.
+- `main.py`: REGIME_ENFORCE / CONFLUENCE_ENFORCE (default true). When false
+  the gate is computed+journaled but doesn't block (harvester mode).
+  `sufficient_data=False` is NEVER bypassable. Bad flag value refuses boot.
+- `execution.py`: FIXED_TRADE_NOTIONAL (quote currency) replaces
+  Kelly × equity when set; liquidity cap/quantize/min-size sieves still
+  apply; rejects non-positive/non-finite values at boot.
+- `learner.py`: `train` accepts repeated `--db` and pools journals
+  (pooling across variants is CORRECT for the meta-labeler); missing DB
+  files are skipped with a warning, not fatal.
+- `main.py` also gained tuning knobs: REGIME_MIN_ADX, EDGE_THRESHOLD,
+  DEAD_BAND_LOW, DEAD_BAND_HIGH (constructor-validated).
 
-Plumbing required: `variant` column + VARIANT env in journal.py;
-REGIME_ENFORCE / CONFLUENCE_ENFORCE flags in main.py; FIXED_TRADE_NOTIONAL
-sizing mode in execution.py; `learner.py train` accepting multiple `--db`
-(pooling across variants is CORRECT for the meta-labeler);
-`replay_into()` filtered to OWN variant (harvester's bad win rate must never
-shrink prod sizing). Watch CPU: harvester runs Kronos every bar.
-User must create 2 extra Binance testnet accounts/keys first.
+### NEXT — deploy the farm (user-side prerequisites first)
+1. User creates 2 extra Binance Spot Testnet accounts + API keys.
+2. Two new folders (copy of repo each), `.env` per variant:
+   - **A prod** (existing folder): VARIANT=prod, everything default.
+   - **B relaxed**: VARIANT=relaxed, CONFLUENCE_MIN_VOTES=1,
+     REGIME_MIN_ADX=20, EDGE_THRESHOLD=0.50, DEAD_BAND_LOW=0.48,
+     DEAD_BAND_HIGH=0.50 (engine enforces low < high <= edge, so the dead
+     band must come down with the edge).
+   - **C harvester**: VARIANT=harvester, REGIME_ENFORCE=false,
+     CONFLUENCE_ENFORCE=false, FIXED_TRADE_NOTIONAL=25 (tiny).
+3. Watch CPU: harvester runs Kronos every bar.
+4. Retrain pooled: `python learner.py train --db <A>/journal.db
+   --db <B>/journal.db --db <C>/journal.db`
 
 ### Backlog (discussed, not yet committed to)
 - Promote meta filter shadow→veto only after its shadow record beats the
