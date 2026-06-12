@@ -115,6 +115,14 @@ python learner.py train --db A/journal.db --db C/journal.db  # pooled variants
 - Optional: market-buy ~162.3 ADA on testnet to square the UNKNOWN #15–19
   inventory. Optional: ADA balance check so concurrent shorts never starve.
 
+**M1 — partially done 2026-06-12 ~midday:** meta v1 trained at 101 decided
+trades: holdout accuracy 33.3% vs 61.9% predict-majority baseline — v1 is
+ANTI-predictive (memorized one overnight regime, holdout n≈20, older rows
+lack Phase A features). Correctly stays in shadow; its scores now journal
+as meta_p_win for the M4 comparison. Retrain at ~250–300 decided across
+more market conditions. ADA SHORTS are the bleeding pattern so far
+(7W/13L vs BTC shorts 7W/2L, ADA longs 7W/1L as of trade ~#37).
+
 **M1 — read the harvest (evening 2026-06-12):**
 - Scheduled task `harvester-24h-report` fires ~18:15 UTC: volume, win rates
   per direction, KRONOS CALIBRATION buckets (the key question), whether the
