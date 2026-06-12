@@ -176,9 +176,17 @@ exception because it is execution COST, not signal):
   feature-name mismatches anyway.
 - execution: MAX_SPREAD_BPS env → ABORT_SPREAD sieve (disabled when unset;
   .env runs 25 bps).
-PHASE B (next): order-flow/trade imbalance + micro-VWAP need a watchTrades
-consumer in feed.py with rolling aggressive-buy/sell windows — journal-first
-again. DEFERRED: sub-minute momentum/vol burst (bot is bar-driven),
+PHASE B (next) — spec updated after web research 2026-06-12:
+1. CVD/trade-flow imbalance (aggressive buy − sell volume, rolling windows)
+   via a watchTrades consumer in feed.py — THE industry scalping signal.
+2. True OFI per Cont et al.: queue-size CHANGES between book snapshots
+   (not static depth) — strongest short-horizon predictor in the academic
+   literature; accumulate in feed between bars.
+3. Micro-VWAP from the trade stream.
+4. Microprice (depth-weighted mid: (bidSz*ask+askSz*bid)/(bidSz+askSz));
+   gap vs mid is a cheap directional feature from the existing snapshot.
+All journal-first (meta features), no new gates without evidence.
+DEFERRED: sub-minute momentum/vol burst (bot is bar-driven),
 liquidations/funding/OI (spot has none), Tier-3 sentiment (noise at 5m).
 
 ### ALSO — dashboards (2026-06-11)
