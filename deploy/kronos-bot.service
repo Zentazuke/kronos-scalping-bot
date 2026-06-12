@@ -1,0 +1,20 @@
+# /etc/systemd/system/kronos-bot.service
+# sudo systemctl daemon-reload && sudo systemctl enable --now kronos-bot
+[Unit]
+Description=Kronos scalping bot (testnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kronos
+WorkingDirectory=/home/kronos/kronos-scalping-bot
+Environment=HEADLESS=true
+ExecStart=/home/kronos/kronos-scalping-bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=30
+# The bot exits non-zero on the kill switch ON PURPOSE — emergency_lock.lock
+# then refuses every reboot until a human deletes it, so Restart is safe.
+
+[Install]
+WantedBy=multi-user.target

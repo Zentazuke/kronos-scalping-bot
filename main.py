@@ -1083,7 +1083,13 @@ def main() -> int:
 
     handlers: List[logging.Handler]
     if _headless_mode():
-        handlers = [logging.StreamHandler()]
+        # Server mode: console for systemd/journald AND bot.log — the
+        # dashboard parses equity, decisions and the activity feed from
+        # the file, so headless must keep writing it.
+        handlers = [
+            logging.FileHandler(BASE_DIR / "bot.log", encoding="utf-8"),
+            logging.StreamHandler(),
+        ]
     else:
         # Dashboard mode: rich.Live owns the console. Full detail goes to
         # bot.log; only CRITICAL (boot refusals, kill switch) hits stderr.

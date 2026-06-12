@@ -1,0 +1,12 @@
+# Kronos scalping bot — Python 3.12+
+# On a CPU-only server install torch first to avoid the CUDA download:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+pandas>=2.0
+numpy>=1.26
+ccxt>=4.5
+torch>=2.2
+transformers>=4.40
+einops>=0.7
+rich>=13.0
+python-dotenv>=1.0
+huggingface_hub>=0.23

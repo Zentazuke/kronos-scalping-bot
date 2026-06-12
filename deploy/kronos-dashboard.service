@@ -1,0 +1,15 @@
+# /etc/systemd/system/kronos-dashboard.service
+[Unit]
+Description=Kronos dashboard (read-only, port 8765)
+After=network-online.target
+
+[Service]
+Type=simple
+User=kronos
+WorkingDirectory=/home/kronos/kronos-scalping-bot
+ExecStart=/home/kronos/kronos-scalping-bot/.venv/bin/python dashboard_server.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
