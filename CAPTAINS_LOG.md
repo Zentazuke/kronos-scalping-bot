@@ -107,6 +107,56 @@ python learner.py train                # trains meta model from journal.db
 python learner.py train --db A/journal.db --db C/journal.db  # pooled variants
 ```
 
+## 6½. MASTER PLAN — everything left, in execution order (written 2026-06-12 ~01:30)
+
+**M0 — user's morning chores (no Claude needed):**
+- One bot restart (`start_all.bat`) — loads the sibling-flatten fix
+  (running process predates it; dormant bug until a bracket fails).
+- Optional: market-buy ~162.3 ADA on testnet to square the UNKNOWN #15–19
+  inventory. Optional: ADA balance check so concurrent shorts never starve.
+
+**M1 — read the harvest (evening 2026-06-12):**
+- Scheduled task `harvester-24h-report` fires ~18:15 UTC: volume, win rates
+  per direction, KRONOS CALIBRATION buckets (the key question), whether the
+  disabled gates would have helped, stop slippage.
+- If decided trades ≥ 100: train meta v1 (`python learner.py train`), check
+  holdout vs predict-majority baseline. KEEP shadow mode. Journal now stores
+  meta_p_win per trade → its shadow record accumulates for M4.
+
+**M2 — Phase B microstructure (next build session, ~one session):**
+- feed.py: `watch_trades` consumer per symbol; rolling 1m/5m windows of
+  aggressive buy/sell volume → CVD + trade imbalance; book-snapshot diffs
+  accumulated between bars → true OFI (Cont); micro-VWAP from trades;
+  microprice gap from the existing snapshot.
+- New journal columns (auto-migrate) + meta features v2 + tests.
+- Journal-first: NO new gates. Watch CPU (harvester runs Kronos every bar).
+- Build AFTER meta v1 is trained so v1's feature set stays stable.
+
+**M3 — Kronos calibration replay (Phase 9½, overnight offline job):**
+- New tool `calibrate.py`: run Kronos over N days of historical bars
+  (user's PC, ~overnight on CPU), score p_up/p_down vs realized outcomes,
+  emit a reliability curve. Decide: probability shrinkage (pseudo-counts
+  toward 0.5), dead-band widening, or (only if truly broken) Phase 10
+  fine-tune. Yesterday's 28–30/30-paths-wrong calls are the motivation.
+
+**M4 — meta promotion decision (after ~100 trades WITH shadow scores):**
+- Compare shadow-filtered expectancy vs unfiltered on the same trades.
+  Promote META_FILTER_MODE=veto ONLY if shadow wins. Else retrain with
+  Phase B features and repeat.
+
+**M5 — variant farm proper (blocked on user creating 2 testnet accounts):**
+- Folder per variant, .env per captain's-log NEXT section. Main account
+  returns to prod settings (or stays harvester until M4 resolves).
+
+**M6 — robustness backlog (before anything resembling real money):**
+- Fee/spread model in backtest + journal (taker 0.1% would eat these
+  margins; testnet hides it). REQUIRED before any live decision.
+- Walk-forward rerun: --days 90, plus ADA/USDT.
+- User-data websocket instead of per-bar TP/SL polling (faster settles).
+- Restore RISK_TOTAL_DRAWDOWN_LIMIT=0.03, MAX_OPEN_TRADES_PER_SYMBOL=1,
+  Kelly sizing, enforce flags true — the harvester .env is a DATA rig,
+  never a production configuration.
+
 ## 7. State of play (as of 2026-06-11)
 
 - Bot has run overnight on testnet; first pilot night's bugs all fixed (spot
@@ -219,51 +269,4 @@ user-pasted PowerShell output, not the mounted file.
 
 ### ACTIVE — main account switched to HARVESTER mode (2026-06-11 evening)
 User chose to maximize training data on the existing testnet account while
-the 2 extra accounts don't exist yet. `.env` now runs: VARIANT=harvester,
-REGIME_ENFORCE=false, CONFLUENCE_ENFORCE=false, FIXED_TRADE_NOTIONAL=25,
-EDGE_THRESHOLD=0.51 + dead band 0.49–0.51 (narrowest legal),
-TP/SL 2.5/2.5 (walk-forward pick), SLIPPAGE_LIMIT=0.0015,
-RISK_TOTAL_DRAWDOWN_LIMIT=0.50 (bug-catcher only — RESTORE 0.03 before
-anything resembling real money). Rationale: prod's Kelly benched itself
-after 4 trades (2W/2L, payoff ~0.33); harvester sizing ignores Kelly so it
-keeps journaling. Trade #2 (2026-06-11) slipped 0.22% past its stop —
-testnet books are thin. Kronos calibration is the big open question: it
-emitted 28–30/30 paths DOWN repeatedly while price rose; the journal now
-captures every such call for a future calibration report (Phase 9½ idea:
-offline Kronos replay over history to score p_up/p_down vs realized).
-Walk-forward (30d, 3 folds): ADX>30 won all folds, TP 2.5 all folds,
-SL unstable 2.0/2.5, validation expectancy +0.37/+0.66/−0.09 ATR.
-
-### NEXT — deploy the farm (user-side prerequisites first)
-1. User creates 2 extra Binance Spot Testnet accounts + API keys.
-2. Two new folders (copy of repo each), `.env` per variant:
-   - **A prod** (existing folder): VARIANT=prod, everything default.
-   - **B relaxed**: VARIANT=relaxed, CONFLUENCE_MIN_VOTES=1,
-     REGIME_MIN_ADX=20, EDGE_THRESHOLD=0.50, DEAD_BAND_LOW=0.48,
-     DEAD_BAND_HIGH=0.50 (engine enforces low < high <= edge, so the dead
-     band must come down with the edge).
-   - **C harvester**: VARIANT=harvester, REGIME_ENFORCE=false,
-     CONFLUENCE_ENFORCE=false, FIXED_TRADE_NOTIONAL=25 (tiny).
-3. Watch CPU: harvester runs Kronos every bar.
-4. Retrain pooled: `python learner.py train --db <A>/journal.db
-   --db <B>/journal.db --db <C>/journal.db`
-
-### Backlog (discussed, not yet committed to)
-- Promote meta filter shadow→veto only after its shadow record beats the
-  unfiltered baseline over ~100 trades.
-- Walk-forward says whether TP1.5/SL2.5 (breakeven 62.5% win rate) should flip.
-- Phase 10 (Kronos fine-tune): deferred until evidence shows the model is the
-  bottleneck. Offline, versioned, validated only.
-- Possible: spread/fee model; user-data websocket instead of per-bar polling.
-
-## 8. Working style that produced this codebase (keep it)
-
-- One phase = one module = complete production code + embedded tests in the
-  same file; no stubs, no placeholders, run tests after every phase.
-- Decimal for decisions, float for models; conversions only at boundaries.
-- Fail-safe defaults everywhere: unverified state → refuse to trade;
-  inference fault → NEUTRAL; missing evidence → failed confluence vote.
-- Offline tools (backtest/learner) never share runtime state with the live
-  bot and never need API keys.
-- The dashboard is an observer — it can never block or influence a decision
-  (drop-oldest queue, publish() never raises).
+the 2 extra a
