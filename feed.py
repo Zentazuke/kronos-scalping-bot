@@ -33,6 +33,8 @@ recommended in the dev environment). Requires Python >= 3.10.
 from __future__ import annotations
 
 import asyncio
+import time
+import unittest
 import logging
 import os
 import random
@@ -73,6 +75,9 @@ logger: Final[logging.Logger] = logging.getLogger("bot.feed")
 SYMBOLS: Final[Tuple[str, ...]] = ("BTC/USDT", "ADA/USDT")
 TIMEFRAME: Final[str] = "5m"
 TIMEFRAME_MS: Final[int] = 5 * 60 * 1_000
+#: Rolling trade-window capacity; ~20k prints comfortably covers one 5m bar
+#: on BTC/USDT spot while bounding memory on busy days.
+TRADE_WINDOW_MAXLEN: Final[int] = 20_000
 LOOKBACK_BARS: Final[int] = 512
 
 ORDER_BOOK_DEPTH: Final[int] = 10  # gatekeeper consumes top 3; margin kept
@@ -137,6 +142,33 @@ class L2OrderBook:
 #: Event yielded to subscribers on every confirmed 5-minute bar close.
 FeedEvent = Tuple[str, pd.DataFrame, L2OrderBook]
 
+#: One raw trade in the rolling window: (timestamp_ms, price, amount, is_buy).
+TradeTick = Tuple[int, float, float, bool]
+
+
+@dataclass(frozen=True, slots=True)
+class TradeFlowSnapshot:
+    """Aggressive trade-flow metrics over the last bar window.
+
+    Float domain by design — this sits at the CCXT wire seam. The
+    supervisor converts to Decimal at the journal boundary.
+
+    ``ofi`` is the accumulated level-1 order-flow imbalance (Cont,
+    Kukanov & Stoikov 2014) since the previous read: queue growth at the
+    best bid and queue depletion at the best ask count as buying
+    pressure, and vice versa. ``trade_imbalance`` is the CVD normalized
+    to −1..+1 (None when no trades printed in the window).
+    """
+
+    window_ms: int
+    trade_count: int
+    buy_volume: float
+    sell_volume: float
+    cvd: float
+    trade_imbalance: Optional[float]
+    micro_vwap: Optional[float]
+    ofi: float
+
 #: Transient exceptions the resilience engine recovers from in place.
 _RECOVERABLE: Final[Tuple[Type[BaseException], ...]] = (NetworkError, ExchangeError)
 
@@ -180,6 +212,14 @@ class MultiAssetFeed:
             s: None for s in self._symbols
         }
         self._books: Dict[str, Optional[Dict[str, Any]]] = {
+            s: None for s in self._symbols
+        }
+        # Trade-flow window (Phase B): raw prints + level-1 OFI accumulator.
+        self._trades: Dict[str, Deque[TradeTick]] = {
+            s: deque(maxlen=TRADE_WINDOW_MAXLEN) for s in self._symbols
+        }
+        self._ofi_acc: Dict[str, float] = {s: 0.0 for s in self._symbols}
+        self._prev_best: Dict[str, Optional[Tuple[float, float, float, float]]] = {
             s: None for s in self._symbols
         }
         self._reseeding: Dict[str, bool] = {s: False for s in self._symbols}
@@ -257,6 +297,11 @@ class MultiAssetFeed:
             )
             self._tasks.append(
                 asyncio.create_task(self._book_worker(symbol), name=f"book:{symbol}")
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    self._trades_worker(symbol), name=f"trades:{symbol}"
+                )
             )
 
     async def stop(self) -> None:
@@ -416,6 +461,7 @@ class MultiAssetFeed:
                         attempt = 0
                         self._fire_reconciliation(symbol)
                     self._books[symbol] = book
+                    self._track_ofi(symbol, book)
             except asyncio.CancelledError:
                 raise
             except _RECOVERABLE as exc:
@@ -440,6 +486,147 @@ class MultiAssetFeed:
                     delay,
                 )
                 await asyncio.sleep(delay)
+
+    async def _trades_worker(self, symbol: str) -> None:
+        """Supervised watch_trades loop feeding the trade-flow window."""
+        attempt: int = 0
+        while not self._closed:
+            try:
+                await self._connection_guard()
+                while not self._closed:
+                    trades: Any = await self._exchange.watch_trades(symbol)
+                    if attempt:
+                        logger.info("%s: trade stream recovered", symbol)
+                        attempt = 0
+                    buffer: Deque[TradeTick] = self._trades[symbol]
+                    for trade in trades or ():
+                        try:
+                            buffer.append(
+                                (
+                                    int(trade.get("timestamp") or 0),
+                                    float(trade.get("price") or 0.0),
+                                    float(trade.get("amount") or 0.0),
+                                    str(trade.get("side") or "") == "buy",
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            continue  # one malformed print never kills the loop
+            except asyncio.CancelledError:
+                raise
+            except _RECOVERABLE as exc:
+                attempt += 1
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    "%s: trade stream dropout (%s: %s) — retry %d in %.1fs",
+                    symbol,
+                    type(exc).__name__,
+                    exc,
+                    attempt,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            except Exception:  # noqa: BLE001
+                attempt += 1
+                delay = self._backoff_delay(attempt)
+                logger.exception(
+                    "%s: unexpected trades worker fault — retry %d in %.1fs",
+                    symbol,
+                    attempt,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+    def _track_ofi(self, symbol: str, book: Any) -> None:
+        """Fold one best-bid/ask update into the symbol's OFI accumulator."""
+        try:
+            bids: Any = book.get("bids") or []
+            asks: Any = book.get("asks") or []
+            if not bids or not asks:
+                return
+            current: Tuple[float, float, float, float] = (
+                float(bids[0][0]),
+                float(bids[0][1]),
+                float(asks[0][0]),
+                float(asks[0][1]),
+            )
+        except (TypeError, ValueError, IndexError):
+            return
+        previous = self._prev_best.get(symbol)
+        if previous is not None:
+            self._ofi_acc[symbol] = self._ofi_acc.get(symbol, 0.0) + self._ofi_event(
+                previous, current
+            )
+        self._prev_best[symbol] = current
+
+    @staticmethod
+    def _ofi_event(
+        previous: Tuple[float, float, float, float],
+        current: Tuple[float, float, float, float],
+    ) -> float:
+        """Level-1 OFI contribution of one book update (Cont et al. 2014).
+
+        e_n =  1{Pb_n >= Pb_n-1} * qb_n  -  1{Pb_n <= Pb_n-1} * qb_n-1
+             - 1{Pa_n <= Pa_n-1} * qa_n  +  1{Pa_n >= Pa_n-1} * qa_n-1
+        Positive = net buying pressure (bid building / ask depleting).
+        """
+        prev_bid_p, prev_bid_q, prev_ask_p, prev_ask_q = previous
+        bid_p, bid_q, ask_p, ask_q = current
+        contribution: float = 0.0
+        if bid_p >= prev_bid_p:
+            contribution += bid_q
+        if bid_p <= prev_bid_p:
+            contribution -= prev_bid_q
+        if ask_p <= prev_ask_p:
+            contribution -= ask_q
+        if ask_p >= prev_ask_p:
+            contribution += prev_ask_q
+        return contribution
+
+    @staticmethod
+    def _window_metrics(
+        trades: Sequence[TradeTick], now_ms: int, window_ms: int
+    ) -> Tuple[int, float, float, Optional[float]]:
+        """(count, buy_volume, sell_volume, micro_vwap) inside the window."""
+        cutoff: int = now_ms - window_ms
+        buy = sell = notional = volume = 0.0
+        count: int = 0
+        for ts, price, amount, is_buy in trades:
+            if ts < cutoff or amount <= 0.0:
+                continue
+            count += 1
+            volume += amount
+            notional += price * amount
+            if is_buy:
+                buy += amount
+            else:
+                sell += amount
+        vwap: Optional[float] = (notional / volume) if volume > 0.0 else None
+        return count, buy, sell, vwap
+
+    def trade_flow(self, symbol: str) -> TradeFlowSnapshot:
+        """Trade-flow metrics over the last bar window.
+
+        READS AND RESETS the OFI accumulator — the supervisor calls this
+        exactly once per dispatched bar. A second read in the same bar
+        would see OFI = 0.
+        """
+        now_ms: int = int(time.time() * 1_000)
+        count, buy, sell, vwap = self._window_metrics(
+            tuple(self._trades[symbol]), now_ms, self._timeframe_ms
+        )
+        total: float = buy + sell
+        ofi: float = self._ofi_acc.get(symbol, 0.0)
+        self._ofi_acc[symbol] = 0.0
+        return TradeFlowSnapshot(
+            window_ms=self._timeframe_ms,
+            trade_count=count,
+            buy_volume=buy,
+            sell_volume=sell,
+            cvd=buy - sell,
+            trade_imbalance=((buy - sell) / total) if total > 0.0 else None,
+            micro_vwap=vwap,
+            ofi=ofi,
+        )
 
     # ------------------------------------------------------------------ #
     # Candle ingestion + barstate confirmation                            #
@@ -671,8 +858,77 @@ async def _demo() -> None:
             )
 
 
+# --------------------------------------------------------------------------- #
+# Embedded tests — pure trade-flow math only (zero network, no event loop)     #
+# --------------------------------------------------------------------------- #
+
+
+class TradeFlowMathTests(unittest.TestCase):
+    def test_ofi_event_bid_up_ask_up_is_buying_pressure(self) -> None:
+        prev = (100.0, 5.0, 101.0, 7.0)
+        # Bid improves and ask lifts: +new bid queue, +old ask queue.
+        self.assertEqual(
+            MultiAssetFeed._ofi_event(prev, (100.5, 3.0, 101.5, 2.0)), 3.0 + 7.0
+        )
+
+    def test_ofi_event_bid_down_ask_down_is_selling_pressure(self) -> None:
+        prev = (100.0, 5.0, 101.0, 7.0)
+        self.assertEqual(
+            MultiAssetFeed._ofi_event(prev, (99.5, 9.0, 100.5, 4.0)), -5.0 - 4.0
+        )
+
+    def test_ofi_event_static_prices_nets_queue_changes(self) -> None:
+        prev = (100.0, 5.0, 101.0, 7.0)
+        # Same prices: bid queue +3 (buying), ask queue −1 (buying).
+        self.assertEqual(
+            MultiAssetFeed._ofi_event(prev, (100.0, 8.0, 101.0, 6.0)), 3.0 + 1.0
+        )
+
+    def test_window_metrics_filters_by_time_and_aggregates(self) -> None:
+        trades = (
+            (100, 9.0, 9.9, True),     # outside the window — ignored
+            (1000, 10.0, 2.0, True),
+            (2000, 11.0, 1.0, False),
+            (5000, 12.0, 3.0, True),
+        )
+        count, buy, sell, vwap = MultiAssetFeed._window_metrics(trades, 5000, 4500)
+        self.assertEqual(count, 3)
+        self.assertEqual(buy, 5.0)
+        self.assertEqual(sell, 1.0)
+        assert vwap is not None
+        self.assertAlmostEqual(vwap, (10.0 * 2 + 11.0 * 1 + 12.0 * 3) / 6.0)
+
+    def test_window_metrics_empty_is_safe(self) -> None:
+        self.assertEqual(
+            MultiAssetFeed._window_metrics((), 0, 1_000), (0, 0.0, 0.0, None)
+        )
+
+    def test_snapshot_math_via_fake_state(self) -> None:
+        feed = MultiAssetFeed.__new__(MultiAssetFeed)  # no network, no init
+        feed._timeframe_ms = 300_000
+        now = int(time.time() * 1_000)
+        feed._trades = {"X/Y": deque([(now - 1_000, 100.0, 2.0, True),
+                                      (now - 2_000, 99.0, 1.0, False)])}
+        feed._ofi_acc = {"X/Y": 42.0}
+        snap = feed.trade_flow("X/Y")
+        self.assertEqual(snap.trade_count, 2)
+        self.assertEqual(snap.cvd, 1.0)
+        assert snap.trade_imbalance is not None
+        self.assertAlmostEqual(snap.trade_imbalance, 1.0 / 3.0)
+        self.assertEqual(snap.ofi, 42.0)
+        self.assertEqual(feed._ofi_acc["X/Y"], 0.0)  # read-and-reset
+        snap2 = feed.trade_flow("X/Y")
+        self.assertEqual(snap2.ofi, 0.0)
+
+
 if __name__ == "__main__":
-    try:
-        asyncio.run(_demo())
-    except KeyboardInterrupt:
-        logger.info("feed demo interrupted — shutting down cleanly")
+    import sys as _sys
+
+    if len(_sys.argv) > 1 and _sys.argv[1] == "demo":
+        try:
+            asyncio.run(_demo())
+        except KeyboardInterrupt:
+            logger.info("feed demo interrupted — shutting down cleanly")
+    else:
+        logging.basicConfig(level=logging.INFO)
+        unittest.main()

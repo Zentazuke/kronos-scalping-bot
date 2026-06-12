@@ -66,7 +66,13 @@ from execution import (
     ExecutionStatus,
     PerformanceTracker,
 )
-from feed import SYMBOLS, FeedEvent, L2OrderBook, MultiAssetFeed
+from feed import (
+    SYMBOLS,
+    FeedEvent,
+    L2OrderBook,
+    MultiAssetFeed,
+    TradeFlowSnapshot,
+)
 from gatekeeper import ConfluenceReport, MarketGatekeeper, RegimeReport
 from journal import OutcomeMonitor, TradeJournal, TradeOutcome
 from learner import MetaFilter, features_from_context
@@ -754,6 +760,36 @@ class TradingSupervisor:
                 logger.info("%s: %s — standing down", symbol, direction.value)
                 return
 
+            # Step B¾ — trade-flow snapshot (Phase B). Read-and-reset, so
+            # exactly one consult per bar; fail-safe getattr keeps test
+            # fakes and degraded feeds harmless.
+            flow_fn: Any = getattr(self._feed, "trade_flow", None)
+            flow: Any = flow_fn(symbol) if callable(flow_fn) else None
+            flow_imbalance: Optional[Decimal] = None
+            ofi_rel: Optional[Decimal] = None
+            mvwap_gap_bps: Optional[Decimal] = None
+            if flow is not None:
+                if flow.trade_imbalance is not None:
+                    flow_imbalance = Decimal(str(round(flow.trade_imbalance, 6)))
+                if (
+                    regime.candle_volume is not None
+                    and regime.candle_volume > _ZERO
+                ):
+                    ofi_rel = Decimal(
+                        str(round(flow.ofi / float(regime.candle_volume), 6))
+                    )
+                if flow.micro_vwap is not None and flow.micro_vwap > 0.0:
+                    mvwap_gap_bps = Decimal(
+                        str(
+                            round(
+                                (float(trigger_price) - flow.micro_vwap)
+                                / flow.micro_vwap
+                                * 10_000,
+                                4,
+                            )
+                        )
+                    )
+
             # Step C½ — directional confluence: the model proposes, three
             # independent confirmations (DI direction, RSI exhaustion, L2
             # book imbalance) vote on the side before capital moves.
@@ -801,6 +837,17 @@ class TradingSupervisor:
                         book_imbalance=regime.book_imbalance,
                         atr=regime.atr,
                         atr_sma=regime.atr_sma,
+                        spread_bps=regime.spread_bps,
+                        relative_volume=regime.relative_volume,
+                        depth_imbalance=regime.depth_imbalance,
+                        trade_imbalance=flow_imbalance,
+                        ofi_rel=ofi_rel,
+                        mvwap_gap_bps=mvwap_gap_bps,
+                        microprice_gap_bps=regime.microprice_gap_bps,
+                        trend_1h=regime.trend_1h,
+                        trend_4h=regime.trend_4h,
+                        rsi_1h=regime.rsi_1h,
+                        day_range_pos=regime.day_range_pos,
                     )
                 )
                 if raw_score is not None:
@@ -906,6 +953,14 @@ class TradingSupervisor:
                     relative_volume=regime.relative_volume,
                     depth_imbalance=regime.depth_imbalance,
                     total_depth=regime.total_depth,
+                    trade_imbalance=flow_imbalance,
+                    ofi_rel=ofi_rel,
+                    mvwap_gap_bps=mvwap_gap_bps,
+                    microprice_gap_bps=regime.microprice_gap_bps,
+                    trend_1h=regime.trend_1h,
+                    trend_4h=regime.trend_4h,
+                    rsi_1h=regime.rsi_1h,
+                    day_range_pos=regime.day_range_pos,
                 )
                 self._publish_performance()
         except asyncio.CancelledError:
@@ -1063,6 +1118,18 @@ class _FakeFeed:
     async def stream(self) -> AsyncIterator[FeedEvent]:
         for event in self._events:
             yield event
+
+    def trade_flow(self, symbol: str) -> TradeFlowSnapshot:
+        return TradeFlowSnapshot(
+            window_ms=300_000,
+            trade_count=12,
+            buy_volume=7.5,
+            sell_volume=2.5,
+            cvd=5.0,
+            trade_imbalance=0.5,
+            micro_vwap=100.0,
+            ofi=40.0,
+        )
 
 
 class _FakeGatekeeper:
@@ -1264,6 +1331,26 @@ class TradingSupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(feed.started and feed.stopped)
         self.assertFalse(self.lockfile.exists())
+
+    async def test_flow_and_context_features_are_journaled(self) -> None:
+        supervisor, _, _, _, _ = _supervisor(
+            equity_sequence=[10_000.0, 10_000.0],
+            events=1,
+            regime_ok=True,
+            direction=SignalDirection.LONG,
+            lockfile=self.lockfile,
+        )
+        self.assertEqual(await supervisor.run(), EXIT_OK)
+        reopened = TradeJournal(self.lockfile.parent / "journal-test.db")
+        try:
+            (trade,) = reopened.open_trades()
+        finally:
+            reopened.close()
+        self.assertEqual(trade.trade_imbalance, Decimal("0.5"))
+        # OFI 40.0 / fake candle volume 200 = 0.2.
+        self.assertEqual(trade.ofi_rel, Decimal("0.2"))
+        # Trigger 100.0 vs micro-VWAP 100.0 -> 0 bps gap.
+        self.assertEqual(trade.mvwap_gap_bps, Decimal("0.0"))
 
     async def test_executed_trade_is_journaled_and_settled(self) -> None:
         # Bar 1 routes a LONG and journals it; before bar 2's decision the

@@ -103,6 +103,14 @@ CREATE TABLE IF NOT EXISTS trades (
     relative_volume TEXT,
     depth_imbalance TEXT,
     total_depth     TEXT,
+    trade_imbalance TEXT,
+    ofi_rel         TEXT,
+    mvwap_gap_bps   TEXT,
+    microprice_gap_bps TEXT,
+    trend_1h        TEXT,
+    trend_4h        TEXT,
+    rsi_1h          TEXT,
+    day_range_pos   TEXT,
     variant         TEXT NOT NULL DEFAULT 'prod',
     status          TEXT NOT NULL DEFAULT 'OPEN',
     ts_close        TEXT,
@@ -167,6 +175,14 @@ class TradeRecord:
     relative_volume: Optional[Decimal]
     depth_imbalance: Optional[Decimal]
     total_depth: Optional[Decimal]
+    trade_imbalance: Optional[Decimal]
+    ofi_rel: Optional[Decimal]
+    mvwap_gap_bps: Optional[Decimal]
+    microprice_gap_bps: Optional[Decimal]
+    trend_1h: Optional[Decimal]
+    trend_4h: Optional[Decimal]
+    rsi_1h: Optional[Decimal]
+    day_range_pos: Optional[Decimal]
     variant: str
     status: str
     ts_close: Optional[str]
@@ -257,6 +273,14 @@ class TradeJournal:
             "relative_volume",
             "depth_imbalance",
             "total_depth",
+            "trade_imbalance",
+            "ofi_rel",
+            "mvwap_gap_bps",
+            "microprice_gap_bps",
+            "trend_1h",
+            "trend_4h",
+            "rsi_1h",
+            "day_range_pos",
         ):
             if feature not in columns:
                 self._conn.execute(
@@ -288,6 +312,14 @@ class TradeJournal:
         relative_volume: Optional[Decimal] = None,
         depth_imbalance: Optional[Decimal] = None,
         total_depth: Optional[Decimal] = None,
+        trade_imbalance: Optional[Decimal] = None,
+        ofi_rel: Optional[Decimal] = None,
+        mvwap_gap_bps: Optional[Decimal] = None,
+        microprice_gap_bps: Optional[Decimal] = None,
+        trend_1h: Optional[Decimal] = None,
+        trend_4h: Optional[Decimal] = None,
+        rsi_1h: Optional[Decimal] = None,
+        day_range_pos: Optional[Decimal] = None,
     ) -> int:
         """Journal one EXECUTED bracket with its full decision context."""
         if result.executed_amount is None or result.entry_fill_price is None:
@@ -300,9 +332,11 @@ class TradeJournal:
                 adx, atr, atr_sma, rsi, plus_di, minus_di, book_imbalance,
                 p_up, p_down, confluence_votes, meta_p_win,
                 spread_bps, relative_volume, depth_imbalance, total_depth,
+                trade_imbalance, ofi_rel, mvwap_gap_bps, microprice_gap_bps,
+                trend_1h, trend_4h, rsi_1h, day_range_pos,
                 variant, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _utc_now(),
@@ -329,6 +363,14 @@ class TradeJournal:
                 _to_text(relative_volume),
                 _to_text(depth_imbalance),
                 _to_text(total_depth),
+                _to_text(trade_imbalance),
+                _to_text(ofi_rel),
+                _to_text(mvwap_gap_bps),
+                _to_text(microprice_gap_bps),
+                _to_text(trend_1h),
+                _to_text(trend_4h),
+                _to_text(rsi_1h),
+                _to_text(day_range_pos),
                 self._variant,
                 STATUS_OPEN,
             ),
@@ -398,6 +440,14 @@ class TradeJournal:
             relative_volume=_to_decimal(row["relative_volume"]),
             depth_imbalance=_to_decimal(row["depth_imbalance"]),
             total_depth=_to_decimal(row["total_depth"]),
+            trade_imbalance=_to_decimal(row["trade_imbalance"]),
+            ofi_rel=_to_decimal(row["ofi_rel"]),
+            mvwap_gap_bps=_to_decimal(row["mvwap_gap_bps"]),
+            microprice_gap_bps=_to_decimal(row["microprice_gap_bps"]),
+            trend_1h=_to_decimal(row["trend_1h"]),
+            trend_4h=_to_decimal(row["trend_4h"]),
+            rsi_1h=_to_decimal(row["rsi_1h"]),
+            day_range_pos=_to_decimal(row["day_range_pos"]),
             variant=str(row["variant"]),
             status=str(row["status"]),
             ts_close=row["ts_close"],
@@ -766,6 +816,14 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
             relative_volume=Decimal("2.5"),
             depth_imbalance=Decimal("-0.18"),
             total_depth=Decimal("145"),
+            trade_imbalance=Decimal("0.33"),
+            ofi_rel=Decimal("-0.07"),
+            mvwap_gap_bps=Decimal("1.8"),
+            microprice_gap_bps=Decimal("0.6"),
+            trend_1h=Decimal("1"),
+            trend_4h=Decimal("-1"),
+            rsi_1h=Decimal("58.2"),
+            day_range_pos=Decimal("0.81"),
         )
         (trade,) = self.journal.open_trades(_SYMBOL)
         self.assertEqual(trade.trade_id, trade_id)
@@ -778,6 +836,14 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade.relative_volume, Decimal("2.5"))
         self.assertEqual(trade.depth_imbalance, Decimal("-0.18"))
         self.assertEqual(trade.total_depth, Decimal("145"))
+        self.assertEqual(trade.trade_imbalance, Decimal("0.33"))
+        self.assertEqual(trade.ofi_rel, Decimal("-0.07"))
+        self.assertEqual(trade.mvwap_gap_bps, Decimal("1.8"))
+        self.assertEqual(trade.microprice_gap_bps, Decimal("0.6"))
+        self.assertEqual(trade.trend_1h, Decimal("1"))
+        self.assertEqual(trade.trend_4h, Decimal("-1"))
+        self.assertEqual(trade.rsi_1h, Decimal("58.2"))
+        self.assertEqual(trade.day_range_pos, Decimal("0.81"))
         self.assertTrue(trade.is_long)
 
     def test_performance_snapshot_aggregates(self) -> None:

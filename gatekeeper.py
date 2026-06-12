@@ -122,6 +122,12 @@ class RegimeReport:
     relative_volume: Optional[Decimal] = None  # candle / lookback average
     depth_imbalance: Optional[Decimal] = None  # (bid-ask)/(bid+ask), ±0.25%
     total_depth: Optional[Decimal] = None      # base units within ±0.25%
+    # Phase B: microprice + multi-timeframe context (journal-first features).
+    microprice_gap_bps: Optional[Decimal] = None  # depth-weighted mid vs mid
+    trend_1h: Optional[Decimal] = None         # +1 above 1h SMA10, −1 below
+    trend_4h: Optional[Decimal] = None         # +1 above 4h SMA5, −1 below
+    rsi_1h: Optional[Decimal] = None           # Wilder RSI(14) on 1h closes
+    day_range_pos: Optional[Decimal] = None    # close position in 24h range
 
     @property
     def passed(self) -> bool:
@@ -288,9 +294,10 @@ class MarketGatekeeper:
         relative_volume: Optional[Decimal] = (
             candle_volume / average_volume if average_volume > _ZERO else None
         )
-        spread_bps, depth_imbalance, total_depth = self._microstructure(
-            l2_order_book
+        spread_bps, depth_imbalance, total_depth, microprice_gap_bps = (
+            self._microstructure(l2_order_book)
         )
+        trend_1h, trend_4h, rsi_1h, day_range_pos = self._htf_context(dataframe)
 
         return RegimeReport(
             sufficient_data=True,
@@ -312,13 +319,24 @@ class MarketGatekeeper:
             relative_volume=relative_volume,
             depth_imbalance=depth_imbalance,
             total_depth=total_depth,
+            microprice_gap_bps=microprice_gap_bps,
+            trend_1h=trend_1h,
+            trend_4h=trend_4h,
+            rsi_1h=rsi_1h,
+            day_range_pos=day_range_pos,
         )
 
     @staticmethod
     def _microstructure(
         book: L2OrderBook,
-    ) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
-        """(spread_bps, depth_imbalance, total_depth) within 0.25% of mid.
+    ) -> Tuple[
+        Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]
+    ]:
+        """(spread_bps, depth_imbalance, total_depth, microprice_gap_bps).
+
+        Depth bands span ±0.25% of mid. The microprice is the depth-weighted
+        fair price (Stoikov): heavier bids pull it toward the ask, signalling
+        latent buying pressure; the gap vs mid is expressed in bps.
 
         Spread answers "is execution already expensive?"; the depth pair
         answers "who is defending price, and with how much size?". A book
@@ -326,11 +344,11 @@ class MarketGatekeeper:
         evidence is never fabricated.
         """
         if not book.is_populated:
-            return None, None, None
+            return None, None, None, None
         best_bid: Decimal = Decimal(str(book.bids[0][0]))
         best_ask: Decimal = Decimal(str(book.asks[0][0]))
         if best_bid <= _ZERO or best_ask <= _ZERO or best_ask < best_bid:
-            return None, None, None
+            return None, None, None, None
         mid: Decimal = (best_bid + best_ask) / Decimal("2")
         spread_bps: Decimal = (best_ask - best_bid) / mid * Decimal("10000")
         band: Decimal = mid * Decimal("0.0025")
@@ -350,10 +368,88 @@ class MarketGatekeeper:
             ),
             _ZERO,
         )
+        best_bid_size: Decimal = Decimal(str(book.bids[0][1]))
+        best_ask_size: Decimal = Decimal(str(book.asks[0][1]))
+        top_size: Decimal = best_bid_size + best_ask_size
+        microprice_gap_bps: Optional[Decimal] = None
+        if top_size > _ZERO:
+            microprice: Decimal = (
+                best_bid_size * best_ask + best_ask_size * best_bid
+            ) / top_size
+            microprice_gap_bps = (microprice - mid) / mid * Decimal("10000")
+
         total: Decimal = bid_depth + ask_depth
         if total <= _ZERO:
-            return spread_bps, None, total
-        return spread_bps, (bid_depth - ask_depth) / total, total
+            return spread_bps, None, total, microprice_gap_bps
+        return (
+            spread_bps,
+            (bid_depth - ask_depth) / total,
+            total,
+            microprice_gap_bps,
+        )
+
+    @staticmethod
+    def _htf_context(
+        dataframe: pd.DataFrame,
+    ) -> Tuple[
+        Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]
+    ]:
+        """(trend_1h, trend_4h, rsi_1h, day_range_pos) from the 5m window.
+
+        Resampled views of the bars already in memory — no extra fetches.
+        Float pandas math (model domain); results cross to Decimal here.
+        Missing history yields None — absent evidence is never invented.
+        """
+        try:
+            closes = dataframe["close"].astype("float64")
+            highs = dataframe["high"].astype("float64")
+            lows = dataframe["low"].astype("float64")
+            stamps = pd.DatetimeIndex(dataframe["timestamps"])
+        except (KeyError, TypeError, ValueError):
+            return None, None, None, None
+
+        def _dec(value: float) -> Decimal:
+            return Decimal(str(round(value, 6)))
+
+        series = pd.Series(closes.to_numpy(), index=stamps)
+        hourly = series.resample("1h").last().dropna()
+        four_hourly = series.resample("4h").last().dropna()
+
+        trend_1h: Optional[Decimal] = None
+        if len(hourly) >= 11:
+            sma = float(hourly.iloc[-10:].mean())
+            trend_1h = Decimal("1") if float(hourly.iloc[-1]) > sma else Decimal("-1")
+
+        trend_4h: Optional[Decimal] = None
+        if len(four_hourly) >= 6:
+            sma4 = float(four_hourly.iloc[-5:].mean())
+            trend_4h = (
+                Decimal("1") if float(four_hourly.iloc[-1]) > sma4 else Decimal("-1")
+            )
+
+        rsi_1h: Optional[Decimal] = None
+        if len(hourly) >= 15:
+            deltas = hourly.diff().dropna().to_numpy()[-28:]
+            gains = [d for d in deltas if d > 0]
+            losses = [-d for d in deltas if d < 0]
+            avg_gain = sum(gains) / len(deltas) if deltas.size else 0.0
+            avg_loss = sum(losses) / len(deltas) if deltas.size else 0.0
+            if avg_loss == 0.0:
+                rsi_1h = Decimal("100") if avg_gain > 0.0 else Decimal("50")
+            else:
+                rs = avg_gain / avg_loss
+                rsi_1h = _dec(100.0 - 100.0 / (1.0 + rs))
+
+        day_range_pos: Optional[Decimal] = None
+        window = min(len(closes), 288)  # 24h of 5m bars
+        if window >= 12:
+            high_max = float(highs.iloc[-window:].max())
+            low_min = float(lows.iloc[-window:].min())
+            span = high_max - low_min
+            if span > 0.0:
+                day_range_pos = _dec((float(closes.iloc[-1]) - low_min) / span)
+
+        return trend_1h, trend_4h, rsi_1h, day_range_pos
 
     def confluence(self, report: RegimeReport, *, long_side: bool) -> ConfluenceReport:
         """Count how many directional confirmations agree with the model.
@@ -707,6 +803,33 @@ class MarketGatekeeperTests(unittest.TestCase):
         self.assertAlmostEqual(float(report.depth_imbalance), 1 / 3, places=6)
         assert report.relative_volume is not None
         self.assertGreater(report.relative_volume, Decimal("1"))
+
+    def test_microprice_gap_reflects_bid_heaviness(self) -> None:
+        frame: pd.DataFrame = _trending_frame()
+        report: RegimeReport = self.gatekeeper.evaluate(
+            frame, _book_for(frame, bid_sizes=(9.0, 1.0, 1.0), ask_sizes=(3.0, 1.0, 1.0))
+        )
+        # Heavy bid queue pulls the microprice toward the ask: positive gap.
+        # microprice = (9*100.1 + 3*100.0)/12 = 100.075; mid = 100.05.
+        assert report.microprice_gap_bps is not None
+        self.assertAlmostEqual(float(report.microprice_gap_bps), 2.4988, places=3)
+
+    def test_htf_context_on_long_uptrend(self) -> None:
+        frame: pd.DataFrame = _trending_frame(num_bars=300)
+        trend_1h, trend_4h, rsi_1h, day_pos = MarketGatekeeper._htf_context(frame)
+        self.assertEqual(trend_1h, Decimal("1"))   # monotone uptrend
+        self.assertEqual(trend_4h, Decimal("1"))
+        assert rsi_1h is not None
+        self.assertGreater(rsi_1h, Decimal("70"))  # relentless gains
+        assert day_pos is not None
+        self.assertGreater(day_pos, Decimal("0.9"))  # closing at range top
+
+    def test_htf_context_short_history_is_all_none(self) -> None:
+        frame: pd.DataFrame = _trending_frame(num_bars=40)
+        trend_1h, trend_4h, rsi_1h, _ = MarketGatekeeper._htf_context(frame)
+        self.assertIsNone(trend_1h)   # 40 bars = 3.3h — not enough for 1h SMA10
+        self.assertIsNone(trend_4h)
+        self.assertIsNone(rsi_1h)
 
     def test_microstructure_none_on_empty_book(self) -> None:
         frame: pd.DataFrame = _trending_frame()

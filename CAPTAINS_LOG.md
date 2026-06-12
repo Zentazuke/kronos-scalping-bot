@@ -131,7 +131,23 @@ more market conditions. ADA SHORTS are the bleeding pattern so far
   holdout vs predict-majority baseline. KEEP shadow mode. Journal now stores
   meta_p_win per trade → its shadow record accumulates for M4.
 
-**M2 — Phase B microstructure (next build session, ~one session):**
+**M2 — DONE 2026-06-12 afternoon (suite 111):** feed.py gained a
+TradeFlowMonitor: watch_trades worker per symbol (rolling 20k-print window),
+level-1 OFI accumulated from every book update (Cont 2014 — _ofi_event),
+`feed.trade_flow(symbol)` is READ-AND-RESET, called once per bar at step B¾.
+Gatekeeper: microprice gap (Stoikov depth-weighted mid vs mid, bps) +
+multi-timeframe context resampled from the in-memory 512-bar window
+(trend_1h = close vs 1h SMA10, trend_4h = close vs 4h SMA5, rsi_1h Wilder,
+day_range_pos over last 288 bars). 8 new journal columns (auto-migrate):
+trade_imbalance, ofi_rel (OFI / candle volume), mvwap_gap_bps,
+microprice_gap_bps, trend_1h, trend_4h, rsi_1h, day_range_pos.
+Learner FEATURE_NAMES now 17 (v2). IMPORTANT: extending features
+deliberately invalidates the saved v1 model (load() rejects feature-name
+mismatch) -> meta filter DORMANT until v2 trains at ~250 decided. v1 was
+anti-predictive (33%), so nothing of value was lost. feed.py also gained
+its first embedded test suite (pure math; add `feed` to the unittest list).
+
+**M2 (original spec, kept for reference):**
 - feed.py: `watch_trades` consumer per symbol; rolling 1m/5m windows of
   aggressive buy/sell volume → CVD + trade imbalance; book-snapshot diffs
   accumulated between bars → true OFI (Cont); micro-VWAP from trades;

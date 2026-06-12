@@ -82,6 +82,17 @@ FEATURE_NAMES: Final[Tuple[str, ...]] = (
     "spread_bps",
     "rel_volume",
     "depth_align",
+    # Phase B v2 features. Extending invalidates any saved v1 model on
+    # purpose: MetaModel.load() refuses a feature_names mismatch, so the
+    # filter goes dormant until retrained — never scores with stale weights.
+    "flow_align",
+    "ofi_align",
+    "mvwap_align",
+    "micro_gap_align",
+    "htf_1h_align",
+    "htf_4h_align",
+    "rsi_1h_room",
+    "day_range_pos",
 )
 
 META_MIN_SAMPLES: Final[int] = 100  # decided trades before the model is real
@@ -115,6 +126,14 @@ def features_from_context(
     spread_bps: Optional[Decimal] = None,
     relative_volume: Optional[Decimal] = None,
     depth_imbalance: Optional[Decimal] = None,
+    trade_imbalance: Optional[Decimal] = None,
+    ofi_rel: Optional[Decimal] = None,
+    mvwap_gap_bps: Optional[Decimal] = None,
+    microprice_gap_bps: Optional[Decimal] = None,
+    trend_1h: Optional[Decimal] = None,
+    trend_4h: Optional[Decimal] = None,
+    rsi_1h: Optional[Decimal] = None,
+    day_range_pos: Optional[Decimal] = None,
 ) -> List[float]:
     """Direction-signed feature vector from live decision-time values."""
     edge_p: float = _f(p_up if long_side else p_down, 0.5)
@@ -135,9 +154,23 @@ def features_from_context(
     rel_volume: float = _f(relative_volume, 1.0)
     raw_depth: float = _f(depth_imbalance, 0.0)
     depth_align: float = raw_depth if long_side else -raw_depth
+    sign: float = 1.0 if long_side else -1.0
+    flow_align: float = sign * _f(trade_imbalance, 0.0)
+    ofi_align: float = sign * _f(ofi_rel, 0.0)
+    mvwap_align: float = sign * _f(mvwap_gap_bps, 0.0) / 100.0
+    micro_gap_align: float = sign * _f(microprice_gap_bps, 0.0)
+    htf_1h_align: float = sign * _f(trend_1h, 0.0)
+    htf_4h_align: float = sign * _f(trend_4h, 0.0)
+    rsi_1h_value: float = _f(rsi_1h, 50.0)
+    rsi_1h_room: float = (
+        (70.0 - rsi_1h_value) if long_side else (rsi_1h_value - 30.0)
+    ) / 100.0
+    day_pos: float = _f(day_range_pos, 0.5)
     return [
         edge_p, di_align, rsi_room, book_align, atr_ratio, adx_norm,
         spread, rel_volume, depth_align,
+        flow_align, ofi_align, mvwap_align, micro_gap_align,
+        htf_1h_align, htf_4h_align, rsi_1h_room, day_pos,
     ]
 
 
@@ -156,6 +189,14 @@ def features_from_record(trade: TradeRecord) -> List[float]:
         spread_bps=trade.spread_bps,
         relative_volume=trade.relative_volume,
         depth_imbalance=trade.depth_imbalance,
+        trade_imbalance=trade.trade_imbalance,
+        ofi_rel=trade.ofi_rel,
+        mvwap_gap_bps=trade.mvwap_gap_bps,
+        microprice_gap_bps=trade.microprice_gap_bps,
+        trend_1h=trade.trend_1h,
+        trend_4h=trade.trend_4h,
+        rsi_1h=trade.rsi_1h,
+        day_range_pos=trade.day_range_pos,
     )
 
 
