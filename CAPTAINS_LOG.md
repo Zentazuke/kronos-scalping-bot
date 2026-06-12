@@ -107,6 +107,59 @@ python learner.py train                # trains meta model from journal.db
 python learner.py train --db A/journal.db --db C/journal.db  # pooled variants
 ```
 
+## 6¼. MASTER PLAN v2 (written 2026-06-12 evening — supersedes v1 below)
+
+**PHASE 1 — industrialize the mill (this week)**
+1. [USER, in progress] Server: Netcup VPS (Hetzner CX22 was out of stock),
+   DEPLOY.md runbook, carry journal.db over, Tailscale for dashboard.
+   ONE bot per account — stop the PC bot before starting the server one.
+2. [CLAUDE, small build] SYMBOLS env knob + add ETH/USDT, SOL/USDT
+   (2-3x data velocity, CPU permitting) + trainer upgrades: walk-forward
+   CV instead of single 80/20 holdout, L1 to expose dead features.
+3. [USER, any night, on the PC while server trades]
+   python calibrate.py BTC/USDT --days 14 --stride 3      (overnight)
+   python backtest.py BTC/USDT --days 90 --walk-forward   (fee-aware now)
+   python backtest.py ADA/USDT --days 90 --walk-forward
+
+**PHASE 2 — learning-rate multipliers (next full build session)**
+4. [CLAUDE, the big one] Observation journal: record the 21-feature vector
+   for EVERY evaluated bar (not just routed trades) + offline phantom
+   labelling via the backtest bracket simulator -> ~10x training samples
+   per day. Real trades remain the gold standard; phantoms are clearly
+   flagged in a separate table/column.
+5. [CLAUDE, rides along] MFE/MAE columns in OutcomeMonitor (max
+   favorable/adverse excursion) -> every real trade re-labelable against
+   any hypothetical bracket offline.
+
+**PHASE 3 — first real decisions (data-gated)**
+6. Retrain meta v2 at ~250+ decided (or phantom-augmented earlier);
+   judge by walk-forward CV stability, not one holdout number.
+7. Calibration verdict -> probability shrinkage / dead-band / edge changes.
+8. 90d walk-forward verdicts -> confirm or adjust TP/SL/ADX.
+
+**PHASE 4 — the variant farm (blocked on USER: 2 extra testnet accounts)**
+9. Three bots on the server (systemd each, separate accounts/folders):
+   A prod = enforced gates + Kelly + single position (the CONTROL GROUP);
+   B relaxed = enforced but loose (ADX>20, votes=1, edge 0.50 + dead band
+   down); C harvester = current config. CPU check with 3x Kronos.
+10. M4 promotion: meta shadow record vs unfiltered baseline over ~100+
+    trades; veto power only on a win. Pooled training across variants.
+
+**PHASE 5 — frontier (strictly evidence-gated)**
+11. XGBoost/LightGBM meta v3 at ~1000+ samples (architecture is already
+    model-agnostic; ~50-line learner change).
+12. Kronos fine-tune (Phase 10) ONLY if calibration proves the model is
+    the bottleneck.
+13. Sentiment engine integration — USER's parallel project, his timeline;
+    shadow hook already live, journal-first when it matures.
+14. Named chart patterns / sub-minute momentum — parked unless evidence
+    demands.
+
+**BEFORE ANYTHING RESEMBLING REAL MONEY (unchanged, non-negotiable):**
+restore RISK_TOTAL_DRAWDOWN_LIMIT=0.03, MAX_OPEN_TRADES_PER_SYMBOL=1,
+Kelly sizing, enforce flags true, spread/fee-aware edge PROVEN positive,
+IP-whitelisted keys. The harvester .env is a data rig, never production.
+
 ## 6½. MASTER PLAN — everything left, in execution order (written 2026-06-12 ~01:30)
 
 **M0 — user's morning chores (no Claude needed):**
