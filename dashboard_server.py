@@ -47,13 +47,9 @@ def _trades() -> List[Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         return [
             dict(r)
-            for r in conn.execute(
-                "SELECT id, ts_open, ts_close, symbol, direction, amount,"
-                " entry_price, tp_price, sl_price, exit_price, pnl, status,"
-                " variant, confluence_votes, p_up, p_down, adx, rsi,"
-                " atr, atr_sma, plus_di, minus_di, book_imbalance, meta_p_win"
-                " FROM trades ORDER BY id"
-            )
+            # SELECT * so newly migrated feature columns (Phase A/B and
+            # beyond) reach the dashboard without further server changes.
+            for r in conn.execute("SELECT * FROM trades ORDER BY id")
         ]
     finally:
         conn.close()
