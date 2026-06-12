@@ -71,6 +71,7 @@ from gatekeeper import ConfluenceReport, MarketGatekeeper, RegimeReport
 from journal import OutcomeMonitor, TradeJournal, TradeOutcome
 from learner import MetaFilter, features_from_context
 from predictor import KronosInferenceEngine, PredictionReport, SignalDirection
+from sentiment_shadow_client import SentimentShadowClient
 from visualizer import (
     ConfluenceUpdate,
     EquityUpdate,
@@ -296,6 +297,17 @@ class TradingSupervisor:
             dead_band_low=Decimal(os.getenv("DEAD_BAND_LOW", "0.48")),
             dead_band_high=Decimal(os.getenv("DEAD_BAND_HIGH", "0.52")),
         )
+
+        # SENTIMENT_SHADOW (default on): pure-observation hook into the
+        # standalone sentiment/microstructure engine. Fire-and-forget; the
+        # result is never read here and can never delay or alter routing.
+        # If the engine is down the call degrades to a logged no-op.
+        # SENTIMENT_ENGINE_URL overrides the default http://127.0.0.1:8787.
+        self._sentiment_shadow: Optional[SentimentShadowClient] = None
+        if os.getenv("SENTIMENT_SHADOW", "on").lower() not in ("off", "0", "false"):
+            self._sentiment_shadow = SentimentShadowClient(
+                base_url=os.getenv("SENTIMENT_ENGINE_URL", "http://127.0.0.1:8787"),
+            )
 
         # Multi-variant data farm (harvester support): the regime and
         # confluence gates are ALWAYS computed and journaled, but a variant
@@ -830,6 +842,28 @@ class TradingSupervisor:
                             )
                         )
 
+            # Step C⅞ — sentiment/microstructure shadow evaluation
+            # (Phase: shadow only). Fire-and-forget by design: returns in
+            # microseconds, the Future is intentionally dropped, and the
+            # trade proceeds exactly as if this block did not exist. The
+            # sentiment engine journals its confirm/neutral/veto opinion
+            # plus realized price outcomes for offline comparison.
+            if self._sentiment_shadow is not None:
+                self._sentiment_shadow.evaluate_async(
+                    symbol=symbol,
+                    direction=(
+                        "STRAT_LONG"
+                        if direction is SignalDirection.LONG
+                        else "STRAT_SHORT"
+                    ),
+                    bot_confidence=float(
+                        prediction.p_up
+                        if direction is SignalDirection.LONG
+                        else prediction.p_down
+                    ),
+                    trigger_price=float(trigger_price),
+                )
+
             # Step D — protective execution routing. The live open-trade
             # count feeds the concurrent-position cap (harvester mode);
             # single-position mode ignores it.
@@ -1203,10 +1237,14 @@ def _supervisor(
 class TradingSupervisorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         os.environ["USE_SANDBOX"] = "True"
+        # Zero network in tests: the sentiment shadow hook would otherwise
+        # fire (harmless, fail-safe) HTTP attempts at localhost per signal.
+        os.environ["SENTIMENT_SHADOW"] = "off"
         self._tmp = tempfile.TemporaryDirectory()
         self.lockfile: Path = Path(self._tmp.name) / "emergency_lock.lock"
 
     def tearDown(self) -> None:
+        os.environ.pop("SENTIMENT_SHADOW", None)
         self._tmp.cleanup()
 
     async def test_full_pipeline_routes_long_signal(self) -> None:
