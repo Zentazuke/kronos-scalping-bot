@@ -487,7 +487,7 @@ function renderSide() {
     const mt = d.meta;
     rows.push(mt && !isStale(mt)
       ? decRow('warn', 'Meta', mt.text.replace(sym + ': ', ''), false)
-      : decRow('na', 'Meta', 'dormant (needs 100 decided trades)', false));
+      : decRow('na', 'Meta', 'dormant — no valid model loaded (train with: python learner.py train)', false));
 
     // 5 · Route
     const oc = d.outcome, br = d.bracket;
