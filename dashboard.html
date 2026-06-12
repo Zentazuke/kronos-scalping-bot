@@ -387,7 +387,11 @@ function openChain(id) {
      `µprice gap ${v(n(t.microprice_gap_bps))} bps<br>` +
      `1h trend ${t.trend_1h === null || t.trend_1h === undefined ? '—' : (n(t.trend_1h) > 0 ? '↑ up' : '↓ down')} · ` +
      `4h trend ${t.trend_4h === null || t.trend_4h === undefined ? '—' : (n(t.trend_4h) > 0 ? '↑ up' : '↓ down')} · ` +
-     `1h RSI ${v(n(t.rsi_1h), 1)} · day range ${t.day_range_pos === null || t.day_range_pos === undefined ? '—' : fmt(n(t.day_range_pos) * 100, 0) + '%'}`],
+     `1h RSI ${v(n(t.rsi_1h), 1)} · day range ${t.day_range_pos === null || t.day_range_pos === undefined ? '—' : fmt(n(t.day_range_pos) * 100, 0) + '%'}<br>` +
+     `1d trend ${t.trend_1d === null || t.trend_1d === undefined ? '—' : (n(t.trend_1d) > 0 ? '↑' : '↓')} · ` +
+     `macro (SMA200) ${t.macro_trend === null || t.macro_trend === undefined ? '—' : (n(t.macro_trend) > 0 ? '↑ bull' : '↓ bear')} · ` +
+     `vs 30d high ${t.dist_30d_high === null || t.dist_30d_high === undefined ? '—' : fmt(n(t.dist_30d_high) * 100, 1) + '%'} · ` +
+     `vol regime ${t.vol_pct_1d === null || t.vol_pct_1d === undefined ? '—' : fmt(n(t.vol_pct_1d) * 100, 0) + 'th pct'}`],
     [meta === null ? 'na' : (meta >= 0.5 ? 'ok' : 'no'),
      '4 · Meta-filter — learned P(win) for this setup',
      meta === null ? 'Dormant (needs 100 decided trades to train)' :

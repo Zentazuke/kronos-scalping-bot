@@ -93,6 +93,13 @@ FEATURE_NAMES: Final[Tuple[str, ...]] = (
     "htf_4h_align",
     "rsi_1h_room",
     "day_range_pos",
+    # Daily macro context. Near-constant within any short harvest window —
+    # informative only across regime changes; journaled now so the dataset
+    # is regime-aware when that day comes.
+    "trend_1d_align",
+    "macro_align",
+    "dist_30d_high",
+    "vol_pct_1d",
 )
 
 META_MIN_SAMPLES: Final[int] = 100  # decided trades before the model is real
@@ -134,6 +141,10 @@ def features_from_context(
     trend_4h: Optional[Decimal] = None,
     rsi_1h: Optional[Decimal] = None,
     day_range_pos: Optional[Decimal] = None,
+    trend_1d: Optional[Decimal] = None,
+    macro_trend: Optional[Decimal] = None,
+    dist_30d_high: Optional[Decimal] = None,
+    vol_pct_1d: Optional[Decimal] = None,
 ) -> List[float]:
     """Direction-signed feature vector from live decision-time values."""
     edge_p: float = _f(p_up if long_side else p_down, 0.5)
@@ -166,11 +177,16 @@ def features_from_context(
         (70.0 - rsi_1h_value) if long_side else (rsi_1h_value - 30.0)
     ) / 100.0
     day_pos: float = _f(day_range_pos, 0.5)
+    trend_1d_align: float = sign * _f(trend_1d, 0.0)
+    macro_align: float = sign * _f(macro_trend, 0.0)
+    dist_high: float = _f(dist_30d_high, 0.0)
+    vol_regime: float = _f(vol_pct_1d, 0.5)
     return [
         edge_p, di_align, rsi_room, book_align, atr_ratio, adx_norm,
         spread, rel_volume, depth_align,
         flow_align, ofi_align, mvwap_align, micro_gap_align,
         htf_1h_align, htf_4h_align, rsi_1h_room, day_pos,
+        trend_1d_align, macro_align, dist_high, vol_regime,
     ]
 
 
@@ -197,6 +213,10 @@ def features_from_record(trade: TradeRecord) -> List[float]:
         trend_4h=trade.trend_4h,
         rsi_1h=trade.rsi_1h,
         day_range_pos=trade.day_range_pos,
+        trend_1d=trade.trend_1d,
+        macro_trend=trade.macro_trend,
+        dist_30d_high=trade.dist_30d_high,
+        vol_pct_1d=trade.vol_pct_1d,
     )
 
 

@@ -68,6 +68,7 @@ from execution import (
 )
 from feed import (
     SYMBOLS,
+    DailyContext,
     FeedEvent,
     L2OrderBook,
     MultiAssetFeed,
@@ -859,6 +860,19 @@ class TradingSupervisor:
                         )
                     )
 
+            # Step B⅞ — daily macro context (Phase B½): regime label per
+            # trade; near-constant day to day, decisive across months.
+            daily_fn: Any = getattr(self._feed, "daily_context", None)
+            daily: Any = daily_fn(symbol) if callable(daily_fn) else None
+
+            def _ctx_dec(value: Any) -> Optional[Decimal]:
+                return None if value is None else Decimal(str(round(value, 6)))
+
+            trend_1d = _ctx_dec(getattr(daily, "trend_1d", None))
+            macro_trend = _ctx_dec(getattr(daily, "macro_trend", None))
+            dist_30d_high = _ctx_dec(getattr(daily, "dist_30d_high", None))
+            vol_pct_1d = _ctx_dec(getattr(daily, "vol_pct", None))
+
             # Step C½ — directional confluence: the model proposes, three
             # independent confirmations (DI direction, RSI exhaustion, L2
             # book imbalance) vote on the side before capital moves.
@@ -917,6 +931,10 @@ class TradingSupervisor:
                         trend_4h=regime.trend_4h,
                         rsi_1h=regime.rsi_1h,
                         day_range_pos=regime.day_range_pos,
+                        trend_1d=trend_1d,
+                        macro_trend=macro_trend,
+                        dist_30d_high=dist_30d_high,
+                        vol_pct_1d=vol_pct_1d,
                     )
                 )
                 if raw_score is not None:
@@ -1030,6 +1048,10 @@ class TradingSupervisor:
                     trend_4h=regime.trend_4h,
                     rsi_1h=regime.rsi_1h,
                     day_range_pos=regime.day_range_pos,
+                    trend_1d=trend_1d,
+                    macro_trend=macro_trend,
+                    dist_30d_high=dist_30d_high,
+                    vol_pct_1d=vol_pct_1d,
                 )
                 self._publish_performance()
         except asyncio.CancelledError:
@@ -1198,6 +1220,14 @@ class _FakeFeed:
             trade_imbalance=0.5,
             micro_vwap=100.0,
             ofi=40.0,
+        )
+
+    def daily_context(self, symbol: str) -> DailyContext:
+        return DailyContext(
+            trend_1d=1.0,
+            macro_trend=-1.0,
+            dist_30d_high=-0.12,
+            vol_pct=0.85,
         )
 
 
@@ -1473,6 +1503,9 @@ class TradingSupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             reopened.close()
         self.assertEqual(trade.trade_imbalance, Decimal("0.5"))
+        self.assertEqual(trade.macro_trend, Decimal("-1.0"))
+        self.assertEqual(trade.dist_30d_high, Decimal("-0.12"))
+        self.assertEqual(trade.vol_pct_1d, Decimal("0.85"))
         # OFI 40.0 / fake candle volume 200 = 0.2.
         self.assertEqual(trade.ofi_rel, Decimal("0.2"))
         # Trigger 100.0 vs micro-VWAP 100.0 -> 0 bps gap.

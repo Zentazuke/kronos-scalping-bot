@@ -111,6 +111,10 @@ CREATE TABLE IF NOT EXISTS trades (
     trend_4h        TEXT,
     rsi_1h          TEXT,
     day_range_pos   TEXT,
+    trend_1d        TEXT,
+    macro_trend     TEXT,
+    dist_30d_high   TEXT,
+    vol_pct_1d      TEXT,
     variant         TEXT NOT NULL DEFAULT 'prod',
     status          TEXT NOT NULL DEFAULT 'OPEN',
     ts_close        TEXT,
@@ -183,6 +187,10 @@ class TradeRecord:
     trend_4h: Optional[Decimal]
     rsi_1h: Optional[Decimal]
     day_range_pos: Optional[Decimal]
+    trend_1d: Optional[Decimal]
+    macro_trend: Optional[Decimal]
+    dist_30d_high: Optional[Decimal]
+    vol_pct_1d: Optional[Decimal]
     variant: str
     status: str
     ts_close: Optional[str]
@@ -281,6 +289,10 @@ class TradeJournal:
             "trend_4h",
             "rsi_1h",
             "day_range_pos",
+            "trend_1d",
+            "macro_trend",
+            "dist_30d_high",
+            "vol_pct_1d",
         ):
             if feature not in columns:
                 self._conn.execute(
@@ -320,6 +332,10 @@ class TradeJournal:
         trend_4h: Optional[Decimal] = None,
         rsi_1h: Optional[Decimal] = None,
         day_range_pos: Optional[Decimal] = None,
+        trend_1d: Optional[Decimal] = None,
+        macro_trend: Optional[Decimal] = None,
+        dist_30d_high: Optional[Decimal] = None,
+        vol_pct_1d: Optional[Decimal] = None,
     ) -> int:
         """Journal one EXECUTED bracket with its full decision context."""
         if result.executed_amount is None or result.entry_fill_price is None:
@@ -334,9 +350,10 @@ class TradeJournal:
                 spread_bps, relative_volume, depth_imbalance, total_depth,
                 trade_imbalance, ofi_rel, mvwap_gap_bps, microprice_gap_bps,
                 trend_1h, trend_4h, rsi_1h, day_range_pos,
+                trend_1d, macro_trend, dist_30d_high, vol_pct_1d,
                 variant, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _utc_now(),
@@ -371,6 +388,10 @@ class TradeJournal:
                 _to_text(trend_4h),
                 _to_text(rsi_1h),
                 _to_text(day_range_pos),
+                _to_text(trend_1d),
+                _to_text(macro_trend),
+                _to_text(dist_30d_high),
+                _to_text(vol_pct_1d),
                 self._variant,
                 STATUS_OPEN,
             ),
@@ -448,6 +469,10 @@ class TradeJournal:
             trend_4h=_to_decimal(row["trend_4h"]),
             rsi_1h=_to_decimal(row["rsi_1h"]),
             day_range_pos=_to_decimal(row["day_range_pos"]),
+            trend_1d=_to_decimal(row["trend_1d"]),
+            macro_trend=_to_decimal(row["macro_trend"]),
+            dist_30d_high=_to_decimal(row["dist_30d_high"]),
+            vol_pct_1d=_to_decimal(row["vol_pct_1d"]),
             variant=str(row["variant"]),
             status=str(row["status"]),
             ts_close=row["ts_close"],
@@ -824,6 +849,8 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
             trend_4h=Decimal("-1"),
             rsi_1h=Decimal("58.2"),
             day_range_pos=Decimal("0.81"),
+            macro_trend=Decimal("-1"),
+            dist_30d_high=Decimal("-0.15"),
         )
         (trade,) = self.journal.open_trades(_SYMBOL)
         self.assertEqual(trade.trade_id, trade_id)
@@ -844,6 +871,9 @@ class TradeJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade.trend_4h, Decimal("-1"))
         self.assertEqual(trade.rsi_1h, Decimal("58.2"))
         self.assertEqual(trade.day_range_pos, Decimal("0.81"))
+        self.assertEqual(trade.macro_trend, Decimal("-1"))
+        self.assertEqual(trade.dist_30d_high, Decimal("-0.15"))
+        self.assertIsNone(trade.trend_1d)
         self.assertTrue(trade.is_long)
 
     def test_performance_snapshot_aggregates(self) -> None:

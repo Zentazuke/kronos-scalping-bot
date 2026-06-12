@@ -147,6 +147,23 @@ TradeTick = Tuple[int, float, float, bool]
 
 
 @dataclass(frozen=True, slots=True)
+class DailyContext:
+    """Macro context from daily candles (float domain, REST-fetched).
+
+    ``macro_trend`` is the canonical bull/bear line: +1 above the daily
+    SMA200, −1 below. ``trend_1d`` uses the faster SMA50. ``dist_30d_high``
+    is the drawdown from the 30-day high (≤ 0). ``vol_pct`` ranks the
+    current 30-day realized volatility against the full fetched history
+    (0 = calmest regime on record, 1 = stormiest). None = not enough data.
+    """
+
+    trend_1d: Optional[float]
+    macro_trend: Optional[float]
+    dist_30d_high: Optional[float]
+    vol_pct: Optional[float]
+
+
+@dataclass(frozen=True, slots=True)
 class TradeFlowSnapshot:
     """Aggressive trade-flow metrics over the last bar window.
 
@@ -219,6 +236,9 @@ class MultiAssetFeed:
             s: deque(maxlen=TRADE_WINDOW_MAXLEN) for s in self._symbols
         }
         self._ofi_acc: Dict[str, float] = {s: 0.0 for s in self._symbols}
+        self._daily: Dict[str, Optional[DailyContext]] = {
+            s: None for s in self._symbols
+        }
         self._prev_best: Dict[str, Optional[Tuple[float, float, float, float]]] = {
             s: None for s in self._symbols
         }
@@ -301,6 +321,11 @@ class MultiAssetFeed:
             self._tasks.append(
                 asyncio.create_task(
                     self._trades_worker(symbol), name=f"trades:{symbol}"
+                )
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    self._daily_worker(symbol), name=f"daily:{symbol}"
                 )
             )
 
@@ -535,6 +560,80 @@ class MultiAssetFeed:
                     delay,
                 )
                 await asyncio.sleep(delay)
+
+    async def _daily_worker(self, symbol: str) -> None:
+        """Fetch ~250 daily candles, refresh every 6h. Fail-safe: errors
+        retry in 15 minutes; ``daily_context`` is None until the first
+        successful fetch (absent evidence stays absent)."""
+        while not self._closed:
+            try:
+                payload: Any = await self._exchange.fetch_ohlcv(
+                    symbol, timeframe="1d", limit=250
+                )
+                closes: List[float] = [float(row[4]) for row in payload or []]
+                self._daily[symbol] = self._daily_metrics(closes)
+                logger.info(
+                    "%s: daily macro context refreshed (%d candles)",
+                    symbol,
+                    len(closes),
+                )
+                await asyncio.sleep(6 * 3600)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — macro context is optional
+                logger.warning(
+                    "%s: daily context fetch failed — retry in 15 min",
+                    symbol,
+                    exc_info=True,
+                )
+                await asyncio.sleep(900)
+
+    @staticmethod
+    def _daily_metrics(closes: Sequence[float]) -> DailyContext:
+        """Pure macro math over daily closes (unit-tested, no network)."""
+        n: int = len(closes)
+        last: Optional[float] = closes[-1] if n else None
+        trend_1d: Optional[float] = None
+        if last is not None and n >= 50:
+            sma50: float = sum(closes[-50:]) / 50.0
+            trend_1d = 1.0 if last > sma50 else -1.0
+        macro_trend: Optional[float] = None
+        if last is not None and n >= 200:
+            sma200: float = sum(closes[-200:]) / 200.0
+            macro_trend = 1.0 if last > sma200 else -1.0
+        dist_30d_high: Optional[float] = None
+        if last is not None and n >= 5:
+            high: float = max(closes[-30:])
+            if high > 0.0:
+                dist_30d_high = last / high - 1.0
+        vol_pct: Optional[float] = None
+        if n >= 60:
+            returns: List[float] = [
+                (closes[i] / closes[i - 1] - 1.0)
+                for i in range(1, n)
+                if closes[i - 1] > 0.0
+            ]
+
+            def _window_vol(end: int) -> float:
+                window = returns[end - 30 : end]
+                mean: float = sum(window) / 30.0
+                return (sum((r - mean) ** 2 for r in window) / 30.0) ** 0.5
+
+            vols: List[float] = [
+                _window_vol(end) for end in range(30, len(returns) + 1)
+            ]
+            current: float = vols[-1]
+            vol_pct = sum(1 for v in vols if v <= current) / len(vols)
+        return DailyContext(
+            trend_1d=trend_1d,
+            macro_trend=macro_trend,
+            dist_30d_high=dist_30d_high,
+            vol_pct=vol_pct,
+        )
+
+    def daily_context(self, symbol: str) -> Optional[DailyContext]:
+        """Latest macro context, or None before the first daily fetch."""
+        return self._daily.get(symbol)
 
     def _track_ofi(self, symbol: str, book: Any) -> None:
         """Fold one best-bid/ask update into the symbol's OFI accumulator."""
@@ -861,6 +960,39 @@ async def _demo() -> None:
 # --------------------------------------------------------------------------- #
 # Embedded tests — pure trade-flow math only (zero network, no event loop)     #
 # --------------------------------------------------------------------------- #
+
+
+class DailyMetricsTests(unittest.TestCase):
+    def test_uptrend_reads_bullish(self) -> None:
+        closes = [100.0 * (1.002 ** i) for i in range(220)]
+        ctx = MultiAssetFeed._daily_metrics(closes)
+        self.assertEqual(ctx.trend_1d, 1.0)
+        self.assertEqual(ctx.macro_trend, 1.0)
+        assert ctx.dist_30d_high is not None
+        self.assertAlmostEqual(ctx.dist_30d_high, 0.0, places=6)  # at the high
+
+    def test_bear_phase_reads_bearish(self) -> None:
+        closes = [100.0] * 150 + [100.0 * (0.99 ** i) for i in range(1, 71)]
+        ctx = MultiAssetFeed._daily_metrics(closes)
+        self.assertEqual(ctx.trend_1d, -1.0)
+        self.assertEqual(ctx.macro_trend, -1.0)
+        assert ctx.dist_30d_high is not None
+        self.assertLess(ctx.dist_30d_high, -0.2)  # deep under the 30d high
+        assert ctx.vol_pct is not None
+        self.assertGreater(ctx.vol_pct, 0.5)  # selloff = elevated vol regime
+
+    def test_short_history_yields_none(self) -> None:
+        ctx = MultiAssetFeed._daily_metrics([100.0] * 40)
+        self.assertIsNone(ctx.trend_1d)
+        self.assertIsNone(ctx.macro_trend)
+        self.assertIsNone(ctx.vol_pct)
+
+    def test_empty_is_safe(self) -> None:
+        ctx = MultiAssetFeed._daily_metrics([])
+        self.assertEqual(
+            (ctx.trend_1d, ctx.macro_trend, ctx.dist_30d_high, ctx.vol_pct),
+            (None, None, None, None),
+        )
 
 
 class TradeFlowMathTests(unittest.TestCase):
