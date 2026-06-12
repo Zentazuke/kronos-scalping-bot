@@ -390,6 +390,15 @@ class TradingSupervisor:
         )
 
         self._stop_event: asyncio.Event = asyncio.Event()
+        # Settles may now be triggered from two places (per-bar pipeline and
+        # the user-data websocket); a lock guarantees a trade can never be
+        # recorded twice into the Kelly tracker.
+        self._settle_lock: asyncio.Lock = asyncio.Lock()
+        # USER_DATA_WS (default on): authenticated order stream that settles
+        # brackets seconds after they fill instead of on the next bar close.
+        # Degrades silently when the exchange lacks watch_orders (test fakes)
+        # and is pure acceleration — the per-bar poll remains authoritative.
+        self._user_data_ws: bool = _env_flag("USER_DATA_WS", True)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._feed_stopped: bool = False
         self._killed: bool = False
@@ -455,6 +464,52 @@ class TradingSupervisor:
     # Lifecycle                                                           #
     # ------------------------------------------------------------------ #
 
+    async def _user_data_worker(self) -> None:
+        """Authenticated order-stream listener: instant bracket settles.
+
+        Pure acceleration with fail-safe degradation: any fault backs off
+        and retries; a dead stream simply returns the system to per-bar
+        polling, which remains authoritative either way.
+        """
+        watch_orders: Any = getattr(self._exchange, "watch_orders", None)
+        if not callable(watch_orders):
+            logger.info("user-data stream unavailable — per-bar polling only")
+            return
+        attempt: int = 0
+        terminal: Tuple[str, ...] = ("closed", "canceled", "cancelled", "expired")
+        while not self._stop_event.is_set():
+            try:
+                orders: Any = await watch_orders()
+                attempt = 0
+                touched: set[str] = set()
+                for order in orders or ():
+                    symbol: str = str(order.get("symbol") or "")
+                    if (
+                        symbol in self._symbols
+                        and str(order.get("status") or "") in terminal
+                    ):
+                        touched.add(symbol)
+                for symbol in touched:
+                    logger.info(
+                        "%s: user-data stream reports a terminal order — "
+                        "settling immediately",
+                        symbol,
+                    )
+                    await self._settle_outcomes(symbol)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — acceleration must never kill
+                attempt += 1
+                delay: float = min(60.0, 2.0 * attempt)
+                logger.warning(
+                    "user-data stream fault — retry %d in %.0fs (polling "
+                    "remains active)",
+                    attempt,
+                    delay,
+                    exc_info=attempt <= 2,
+                )
+                await asyncio.sleep(delay)
+
     async def run(self) -> int:
         """Boot the pipeline, consume bar closes, and exit deliberately."""
         if self._install_handlers:
@@ -479,6 +534,11 @@ class TradingSupervisor:
             visualizer_task = asyncio.create_task(
                 self._visualizer.run(), name="visualizer"
             )
+        user_data_task: Optional["asyncio.Task[None]"] = None
+        if self._user_data_ws:
+            user_data_task = asyncio.create_task(
+                self._user_data_worker(), name="user-data"
+            )
 
         try:
             async for symbol, frame, book in self._feed.stream():
@@ -490,6 +550,9 @@ class TradingSupervisor:
         finally:
             shutdown_watcher.cancel()
             await asyncio.gather(shutdown_watcher, return_exceptions=True)
+            if user_data_task is not None:
+                user_data_task.cancel()
+                await asyncio.gather(user_data_task, return_exceptions=True)
             await self._stop_feed_once()
             if self._visualizer is not None:
                 self._visualizer.stop()
@@ -536,32 +599,38 @@ class TradingSupervisor:
         )
 
     async def _settle_outcomes(self, symbol: str) -> None:
-        """Phase 7 learning loop: realized results update Kelly + dashboard."""
-        outcomes: List[TradeOutcome] = await self._monitor.poll(symbol)
-        for outcome in outcomes:
-            logger.info(
-                "%s: trade #%d settled %s — pnl %s %s",
-                symbol,
-                outcome.trade_id,
-                outcome.status,
-                outcome.pnl,
-                self._quote_currency,
-            )
-            sign: str = "+" if outcome.pnl >= Decimal("0") else ""
-            self._publish(
-                LedgerLine(
-                    message=(
-                        f"{symbol} TRADE #{outcome.trade_id} {outcome.status} — "
-                        f"entry {outcome.entry_price} exit {outcome.exit_price} "
-                        f"pnl {sign}{outcome.pnl} {self._quote_currency}"
-                    ),
-                    style="bold green" if outcome.status == "WIN" else "bold red",
+        """Phase 7 learning loop: realized results update Kelly + dashboard.
+
+        Serialized: the bar pipeline and the user-data websocket may both
+        request a settle; OutcomeMonitor.poll must never run twice
+        concurrently for overlapping trades (double Kelly counting).
+        """
+        async with self._settle_lock:
+            outcomes: List[TradeOutcome] = await self._monitor.poll(symbol)
+            for outcome in outcomes:
+                logger.info(
+                    "%s: trade #%d settled %s — pnl %s %s",
+                    symbol,
+                    outcome.trade_id,
+                    outcome.status,
+                    outcome.pnl,
+                    self._quote_currency,
                 )
-            )
-        if outcomes:
-            self._publish_performance()
-            # The venue is flat again for this symbol; let the router see it.
-            await self._router.reconcile_exchange_truth(symbol)
+                sign: str = "+" if outcome.pnl >= Decimal("0") else ""
+                self._publish(
+                    LedgerLine(
+                        message=(
+                            f"{symbol} TRADE #{outcome.trade_id} {outcome.status} — "
+                            f"entry {outcome.entry_price} exit {outcome.exit_price} "
+                            f"pnl {sign}{outcome.pnl} {self._quote_currency}"
+                        ),
+                        style="bold green" if outcome.status == "WIN" else "bold red",
+                    )
+                )
+            if outcomes:
+                self._publish_performance()
+                # The venue is flat for this symbol again; tell the router.
+                await self._router.reconcile_exchange_truth(symbol)
 
     # ------------------------------------------------------------------ #
     # Step A — daily drawdown circuit breaker                             #
@@ -1331,6 +1400,63 @@ class TradingSupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(feed.started and feed.stopped)
         self.assertFalse(self.lockfile.exists())
+
+    async def test_user_data_stream_settles_immediately(self) -> None:
+        from journal import _executed_result
+
+        class _StreamingExchange(_FakeBootExchange):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.stream_calls: int = 0
+
+            async def watch_orders(self) -> List[Dict[str, Any]]:
+                self.stream_calls += 1
+                if self.stream_calls > 1:
+                    raise asyncio.CancelledError  # one batch, then stop
+                return [
+                    {"symbol": _TEST_SYMBOL, "status": "closed", "id": "tp-1"}
+                ]
+
+        exchange = _StreamingExchange([10_000.0, 10_000.0])
+        exchange.order_states = {
+            "tp-1": {"status": "closed", "average": 101.0},
+            "sl-1": {"status": "open"},
+        }
+        feed = _FakeFeed(exchange, [])
+        journal = TradeJournal(self.lockfile.parent / "journal-test.db")
+        try:
+            supervisor = TradingSupervisor(
+                symbols=(_TEST_SYMBOL,),
+                feed=cast(MultiAssetFeed, feed),
+                gatekeeper=cast(MarketGatekeeper, _FakeGatekeeper(True)),
+                engine=cast(KronosInferenceEngine, _FakeEngine(SignalDirection.LONG)),
+                router=cast(ExecutionRouter, _FakeRouter()),
+                journal=journal,
+                headless=True,
+                emergency_lockfile=self.lockfile,
+                install_signal_handlers=False,
+            )
+        except BaseException:
+            journal.close()
+            raise
+        journal.open_trade(_executed_result(fill="100", tp="101", sl="98.5"))
+        with self.assertRaises(asyncio.CancelledError):
+            await supervisor._user_data_worker()
+        # The terminal order event triggered an immediate settle: WIN booked
+        # without any bar ever closing.
+        self.assertEqual(journal.performance().wins, 1)
+        self.assertEqual(supervisor._tracker._wins, 1)
+        journal.close()
+
+    async def test_user_data_worker_degrades_without_watch_orders(self) -> None:
+        supervisor, _, _, _, _ = _supervisor(
+            equity_sequence=[10_000.0, 10_000.0],
+            events=0,
+            regime_ok=True,
+            direction=SignalDirection.LONG,
+            lockfile=self.lockfile,
+        )
+        await supervisor._user_data_worker()  # returns quietly, no network
 
     async def test_flow_and_context_features_are_journaled(self) -> None:
         supervisor, _, _, _, _ = _supervisor(

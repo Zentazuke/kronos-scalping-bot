@@ -156,7 +156,23 @@ its first embedded test suite (pure math; add `feed` to the unittest list).
 - Journal-first: NO new gates. Watch CPU (harvester runs Kronos every bar).
 - Build AFTER meta v1 is trained so v1's feature set stays stable.
 
-**M3 — Kronos calibration replay (Phase 9½, overnight offline job):**
+**M3 — BUILT 2026-06-12 (tool ready, run pending):** `calibrate.py` —
+replays the real engine over history (public data), buckets predicted p(up)
+vs realized next-bar direction, Brier + skill vs climatology, confident-call
+hit rate, and fits the best shrinkage lambda (p' = 0.5 + λ(p−0.5)) with a
+plain verdict. USER RUNS OVERNIGHT: `python calibrate.py BTC/USDT --days 14
+--stride 3` (hours on CPU; stride trades resolution for speed).
+ALSO BUILT same session: backtest --fee-bps (default 10 = 0.1% taker per
+side, both legs, conservative) threaded through simulate + walk_forward;
+USER_DATA_WS (default on) — watch_orders listener settles brackets seconds
+after fill, settle path serialized with an asyncio.Lock so websocket and
+per-bar poll can never double-record into Kelly; polling stays
+authoritative. Suite 111 -> 121 (feed 6, gatekeeper 20, calibrate 7,
+backtest 7, main 21...). Walk-forward rerun pending: user runs
+`python backtest.py BTC/USDT --days 90 --walk-forward` and same for
+ADA/USDT (now fee-aware by default).
+
+**M3 (original spec, kept for reference):**
 - New tool `calibrate.py`: run Kronos over N days of historical bars
   (user's PC, ~overnight on CPU), score p_up/p_down vs realized outcomes,
   emit a reliability curve. Decide: probability shrinkage (pseudo-counts

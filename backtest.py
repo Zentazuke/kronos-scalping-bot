@@ -38,6 +38,7 @@ import argparse
 import asyncio
 import logging
 import unittest
+import dataclasses
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Final, List, Optional, Sequence, Tuple
@@ -91,13 +92,23 @@ class SimulatedTrade:
     atr_at_entry: Decimal
     outcome: str
     bars_held: int
+    #: Exchange fee per side in basis points (taker, conservatively applied
+    #: to BOTH legs even though resting TP fills pay the cheaper maker rate).
+    fee_bps: Decimal = Decimal("0")
+
+    @property
+    def fees_per_unit(self) -> Decimal:
+        """Round-trip exchange fees for one base unit."""
+        return (self.entry_price + self.exit_price) * self.fee_bps / Decimal("10000")
 
     @property
     def pnl_per_unit(self) -> Decimal:
-        """Quote-currency PnL for one base unit (fees not modelled)."""
+        """Quote-currency PnL for one base unit, net of modelled fees."""
         if self.direction == "LONG":
-            return self.exit_price - self.entry_price
-        return self.entry_price - self.exit_price
+            gross: Decimal = self.exit_price - self.entry_price
+        else:
+            gross = self.entry_price - self.exit_price
+        return gross - self.fees_per_unit
 
     @property
     def pnl_atr(self) -> Decimal:
@@ -259,6 +270,7 @@ def simulate(
     tp_mult: Decimal = Decimal("1.5"),
     sl_mult: Decimal = Decimal("2.5"),
     confluence_min_votes: int = 2,
+    fee_bps: Decimal = Decimal("0"),
 ) -> BacktestReport:
     """Replay ``frame`` through the production gates and simulate brackets."""
     gatekeeper: MarketGatekeeper = MarketGatekeeper(
@@ -307,6 +319,8 @@ def simulate(
         trade: SimulatedTrade = _walk_bracket(
             frame, entry_index, direction, entry, tp, sl, report.atr
         )
+        if fee_bps > _ZERO:
+            trade = dataclasses.replace(trade, fee_bps=fee_bps)
         trades.append(trade)
         busy_until = trade.entry_index + trade.bars_held - 1
 
@@ -340,6 +354,7 @@ def walk_forward(
     grid: Sequence[GridPoint] = DEFAULT_GRID,
     folds: int = 3,
     confluence_min_votes: int = 2,
+    fee_bps: Decimal = Decimal("0"),
 ) -> List[WalkForwardRow]:
     """Train on fold k, validate the winning parameters on fold k+1."""
     if folds < 1:
@@ -371,6 +386,7 @@ def walk_forward(
                 tp_mult=point.tp_mult,
                 sl_mult=point.sl_mult,
                 confluence_min_votes=confluence_min_votes,
+                fee_bps=fee_bps,
             )
             expectancy: Optional[Decimal] = report.expectancy_atr
             if expectancy is None or len(report.trades) < MIN_TRADES_PER_FOLD:
@@ -394,6 +410,7 @@ def walk_forward(
             tp_mult=best.tp_mult,
             sl_mult=best.sl_mult,
             confluence_min_votes=confluence_min_votes,
+            fee_bps=fee_bps,
         )
         rows.append(
             WalkForwardRow(
@@ -507,6 +524,13 @@ def main() -> int:
     parser.add_argument("--tp", type=str, default="1.5")
     parser.add_argument("--sl", type=str, default="2.5")
     parser.add_argument("--votes", type=int, default=2)
+    parser.add_argument(
+        "--fee-bps",
+        type=str,
+        default="10",
+        help="exchange fee per side in basis points (10 = 0.1%% taker; "
+        "0 disables — testnet reports zero but live Binance does not)",
+    )
     parser.add_argument("--walk-forward", action="store_true")
     args = parser.parse_args()
 
@@ -522,7 +546,12 @@ def main() -> int:
     if args.walk_forward:
         _print_walk_forward(
             args.symbol,
-            walk_forward(frame, symbol=args.symbol, confluence_min_votes=args.votes),
+            walk_forward(
+                frame,
+                symbol=args.symbol,
+                confluence_min_votes=args.votes,
+                fee_bps=Decimal(args.fee_bps),
+            ),
         )
     else:
         _print_report(
@@ -534,6 +563,7 @@ def main() -> int:
                 tp_mult=Decimal(args.tp),
                 sl_mult=Decimal(args.sl),
                 confluence_min_votes=args.votes,
+                fee_bps=Decimal(args.fee_bps),
             ),
         )
     return 0
@@ -620,6 +650,23 @@ class BacktestTests(unittest.TestCase):
         # Regardless of admission, the engine must never have crashed and the
         # conservative rule is exercised by at least the assertion above.
         self.assertGreaterEqual(len(report.trades), 0)
+
+    def test_fees_reduce_pnl_per_side(self) -> None:
+        trade = SimulatedTrade(
+            entry_index=1,
+            direction="LONG",
+            entry_price=Decimal("100"),
+            exit_price=Decimal("102"),
+            atr_at_entry=Decimal("1"),
+            outcome="WIN",
+            bars_held=3,
+            fee_bps=Decimal("10"),
+        )
+        # Gross +2; fees = (100+102)*0.001 = 0.202.
+        self.assertEqual(trade.fees_per_unit, Decimal("0.202"))
+        self.assertEqual(trade.pnl_per_unit, Decimal("1.798"))
+        free = dataclasses.replace(trade, fee_bps=Decimal("0"))
+        self.assertEqual(free.pnl_per_unit, Decimal("2"))
 
     def test_breakeven_win_rate_formula(self) -> None:
         report: BacktestReport = BacktestReport(
