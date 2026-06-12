@@ -379,6 +379,15 @@ function openChain(id) {
      tick(rsiVote, 'RSI room', rsi !== null ? 'RSI ' + fmt(rsi, 1) : '') +
      tick(bookVote, 'Order-book lean', imb !== null ? fmt(imb * 100, 1) + '% bids' : '') +
      `<br>Recorded votes: <b>${votes ?? '—'}</b> (needs 2 of 3 when enforced)`],
+    ['na',
+     '3½ · Microstructure & macro context (journaled evidence)',
+     `Spread ${v(n(t.spread_bps))} bps · rel. volume ${v(n(t.relative_volume))}× · ` +
+     `depth imb ${v(n(t.depth_imbalance))} · trade flow ${v(n(t.trade_imbalance))} · ` +
+     `OFI/vol ${v(n(t.ofi_rel))} · µVWAP gap ${v(n(t.mvwap_gap_bps))} bps · ` +
+     `µprice gap ${v(n(t.microprice_gap_bps))} bps<br>` +
+     `1h trend ${t.trend_1h === null || t.trend_1h === undefined ? '—' : (n(t.trend_1h) > 0 ? '↑ up' : '↓ down')} · ` +
+     `4h trend ${t.trend_4h === null || t.trend_4h === undefined ? '—' : (n(t.trend_4h) > 0 ? '↑ up' : '↓ down')} · ` +
+     `1h RSI ${v(n(t.rsi_1h), 1)} · day range ${t.day_range_pos === null || t.day_range_pos === undefined ? '—' : fmt(n(t.day_range_pos) * 100, 0) + '%'}`],
     [meta === null ? 'na' : (meta >= 0.5 ? 'ok' : 'no'),
      '4 · Meta-filter — learned P(win) for this setup',
      meta === null ? 'Dormant (needs 100 decided trades to train)' :
