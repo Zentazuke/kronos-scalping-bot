@@ -65,6 +65,8 @@ __all__ = [
     "features_from_context",
     "features_from_record",
     "train_model",
+    "walk_forward",
+    "WalkForwardFold",
 ]
 
 logger: Final[logging.Logger] = logging.getLogger("bot.learner")
@@ -107,6 +109,7 @@ TRAIN_EPOCHS: Final[int] = 4_000
 TRAIN_LR: Final[float] = 0.05
 TRAIN_L2: Final[float] = 0.01
 HOLDOUT_FRACTION: Final[float] = 0.2
+WALK_FORWARD_FOLDS: Final[int] = 5  # expanding-window folds for walk-forward
 
 
 # --------------------------------------------------------------------------- #
@@ -404,6 +407,202 @@ def train_from_journal(
     return metrics
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Walk-forward validation                                                      #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class WalkForwardFold:
+    """One expanding-window fold: trained on all trades before the test block,
+    evaluated on the block that immediately follows (never shuffled — order is
+    time)."""
+
+    fold: int
+    n_train: int
+    n_test: int
+    accuracy: float
+    base_rate: float
+
+    @property
+    def edge(self) -> float:
+        """Accuracy above the predict-majority baseline (in [-1, 1])."""
+        return self.accuracy - self.base_rate
+
+
+def _fit_logistic(
+    train_x: "np.ndarray",
+    train_y: "np.ndarray",
+    *,
+    epochs: int = TRAIN_EPOCHS,
+    learning_rate: float = TRAIN_LR,
+    l2: float = TRAIN_L2,
+) -> Tuple["np.ndarray", float, "np.ndarray", "np.ndarray"]:
+    """Train logistic-regression weights on ALL given rows (no internal
+    holdout). Byte-for-byte the same optimizer as ``train_model`` so a fold's
+    model matches what production would have fit on the same window."""
+    mean: "np.ndarray" = train_x.mean(axis=0)
+    std: "np.ndarray" = train_x.std(axis=0)
+    std[std < 1e-9] = 1.0
+    normalized: "np.ndarray" = (train_x - mean) / std
+    weights: "np.ndarray" = np.zeros(train_x.shape[1], dtype=np.float64)
+    bias: float = 0.0
+    n: float = float(len(normalized))
+    for _ in range(epochs):
+        z: "np.ndarray" = normalized @ weights + bias
+        predictions: "np.ndarray" = 1.0 / (1.0 + np.exp(-np.clip(z, -50.0, 50.0)))
+        error: "np.ndarray" = predictions - train_y
+        gradient: "np.ndarray" = (normalized.T @ error) / n + l2 * weights
+        weights -= learning_rate * gradient
+        bias -= learning_rate * float(error.mean())
+    return weights, bias, mean, std
+
+
+def _predict_proba(
+    weights: "np.ndarray",
+    bias: float,
+    mean: "np.ndarray",
+    std: "np.ndarray",
+    rows: "np.ndarray",
+) -> "np.ndarray":
+    normalized: "np.ndarray" = (rows - mean) / std
+    z: "np.ndarray" = normalized @ weights + bias
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -50.0, 50.0)))
+
+
+def walk_forward(
+    features: Sequence[Sequence[float]],
+    labels: Sequence[float],
+    *,
+    n_folds: int = WALK_FORWARD_FOLDS,
+) -> List[WalkForwardFold]:
+    """Expanding-window time-series validation.
+
+    Splits the chronological trades into ``n_folds + 1`` contiguous blocks.
+    Fold k (1..n_folds) trains on every block before k and tests on block k,
+    so each successive fold sees more history and is always tested on unseen,
+    later trades. A single holdout (as in ``train_model``) can flatter or
+    damn a model on the luck of one split; agreement across folds is the
+    real evidence that an edge is stable rather than noise.
+    """
+    if len(features) != len(labels) or not features:
+        raise ValueError("features and labels must be equal-length and non-empty")
+
+    matrix: "np.ndarray" = np.asarray(features, dtype=np.float64)
+    target: "np.ndarray" = np.asarray(labels, dtype=np.float64)
+    n: int = len(matrix)
+
+    # Keep at least ~2 rows per block; shrink the fold count for small samples.
+    if n < (n_folds + 1) * 2:
+        n_folds = max(1, n // 2 - 1)
+
+    edges: List[int] = [round(n * i / (n_folds + 1)) for i in range(n_folds + 2)]
+    results: List[WalkForwardFold] = []
+    for k in range(1, n_folds + 1):
+        tr_end: int = edges[k]
+        te_start, te_end = edges[k], edges[k + 1]
+        if tr_end < 1 or te_end <= te_start:
+            continue
+        tx, ty = matrix[:tr_end], target[:tr_end]
+        ex, ey = matrix[te_start:te_end], target[te_start:te_end]
+        weights, bias, mean, std = _fit_logistic(tx, ty)
+        probs: "np.ndarray" = _predict_proba(weights, bias, mean, std, ex)
+        correct: int = int(np.sum((probs >= 0.5) == (ey >= 0.5)))
+        accuracy: float = correct / len(ey)
+        base_rate: float = max(float(ey.mean()), 1.0 - float(ey.mean()))
+        results.append(
+            WalkForwardFold(
+                fold=k,
+                n_train=int(tr_end),
+                n_test=int(len(ey)),
+                accuracy=accuracy,
+                base_rate=base_rate,
+            )
+        )
+    return results
+
+
+def walk_forward_from_journal(
+    db_paths: "Path | Sequence[Path]", *, n_folds: int = WALK_FORWARD_FOLDS
+) -> Optional[List[WalkForwardFold]]:
+    """CLI worker: decided trades -> expanding-window folds, logged as a table.
+
+    Pools journals exactly like ``train_from_journal`` (the meta-labeler
+    estimates P(win | features); the harvester's unfiltered setups remove the
+    selection bias a single enforced journal suffers). Reports nothing to disk
+    — walk-forward is a verdict, not a model.
+    """
+    paths: List[Path] = (
+        [db_paths] if isinstance(db_paths, Path) else [Path(p) for p in db_paths]
+    )
+    decided: List[TradeRecord] = []
+    for db_path in paths:
+        if not db_path.exists():
+            logger.warning("journal %s does not exist — skipped", db_path)
+            continue
+        journal: TradeJournal = TradeJournal(db_path)
+        try:
+            found: List[TradeRecord] = [
+                t
+                for t in journal.closed_trades()
+                if t.status in (STATUS_WIN, STATUS_LOSS)
+            ]
+        finally:
+            journal.close()
+        logger.info("%s: %d decided trades", db_path, len(found))
+        decided.extend(found)
+
+    if len(decided) < META_MIN_SAMPLES:
+        logger.warning(
+            "refusing to validate: %d decided trades < %d required — "
+            "keep the bot(s) journaling",
+            len(decided),
+            META_MIN_SAMPLES,
+        )
+        return None
+
+    features: List[List[float]] = [features_from_record(t) for t in decided]
+    labels: List[float] = [1.0 if t.status == STATUS_WIN else 0.0 for t in decided]
+    folds: List[WalkForwardFold] = walk_forward(features, labels, n_folds=n_folds)
+
+    logger.info(
+        "walk-forward: %d expanding-window fold(s) over %d decided trades",
+        len(folds),
+        len(decided),
+    )
+    beat: int = 0
+    acc_sum: float = 0.0
+    edge_sum: float = 0.0
+    for f in folds:
+        verdict: str = "beats baseline" if f.edge > 0 else "at/below baseline"
+        logger.info(
+            "  fold %d: train %4d -> test %4d | accuracy %5.1f%% vs baseline "
+            "%5.1f%% (edge %+.1f pp) %s",
+            f.fold,
+            f.n_train,
+            f.n_test,
+            f.accuracy * 100,
+            f.base_rate * 100,
+            f.edge * 100,
+            verdict,
+        )
+        beat += 1 if f.edge > 0 else 0
+        acc_sum += f.accuracy
+        edge_sum += f.edge
+    if folds:
+        logger.info(
+            "walk-forward summary: mean accuracy %.1f%% | mean edge %+.1f pp | "
+            "%d/%d folds beat baseline",
+            acc_sum / len(folds) * 100,
+            edge_sum / len(folds) * 100,
+            beat,
+            len(folds),
+        )
+    return folds
+
+
 # --------------------------------------------------------------------------- #
 # Live-side filter                                                             #
 # --------------------------------------------------------------------------- #
@@ -470,7 +669,7 @@ class MetaFilter:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train the meta-label filter")
-    parser.add_argument("command", choices=["train"])
+    parser.add_argument("command", choices=["train", "walkforward"])
     parser.add_argument(
         "--db",
         action="append",
@@ -479,12 +678,20 @@ def main() -> int:
         "(e.g. --db prod/journal.db --db harvester/journal.db)",
     )
     parser.add_argument("--out", default="meta_model.json")
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=WALK_FORWARD_FOLDS,
+        help="walk-forward: number of expanding-window folds",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
     db_args: List[str] = args.db if args.db else ["journal.db"]
-    metrics: Optional[TrainingMetrics] = train_from_journal(
-        [Path(p) for p in db_args], Path(args.out)
-    )
+    paths: List[Path] = [Path(p) for p in db_args]
+    if args.command == "walkforward":
+        folds = walk_forward_from_journal(paths, n_folds=args.folds)
+        return 0 if folds else 1
+    metrics: Optional[TrainingMetrics] = train_from_journal(paths, Path(args.out))
     return 0 if metrics is not None else 1
 
 
@@ -643,6 +850,21 @@ class LearnerTests(unittest.TestCase):
             dormant: MetaFilter = MetaFilter(small_path, min_samples=100)
             self.assertFalse(dormant.ready)  # 40 samples < 100 floor
 
+    def test_walk_forward_reports_folds_and_beats_baseline(self) -> None:
+        features, labels = _synthetic_dataset()
+        folds = walk_forward(features, labels, n_folds=4)
+        self.assertEqual(len(folds), 4)
+        # expanding window: each fold trains on strictly more history.
+        self.assertTrue(
+            all(folds[i].n_train < folds[i + 1].n_train for i in range(len(folds) - 1))
+        )
+        # every fold is tested on later, unseen trades.
+        self.assertTrue(all(f.n_test > 0 for f in folds))
+        # separable data -> mean accuracy clears the majority baseline.
+        mean_acc = sum(f.accuracy for f in folds) / len(folds)
+        mean_base = sum(f.base_rate for f in folds) / len(folds)
+        self.assertGreater(mean_acc, mean_base)
+
     def test_features_are_direction_signed(self) -> None:
         shared: Dict[str, Optional[Decimal]] = {
             "p_up": Decimal("0.6"),
@@ -670,7 +892,7 @@ class LearnerTests(unittest.TestCase):
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "train":
+    if len(sys.argv) > 1 and sys.argv[1] in ("train", "walkforward"):
         raise SystemExit(main())
     logging.basicConfig(level=logging.INFO)
     unittest.main()
