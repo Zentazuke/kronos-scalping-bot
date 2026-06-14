@@ -100,6 +100,7 @@
   .symbtns { display:inline-flex; gap:6px; margin-left:6px; vertical-align:middle; }
   .symbtn { font-size:11px; padding:3px 9px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; color:#475569; cursor:pointer; }
   .symbtn.active { background:#2563eb; border-color:#2563eb; color:#fff; }
+  .lwtip { position:absolute; z-index:5; pointer-events:none; background:#fff; border:1px solid #e2e8f0; border-radius:8px; box-shadow:0 4px 12px rgba(16,24,40,.14); padding:6px 9px; font-size:11.5px; color:#334155; line-height:1.45; max-width:210px; }
   .sec { font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em; color: #94a3b8; font-weight: 700; margin: 24px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; }
   .sec:first-of-type { margin-top: 4px; }
   .panel, .card { box-shadow: 0 1px 2px rgba(16,24,40,.04); }
@@ -133,9 +134,9 @@
 
   <div class="sec">Price &amp; trades</div>
   <div class="panel" style="margin-bottom:14px">
-    <h2>Last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomReset" style="margin-left:6px">Fit</button><button class="symbtn" id="exitToggle">Exits: on</button></h2>
+    <h2>Last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomReset" style="margin-left:6px">Fit</button></h2>
     <div id="priceChart" style="height:380px;position:relative"></div>
-    <div class="rc-foot">Candlesticks = price · ▲ long entry (below bar) · ▼ short entry (above bar) · ■ exit · colour = green win · red loss · grey still open. Scroll to zoom, drag to pan, Fit to reset.</div>
+    <div class="rc-foot">Candlesticks = price · ▲ long · ▼ short (trade entries) · colour = green win · red loss · grey still open · hover a marker for its entry, exit &amp; result. Scroll to zoom, drag to pan, Fit to reset.</div>
   </div>
 
   <div class="sec">Performance</div>
@@ -173,7 +174,7 @@
 const POLL_MS = 3000;
 let PAYLOAD = { trades: [], events: [], ts: '' };
 let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '', lastJson = '';
-let lwChart = null, lwSeries = null, lwSym = null, priceSym = localStorage.getItem('priceSym') || '';
+let lwChart = null, lwSeries = null, lwSym = null, lwTip = null, lwTradeMap = {}, priceSym = localStorage.getItem('priceSym') || '';
 let showExits = localStorage.getItem('showExits') !== '0';
 let pollCount = 0;
 
@@ -246,8 +247,12 @@ function renderPriceChart() {
   if (typeof LightweightCharts === 'undefined') { el.innerHTML = '<div class="empty">chart library loading…</div>'; return; }
   const raw = (PAYLOAD.candles && PAYLOAD.candles[priceSym]) || [];
   if (!raw.length) { if (!lwChart) el.innerHTML = '<div class="empty">No price data yet.</div>'; return; }
-  const data = raw.map(c => ({ time: c[0], open: c[1], high: c[2], low: c[3], close: c[4] }));
-  const times = raw.map(c => c[0]);
+  // dedupe by time (keep last) + sort ascending so two candles never stack
+  const byTime = new Map();
+  for (const c of raw) byTime.set(c[0], c);
+  const clean = [...byTime.values()].sort((a, b) => a[0] - b[0]);
+  const data = clean.map(c => ({ time: c[0], open: c[1], high: c[2], low: c[3], close: c[4] }));
+  const times = clean.map(c => c[0]);
   const t0 = times[0], last = times[times.length - 1];
   if (!lwChart) {
     el.innerHTML = '';
@@ -263,20 +268,34 @@ function renderPriceChart() {
       upColor: '#16a34a', downColor: '#dc2626', borderVisible: false,
       wickUpColor: '#16a34a', wickDownColor: '#dc2626',
     });
+    lwTip = document.createElement('div'); lwTip.className = 'lwtip'; lwTip.style.display = 'none'; el.appendChild(lwTip);
+    lwChart.subscribeCrosshairMove(param => {
+      const items = (param.time != null) ? lwTradeMap[param.time] : null;
+      if (!items || !param.point) { lwTip.style.display = 'none'; return; }
+      lwTip.innerHTML = items.map(s => {
+        const col = s.status === 'WIN' ? '#16a34a' : s.status === 'LOSS' ? '#dc2626' : '#64748b';
+        const oc = s.status === 'WIN' ? 'WIN' : s.status === 'LOSS' ? 'LOSS' : 'OPEN';
+        return `<div><b>#${s.id} ${s.side}</b> · <span style="color:${col};font-weight:700">${oc}</span><br>entry ${s.entry}${s.exit != null ? ' &rarr; exit ' + s.exit : ''}</div>`;
+      }).join('<div style="height:1px;background:#eef2f7;margin:4px 0"></div>');
+      lwTip.style.display = 'block';
+      lwTip.style.left = Math.max(6, Math.min(param.point.x + 14, el.clientWidth - 172)) + 'px';
+      lwTip.style.top = Math.max(6, param.point.y - 8) + 'px';
+    });
   }
   lwSeries.setData(data);
   const outColor = (st) => st === 'WIN' ? '#16a34a' : st === 'LOSS' ? '#dc2626' : '#94a3b8';
   const snap = (sec) => { let b = times[0], bd = Math.abs(times[0] - sec); for (const tt of times) { const d = Math.abs(tt - sec); if (d < bd) { bd = d; b = tt; } } return b; };
   const mine = ALL.filter(t => t.symbol === priceSym);
   const markers = [];
+  lwTradeMap = {};
   for (const t of mine) {
     const long = t.direction === 'STRAT_LONG';
+    const summary = { id: t.id, side: long ? 'LONG' : 'SHORT', entry: n(t.entry_price), exit: n(t.exit_price), status: t.status };
     const em = toMs(t.ts_open);
-    if (em != null && em / 1000 >= t0 && n(t.entry_price) != null)
-      markers.push({ time: snap(Math.round(em / 1000)), position: long ? 'belowBar' : 'aboveBar', color: outColor(t.status), shape: long ? 'arrowUp' : 'arrowDown' });
-    if (showExits && (t.status === 'WIN' || t.status === 'LOSS') && n(t.exit_price) != null) {
-      const xm = toMs(t.ts_close);
-      if (xm != null && xm / 1000 >= t0) markers.push({ time: snap(Math.round(xm / 1000)), position: 'inBar', color: outColor(t.status), shape: 'square' });
+    if (em != null && em / 1000 >= t0 && n(t.entry_price) != null) {
+      const bt = snap(Math.round(em / 1000));
+      markers.push({ time: bt, position: long ? 'belowBar' : 'aboveBar', color: outColor(t.status), shape: long ? 'arrowUp' : 'arrowDown' });
+      (lwTradeMap[bt] = lwTradeMap[bt] || []).push(summary);
     }
   }
   markers.sort((a, b) => a.time - b.time);
@@ -287,8 +306,6 @@ function renderPriceChart() {
   }
   const fit = document.getElementById('zoomReset');
   if (fit) fit.onclick = () => { const lt = times[times.length - 1]; lwChart.timeScale().setVisibleRange({ from: Math.max(times[0], lt - 4 * 3600), to: lt }); };
-  const et = document.getElementById('exitToggle');
-  if (et) { et.textContent = 'Exits: ' + (showExits ? 'on' : 'off'); et.onclick = () => { showExits = !showExits; localStorage.setItem('showExits', showExits ? '1' : '0'); renderPriceChart(); }; }
 }
 function buildFilters() {
 
