@@ -15,11 +15,14 @@ It can never write, lock, or otherwise influence the trading runtime.
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import sqlite3
 import sys
+import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Final, List
@@ -123,6 +126,38 @@ def _equity() -> Dict[str, str] | None:
     return {"ts": ts, "equity": equity, "baseline": baseline}
 
 
+_SYMBOLS: Final[List[str]] = [
+    s.strip()
+    for s in os.getenv("SYMBOLS", "BTC/USDT,ADA/USDT,ETH/USDT,BNB/USDT").split(",")
+    if s.strip()
+]
+_KLINES_HOST: Final[str] = os.getenv("KLINES_HOST", "https://testnet.binance.vision")
+_CANDLE_TTL: Final[int] = 60  # seconds between background candle refreshes
+_candle_cache: Dict[str, List[List[float]]] = {}  # "BTC/USDT" -> [[ms, close], ...]
+
+
+def _fetch_candles(symbol: str) -> None:
+    """Refresh one symbol's last-24h 5m closes into the cache. On any failure
+    the previous series is kept — the dashboard must never break on network."""
+    pair: str = symbol.replace("/", "")
+    url: str = f"{_KLINES_HOST}/api/v3/klines?symbol={pair}&interval=5m&limit=288"
+    try:
+        with urllib.request.urlopen(url, timeout=4) as resp:  # noqa: S310 — fixed host
+            raw: Any = json.loads(resp.read().decode("utf-8"))
+        _candle_cache[symbol] = [[int(k[0]), float(k[4])] for k in raw]
+    except Exception:  # noqa: BLE001 — keep stale series, never raise
+        pass
+
+
+def _candle_loop() -> None:
+    """Background daemon: refresh all symbols every TTL so the request handler
+    never blocks on the network."""
+    while True:
+        for sym in _SYMBOLS:
+            _fetch_candles(sym)
+        time.sleep(_CANDLE_TTL)
+
+
 def _payload() -> bytes:
     out: Dict[str, Any] = {
         "source": "db",
@@ -130,6 +165,7 @@ def _payload() -> bytes:
         "events": [],
         "equity": None,
         "decisions": {},
+        "candles": {},
         "error": "",
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -151,6 +187,7 @@ def _payload() -> bytes:
                 )
     except OSError as exc:
         out["error"] += f" | log: {exc}"
+    out["candles"] = dict(_candle_cache)
     return json.dumps(out, default=str).encode("utf-8")
 
 
@@ -197,6 +234,7 @@ def main() -> int:
     print(f"  this PC : http://localhost:{port}")
     print(f"  phone   : http://{_lan_ip()}:{port}   (same Wi-Fi)")
     print("Ctrl+C to stop. The bot is not affected either way.")
+    threading.Thread(target=_candle_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

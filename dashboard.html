@@ -132,7 +132,7 @@
   <div class="panel" style="margin-bottom:14px">
     <h2>Price &amp; trades — last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomOut" style="margin-left:6px">−</button><button class="symbtn" id="zoomIn">+</button><button class="symbtn" id="zoomReset">Reset</button><button class="symbtn" id="exitToggle">Exits: on</button></h2>
     <div style="height:360px;position:relative"><canvas id="priceChart"></canvas></div>
-    <div class="rc-foot">▲ entry (green = long, red = short) · ◆ exit (green = win, red = loss). Use +/− to zoom, drag to pan when zoomed in, Reset to re-frame. View framed to the price line; some exits filled far off-market (thin testnet liquidity) — zoom out to see those.</div>
+    <div class="rc-foot">Shape = side: ▲ long · ▼ short. Colour = outcome: green win · red loss · grey still open (◆ = exit, placed on the price at close time — actual fill price in the tooltip). Use +/− to zoom, drag to pan, Reset to re-frame.</div>
   </div>
   <div class="row">
     <div class="panel"><h2>Kronos report card — win rate by conviction</h2><div id="kronosCard"></div></div>
@@ -255,10 +255,17 @@ function renderPriceChart() {
   const t0 = candles[0][0];
   const line = candles.map(c => ({ x: c[0], y: c[1] }));
   const mine = ALL.filter(t => t.symbol === priceSym);
+  const outColor = (st, a) => st === 'WIN' ? `rgba(22,163,74,${a})` : st === 'LOSS' ? `rgba(220,38,38,${a})` : `rgba(100,116,139,${a})`;
   const entries = mine.filter(t => { const m = toMs(t.ts_open); return m !== null && m >= t0 && n(t.entry_price) !== null; })
-    .map(t => ({ x: toMs(t.ts_open), y: n(t.entry_price), long: t.direction === 'STRAT_LONG' }));
+    .map(t => ({ x: toMs(t.ts_open), y: n(t.entry_price), long: t.direction === 'STRAT_LONG', color: outColor(t.status, 0.8) }));
+  const priceAt = (ms) => {
+    if (ms == null || !candles.length) return null;
+    let best = candles[0], bd = Math.abs(candles[0][0] - ms);
+    for (const c of candles) { const d = Math.abs(c[0] - ms); if (d < bd) { bd = d; best = c; } }
+    return best[1];
+  };
   const exits = mine.filter(t => (t.status === 'WIN' || t.status === 'LOSS') && n(t.exit_price) !== null && toMs(t.ts_close) !== null && toMs(t.ts_close) >= t0)
-    .map(t => ({ x: toMs(t.ts_close), y: n(t.exit_price), win: t.status === 'WIN' }));
+    .map(t => ({ x: toMs(t.ts_close), y: priceAt(toMs(t.ts_close)), fill: n(t.exit_price), color: outColor(t.status, 0.65) }));
   const scaleY = [...candles.map(c => c[1]), ...entries.map(e => e.y)];
   const lo = Math.min(...scaleY), hi = Math.max(...scaleY);
   const pad = (hi - lo) * 0.12 || (hi * 0.002) || 1;
@@ -267,17 +274,20 @@ function renderPriceChart() {
   priceChart = new Chart(cv, {
     type: 'line',
     data: { datasets: [
-      { type: 'line', label: priceSym, data: line, borderColor: '#2563eb', borderWidth: 1.4, pointRadius: 0, tension: .1, fill: false, order: 3 },
-      { type: 'scatter', label: 'Entry', data: entries, order: 1, pointStyle: 'triangle', pointRadius: 7,
-        pointBackgroundColor: entries.map(e => e.long ? '#16a34a' : '#dc2626'), pointBorderColor: '#fff', pointBorderWidth: 1 },
-      { type: 'scatter', label: 'Exit', data: showExits ? exits : [], order: 2, pointStyle: 'rectRot', pointRadius: 7,
-        pointBackgroundColor: exits.map(e => e.win ? '#16a34a' : '#dc2626'), pointBorderColor: '#fff', pointBorderWidth: 1 },
+      { type: 'line', label: priceSym, data: line, borderColor: '#3b82f6', borderWidth: 1, pointRadius: 0, tension: .15, fill: false, order: 3 },
+      { type: 'scatter', label: '▲ long / ▼ short', data: entries, order: 1, pointStyle: 'triangle', pointRadius: 5,
+        pointRotation: entries.map(e => e.long ? 0 : 180),
+        pointBackgroundColor: entries.map(e => e.color), pointBorderColor: 'rgba(255,255,255,.9)', pointBorderWidth: 1 },
+      { type: 'scatter', label: '◆ exit', data: showExits ? exits : [], order: 2, pointStyle: 'rectRot', pointRadius: 4,
+        pointBackgroundColor: showExits ? exits.map(e => e.color) : [], pointBorderColor: 'rgba(255,255,255,.9)', pointBorderWidth: 1 },
     ]},
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
       plugins: {
         legend: { display: true, labels: { usePointStyle: true, boxWidth: 8, font: { size: 11 } } },
-        tooltip: { callbacks: { label: c => `${c.dataset.label}: ${c.parsed.y} @ ${hhmm(c.parsed.x)} UTC` } },
+        tooltip: { callbacks: { label: c => (c.raw && c.raw.fill != null)
+          ? `exit @ ${hhmm(c.parsed.x)} UTC · filled ${c.raw.fill}`
+          : `${c.dataset.label}: ${c.parsed.y} @ ${hhmm(c.parsed.x)} UTC` } },
         zoom: {
           zoom: { wheel: { enabled: true }, drag: { enabled: false }, mode: 'xy' },
           pan: { enabled: false },
