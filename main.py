@@ -276,6 +276,9 @@ class TradingSupervisor:
     ) -> None:
         self._symbols: Tuple[str, ...] = tuple(symbols)
         self._quote_currency: str = self._symbols[0].split("/")[1].split(":")[0]
+        self._start_capital: Decimal = Decimal(
+            os.getenv("STRATEGY_START_CAPITAL", "10000")
+        )
         self._emergency_lockfile: Path = emergency_lockfile
         self._drawdown_limit: Decimal = Decimal(
             os.getenv("RISK_TOTAL_DRAWDOWN_LIMIT") or str(drawdown_limit)
@@ -638,29 +641,52 @@ class TradingSupervisor:
     # ------------------------------------------------------------------ #
 
     async def _fetch_total_equity(self) -> Decimal:
-        """Total wallet equity: available balance + position margin."""
-        try:
-            balance: Dict[str, Any] = await self._exchange.fetch_balance()
-        except InvalidNonce:
-            # The OS clock drifted past the venue's 1000ms tolerance (-1021).
-            # Re-measure the local-vs-server offset and retry once; a second
-            # failure propagates so the bar is skipped, not silently traded.
-            logger.warning(
-                "venue rejected request timestamp — resyncing clock offset and retrying"
+        """Strategy equity: the bot's funded capital plus its own realized and
+        unrealized PnL — deliberately NOT the raw wallet value.
+
+        The (testnet) wallet is pre-funded with large balances the bot never
+        deployed; counting them would swamp the strategy's real result and make
+        the drawdown breaker track the market instead of the bot. This measures
+        only what the bot did: start capital, plus realized PnL of closed
+        trades, plus each open position marked to the current price.
+        """
+        realized: Decimal = self._journal.performance().realized_pnl
+        unrealized: Decimal = _ZERO
+        for trade in self._journal.open_trades():
+            try:
+                mark: Decimal = await self._fetch_mark_price(trade.symbol)
+            except Exception as exc:  # noqa: BLE001 — pricing must never crash the breaker
+                logger.warning(
+                    "%s: cannot price open trade #%d (%s) — unrealized PnL omitted",
+                    trade.symbol,
+                    trade.trade_id,
+                    exc,
+                )
+                continue
+            move: Decimal = (
+                mark - trade.entry_price if trade.is_long else trade.entry_price - mark
             )
+            unrealized += move * trade.amount
+        return self._start_capital + realized + unrealized
+
+    async def _fetch_mark_price(self, symbol: str) -> Decimal:
+        """Current mark price for valuing an open position: bid/ask mid, else
+        last trade. Retries once on a clock-drift rejection."""
+        try:
+            ticker: Dict[str, Any] = await self._exchange.fetch_ticker(symbol)
+        except InvalidNonce:
             resync: Any = getattr(self._exchange, "load_time_difference", None)
             if callable(resync):
                 await resync()
-            balance = await self._exchange.fetch_balance()
-        entry: Any = balance.get(self._quote_currency)
-        if not isinstance(entry, dict):
-            return _ZERO
-        total: Any = entry.get("total")
-        if total is not None:
-            return Decimal(str(total))
-        free: Decimal = Decimal(str(entry.get("free") or 0))
-        used: Decimal = Decimal(str(entry.get("used") or 0))
-        return free + used
+            ticker = await self._exchange.fetch_ticker(symbol)
+        bid: Any = ticker.get("bid")
+        ask: Any = ticker.get("ask")
+        if bid is not None and ask is not None:
+            return (Decimal(str(bid)) + Decimal(str(ask))) / Decimal(2)
+        last: Any = ticker.get("last")
+        if last is None:
+            raise RuntimeError(f"{symbol}: ticker carries no usable price")
+        return Decimal(str(last))
 
     async def _snapshot_baseline(self) -> None:
         equity: Decimal = await self._fetch_total_equity()
@@ -1418,6 +1444,62 @@ class TradingSupervisorTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         os.environ.pop("SENTIMENT_SHADOW", None)
         self._tmp.cleanup()
+
+    async def test_strategy_equity_is_capital_plus_pnl(self) -> None:
+        # Strategy equity ignores the testnet-inflated wallet entirely:
+        # start capital + realized PnL + open-position unrealized PnL.
+        sup, *_rest = _supervisor(
+            equity_sequence=[10_000.0],
+            events=0,
+            regime_ok=True,
+            direction=SignalDirection.LONG,
+            lockfile=self.lockfile,
+        )
+        real_journal = sup._journal
+        try:
+            sup._start_capital = Decimal("10000")
+
+            class _Perf:
+                realized_pnl = Decimal("25")
+
+            class _OpenTrade:
+                symbol = _TEST_SYMBOL
+                trade_id = 1
+                amount = Decimal("0.1")
+                entry_price = Decimal("9000")
+                is_long = True
+
+            class _Journal:
+                def performance(self_inner: Any) -> Any:
+                    return _Perf()
+
+                def open_trades(self_inner: Any, symbol: Any = None) -> Any:
+                    return [_OpenTrade()]
+
+            class _Ex:
+                async def fetch_ticker(self_inner: Any, symbol: str) -> Dict[str, Any]:
+                    return {"bid": 9490.0, "ask": 9510.0}
+
+            sup._journal = cast(TradeJournal, _Journal())
+            sup._exchange = _Ex()
+            # 10000 + 25 realized + (9500-9000)*0.1 = 50 unrealized = 10075
+            self.assertEqual(await sup._fetch_total_equity(), Decimal("10075"))
+
+            # Flat: no realized, no open positions -> exactly the start capital.
+            class _FlatPerf:
+                realized_pnl = Decimal("0")
+
+            class _FlatJournal:
+                def performance(self_inner: Any) -> Any:
+                    return _FlatPerf()
+
+                def open_trades(self_inner: Any, symbol: Any = None) -> Any:
+                    return []
+
+            sup._journal = cast(TradeJournal, _FlatJournal())
+            self.assertEqual(await sup._fetch_total_equity(), Decimal("10000"))
+        finally:
+            real_journal.close()
 
     async def test_full_pipeline_routes_long_signal(self) -> None:
         supervisor, feed, gatekeeper, engine, router = _supervisor(
