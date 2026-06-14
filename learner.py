@@ -110,6 +110,7 @@ TRAIN_LR: Final[float] = 0.05
 TRAIN_L2: Final[float] = 0.01
 HOLDOUT_FRACTION: Final[float] = 0.2
 WALK_FORWARD_FOLDS: Final[int] = 5  # expanding-window folds for walk-forward
+MAX_EXIT_SLIP: Final[float] = 0.004  # exit >0.4% off its TP/SL trigger = phantom fill, dropped from training
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +352,28 @@ def train_model(
     )
 
 
+def _exit_slip(trade: TradeRecord) -> Optional[float]:
+    """How far the actual exit filled from its nearest bracket trigger (TP or
+    SL), as a fraction of entry price. Large means the exit landed nowhere near
+    where the bracket aimed — a thin-liquidity phantom fill whose WIN/LOSS
+    label is fiction. None when the prices needed to judge are missing."""
+    if trade.exit_price is None or not trade.entry_price:
+        return None
+    legs = [p for p in (trade.tp_price, trade.sl_price) if p is not None]
+    if not legs:
+        return None
+    nearest: Decimal = min(abs(trade.exit_price - p) for p in legs)
+    return float(nearest / abs(trade.entry_price))
+
+
+def _is_clean_fill(trade: TradeRecord, max_slip: float = MAX_EXIT_SLIP) -> bool:
+    """True when the exit landed within ``max_slip`` of its trigger (an honest
+    fill). Trades we cannot assess (missing prices) are kept — only fills we can
+    positively identify as phantom are dropped."""
+    slip: Optional[float] = _exit_slip(trade)
+    return slip is None or slip <= max_slip
+
+
 def train_from_journal(
     db_paths: "Path | Sequence[Path]", model_path: Path
 ) -> Optional[TrainingMetrics]:
@@ -382,6 +405,18 @@ def train_from_journal(
             journal.close()
         logger.info("%s: %d decided trades", db_path, len(found))
         decided.extend(found)
+
+    n_raw: int = len(decided)
+    decided = [t for t in decided if _is_clean_fill(t)]
+    dropped: int = n_raw - len(decided)
+    if dropped:
+        logger.info(
+            "excluded %d phantom-fill trade(s) (exit >%.1f%% off the bracket) — "
+            "%d honest trades remain",
+            dropped,
+            MAX_EXIT_SLIP * 100.0,
+            len(decided),
+        )
 
     if len(decided) < META_MIN_SAMPLES:
         logger.warning(
@@ -553,6 +588,18 @@ def walk_forward_from_journal(
             journal.close()
         logger.info("%s: %d decided trades", db_path, len(found))
         decided.extend(found)
+
+    n_raw: int = len(decided)
+    decided = [t for t in decided if _is_clean_fill(t)]
+    dropped: int = n_raw - len(decided)
+    if dropped:
+        logger.info(
+            "excluded %d phantom-fill trade(s) (exit >%.1f%% off the bracket) — "
+            "%d honest trades remain",
+            dropped,
+            MAX_EXIT_SLIP * 100.0,
+            len(decided),
+        )
 
     if len(decided) < META_MIN_SAMPLES:
         logger.warning(
