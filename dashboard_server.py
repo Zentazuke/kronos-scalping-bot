@@ -31,7 +31,6 @@ BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 DB_PATH: Final[Path] = BASE_DIR / "journal.db"
 LOG_PATH: Final[Path] = BASE_DIR / "bot.log"
 HTML_PATH: Final[Path] = BASE_DIR / "dashboard.html"
-TA_PATH: Final[Path] = BASE_DIR / "ta_signals.html"
 LOG_TAIL_BYTES: Final[int] = 600_000
 
 try:  # optional TA-signals engine; the dashboard must run even if it's absent
@@ -142,25 +141,37 @@ _SYMBOLS: Final[List[str]] = [
 ]
 _KLINES_HOST: Final[str] = os.getenv("KLINES_HOST", "https://testnet.binance.vision")
 _CANDLE_TTL: Final[int] = 60  # seconds between background candle refreshes
-_candle_cache: Dict[str, List[List[float]]] = {}  # "BTC/USDT" -> [[time_s, open, high, low, close, volume], ...]
+_candle_cache: Dict[str, List[List[float]]] = {}  # 5m, "BTC/USDT" -> [[t,o,h,l,c,v], ...] (price chart + 5m TA)
+# Extra timeframes for the TA Signals board only (the price chart stays on 5m).
+_TA_EXTRA_TFS: Final[Tuple[str, ...]] = ("15m", "1h")
+_ta_extra: Dict[str, Dict[str, List[List[float]]]] = {tf: {} for tf in _TA_EXTRA_TFS}
+
+
+def _fetch_klines(symbol: str, interval: str, limit: int = 288) -> List[List[float]]:
+    """One REST pull of OHLCV bars. Volume (k[5]) is carried for OBV."""
+    pair: str = symbol.replace("/", "")
+    url: str = f"{_KLINES_HOST}/api/v3/klines?symbol={pair}&interval={interval}&limit={limit}"
+    with urllib.request.urlopen(url, timeout=4) as resp:  # noqa: S310 — fixed host
+        raw: Any = json.loads(resp.read().decode("utf-8"))
+    return [
+        [int(k[0]) // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
+        for k in raw
+    ]
 
 
 def _fetch_candles(symbol: str) -> None:
-    """Refresh one symbol's last-24h 5m bars into the cache. On any failure the
-    previous series is kept — the dashboard must never break on network. Volume
-    (k[5]) is carried so the TA engine can compute OBV; the price chart only
-    reads indices 0-4, so the extra field is harmless to it."""
-    pair: str = symbol.replace("/", "")
-    url: str = f"{_KLINES_HOST}/api/v3/klines?symbol={pair}&interval=5m&limit=288"
+    """Refresh one symbol's 5m bars (price chart + 5m TA) and the extra TA
+    timeframes. On any failure the previous series is kept — the dashboard must
+    never break on network."""
     try:
-        with urllib.request.urlopen(url, timeout=4) as resp:  # noqa: S310 — fixed host
-            raw: Any = json.loads(resp.read().decode("utf-8"))
-        _candle_cache[symbol] = [
-            [int(k[0]) // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
-            for k in raw
-        ]
+        _candle_cache[symbol] = _fetch_klines(symbol, "5m", 288)
     except Exception:  # noqa: BLE001 — keep stale series, never raise
         pass
+    for tf in _TA_EXTRA_TFS:
+        try:
+            _ta_extra[tf][symbol] = _fetch_klines(symbol, tf, 288)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _candle_loop() -> None:
@@ -210,19 +221,25 @@ def _obs_stats() -> Dict[str, int]:
 
 
 def _ta_signals() -> Dict[str, Any]:
-    """Per-symbol technical-analysis signal board, computed from the live candle
-    cache. Read-only situational display — never wired into trading. Returns {}
-    if the engine is unavailable so the rest of the dashboard is unaffected."""
+    """Per-symbol technical-analysis signal board, computed per timeframe from
+    the live candle caches. Read-only situational display — never wired into
+    trading. Shape: {tf: {symbol: result}}. Returns {} if the engine is absent."""
     if _compute_signals is None:
         return {}
-    out: Dict[str, Any] = {}
-    for sym, candles in _candle_cache.items():
-        try:
-            res = _compute_signals(candles)
-        except Exception:  # noqa: BLE001 — one bad symbol must not break the board
-            res = None
-        if res is not None:
-            out[sym] = res
+    out: Dict[str, Any] = {"5m": {}, "15m": {}, "1h": {}}
+
+    def _fill(tf: str, cache: Dict[str, List[List[float]]]) -> None:
+        for sym, candles in cache.items():
+            try:
+                res = _compute_signals(candles, tf)
+            except Exception:  # noqa: BLE001 — one bad symbol must not break the board
+                res = None
+            if res is not None:
+                out[tf][sym] = res
+
+    _fill("5m", _candle_cache)
+    for tf in _TA_EXTRA_TFS:
+        _fill(tf, _ta_extra[tf])
     return out
 
 
@@ -272,9 +289,6 @@ class _Handler(BaseHTTPRequestHandler):
             content_type = "application/json"
         elif self.path.split("?")[0] in ("/", "/index.html"):
             body = HTML_PATH.read_bytes()
-            content_type = "text/html; charset=utf-8"
-        elif self.path.split("?")[0] in ("/ta", "/ta_signals.html") and TA_PATH.exists():
-            body = TA_PATH.read_bytes()
             content_type = "text/html; charset=utf-8"
         else:
             self.send_error(404)

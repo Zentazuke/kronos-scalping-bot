@@ -328,10 +328,11 @@ _INDICATORS = [
 ]
 
 
-def compute_signals(candles: List[List[float]]) -> Optional[Dict]:
+def compute_signals(candles: List[List[float]], tf: str = "5m") -> Optional[Dict]:
     """Map a symbol's candles to ten indicator signals plus a net bias.
 
-    Returns None when there isn't enough history. Each signal is
+    ``tf`` is just the timeframe label echoed back for display. Returns None
+    when there isn't enough history. Each signal is
     {name, family, dir, strength, detail}; net is the sum of signed strengths.
     """
     if not candles or len(candles) < MIN_BARS:
@@ -372,6 +373,6 @@ def compute_signals(candles: List[List[float]]) -> Optional[Dict]:
         "bias": bias,
         "longs": longs,
         "shorts": shorts,
-        "tf": "5m",
+        "tf": tf,
         "bars": len(candles),
     }

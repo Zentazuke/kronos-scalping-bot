@@ -102,6 +102,23 @@
   .wf-n { flex:0 0 56px; text-align:right; color:#94a3b8; }
   .wf-spark { display:inline-flex; gap:2px; align-items:flex-end; height:18px; margin-left:8px; }
   .wf-spark i { width:5px; border-radius:1px; display:inline-block; }
+  .ta-tfbar { display:inline-flex; gap:6px; }
+  .ta-tf { font-size:12.5px; font-weight:600; padding:4px 13px; border:1px solid #e2e8f0; background:#fff; color:#475569; border-radius:999px; cursor:pointer; }
+  .ta-tf.active { background:#2563eb; color:#fff; border-color:#2563eb; }
+  .ta-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:12px; }
+  .ta-card { border:1px solid #e2e8f0; border-radius:10px; padding:12px 12px 6px; background:#fff; }
+  .ta-chead { display:flex; align-items:center; justify-content:space-between; }
+  .ta-sym { font-size:15px; font-weight:700; }
+  .ta-bias { font-size:11.5px; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .ta-bl { background:#dcfce7; color:#166534; } .ta-bs { background:#fee2e2; color:#991b1b; } .ta-bn { background:#f1f5f9; color:#475569; }
+  .ta-sub { color:#94a3b8; font-size:10.5px; margin:2px 0 8px; }
+  .ta-row { display:grid; grid-template-columns:1fr auto; align-items:center; gap:8px; padding:5px 0; border-top:1px solid #f1f5f9; }
+  .ta-iname { font-size:12.5px; font-weight:600; color:#334155; }
+  .ta-fam { font-size:9.5px; font-weight:400; color:#94a3b8; margin-left:6px; }
+  .ta-ar { font-size:14px; letter-spacing:1px; text-align:right; min-width:40px; }
+  .ta-up { color:#16a34a; } .ta-dn { color:#dc2626; } .ta-nu { color:#94a3b8; }
+  .ta-det { grid-column:1/-1; font-size:10px; color:#94a3b8; margin-top:-2px; }
+  .ta-empty { font-size:12.5px; color:#64748b; padding:8px 2px; }
   .kgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:8px; }
   .kcell { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:8px; }
   .kcell .k { font-size:10.5px; color:#64748b; text-transform:uppercase; letter-spacing:.03em; }
@@ -139,7 +156,7 @@
 
 </head>
 <body>
-<h1>Kronos Scalping Bot — Live <a href="/ta" style="font-size:13px;font-weight:600;color:#2563eb;text-decoration:none;margin-left:10px;padding:4px 11px;border:1px solid #bfdbfe;border-radius:999px;vertical-align:middle;white-space:nowrap">TA Signals →</a></h1>
+<h1>Kronos Scalping Bot — Live</h1>
 <div class="sub" id="meta"><span class="dot ok" id="dot"></span>connecting…</div>
 <div class="banner warn" id="banner"></div>
 
@@ -181,6 +198,19 @@
   </div>
   <div class="panel" style="margin-bottom:14px"><h2>Shadow Kelly — suggested sizing from your live edge</h2><div id="kellyCard"></div></div>
   <div class="panel" style="margin-bottom:14px"><h2>Walk-forward verdict — does the model beat a coin-flip?</h2><div id="wfCard"></div></div>
+
+  <div class="sec">TA Signals</div>
+  <div class="panel" style="margin-bottom:14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+      <span class="ta-tfbar">
+        <button class="ta-tf" id="taTf5m" onclick="taSetTf('5m')">5m</button>
+        <button class="ta-tf" id="taTf15m" onclick="taSetTf('15m')">15m</button>
+        <button class="ta-tf" id="taTf1h" onclick="taSetTf('1h')">1h</button>
+      </span>
+      <span style="font-size:11px;color:#94a3b8">▲ long · ▼ short (more = stronger) · — neutral · read-only, not wired to trading</span>
+    </div>
+    <div class="ta-grid" id="taCards"></div>
+  </div>
 
   <div class="sec">Live</div>
   <div class="row">
@@ -226,7 +256,7 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
@@ -436,6 +466,7 @@ function render() {
   renderMetaCard(decided);
   renderKellyCard(decided, wins, losses, avgW, avgL);
   renderWalkforward(PAYLOAD);
+  renderTASignals();
   buildSymBtns();
   renderPriceChart();
 
@@ -602,6 +633,40 @@ function renderWalkforward(data) {
     '<div class="rc-foot">Mean edge = the model’s accuracy minus the always-guess-the-majority baseline, averaged across expanding-window folds. ' +
     '<b>Green and consistent across folds</b> (the bars) is a real, tradeable edge; a single lucky fold is not. ' +
     'XGBoost on the larger observation journal is the live test of whether there is an edge to learn.</div>';
+}
+function taArrows(s){
+  if (s.dir === 'long')  return '<span class="ta-up">' + '▲'.repeat(s.strength) + '</span>';
+  if (s.dir === 'short') return '<span class="ta-dn">' + '▼'.repeat(s.strength) + '</span>';
+  return '<span class="ta-nu">—</span>';
+}
+let taTF = (function(){ try { return localStorage.getItem('taTf') || '5m'; } catch(e){ return '5m'; } })();
+function taUpdateTabs(){
+  ['5m','15m','1h'].forEach(t => { const b = document.getElementById('taTf'+t); if (b) b.classList.toggle('active', t === taTF); });
+}
+function taSetTf(tf){ taTF = tf; try { localStorage.setItem('taTf', tf); } catch(e){} renderTASignals(); }
+function renderTASignals(){
+  const el = document.getElementById('taCards'); if (!el) return;
+  taUpdateTabs();
+  const all = (typeof PAYLOAD !== 'undefined' && PAYLOAD && PAYLOAD.ta_signals) || {};
+  const ta = all[taTF] || {};
+  const syms = Object.keys(ta).sort();
+  if (!syms.length){
+    el.innerHTML = '<div class="ta-empty">No ' + taTF + ' signals yet — the server is warming its ' + taTF + ' candle cache (~60 bars/symbol). Give it a minute.</div>';
+    return;
+  }
+  el.innerHTML = syms.map(sym => {
+    const t = ta[sym];
+    const cls = t.bias === 'LONG' ? 'ta-bl' : t.bias === 'SHORT' ? 'ta-bs' : 'ta-bn';
+    const net = (t.net > 0 ? '+' : '') + t.net;
+    const rows = t.signals.map(s =>
+      '<div class="ta-row"><div class="ta-iname">' + s.name + '<span class="ta-fam">' + s.family + '</span></div>'
+      + '<div class="ta-ar">' + taArrows(s) + '</div>'
+      + '<div class="ta-det">' + s.detail + '</div></div>').join('');
+    return '<div class="ta-card"><div class="ta-chead"><span class="ta-sym">' + sym + '</span>'
+      + '<span class="ta-bias ' + cls + '">' + t.bias + ' ' + net + '</span></div>'
+      + '<div class="ta-sub">' + t.longs + ' long · ' + t.shorts + ' short · ' + t.tf + ' · ' + t.bars + ' bars</div>'
+      + rows + '</div>';
+  }).join('');
 }
 function v(x, d) {
  return x === null || x === undefined ? '<i>not recorded</i>' : fmt(x, d ?? 2); }
