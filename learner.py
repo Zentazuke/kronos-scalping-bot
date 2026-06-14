@@ -507,11 +507,43 @@ def _predict_proba(
     return 1.0 / (1.0 + np.exp(-np.clip(z, -50.0, 50.0)))
 
 
+def _fit_predict_xgb(
+    train_x: "np.ndarray", train_y: "np.ndarray", test_x: "np.ndarray"
+) -> "np.ndarray":
+    """Shallow, regularised gradient-boosted trees on the fold's train slice;
+    returns P(win) for the test slice. Unlike the linear model it can capture
+    feature *interactions*. Heavy import is deferred so the logistic path never
+    needs xgboost installed. A single-class train slice falls back to the base
+    rate so the fold still scores."""
+    import xgboost as xgb  # type: ignore[import-untyped]
+
+    if len(set(train_y.tolist())) < 2:
+        return np.full(len(test_x), float(train_y.mean()))
+    params = {
+        "objective": "binary:logistic",
+        "max_depth": 3,
+        "eta": 0.08,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "lambda": 1.0,
+        "min_child_weight": 3,
+        "eval_metric": "logloss",
+        "nthread": 1,
+        "verbosity": 0,
+    }
+    dtrain = xgb.DMatrix(np.asarray(train_x, dtype=np.float64), label=np.asarray(train_y, dtype=np.float64))
+    dtest = xgb.DMatrix(np.asarray(test_x, dtype=np.float64))
+    booster = xgb.train(params, dtrain, num_boost_round=120)
+    proba: "np.ndarray" = booster.predict(dtest)
+    return proba
+
+
 def walk_forward(
     features: Sequence[Sequence[float]],
     labels: Sequence[float],
     *,
     n_folds: int = WALK_FORWARD_FOLDS,
+    model: str = "logistic",
 ) -> List[WalkForwardFold]:
     """Expanding-window time-series validation.
 
@@ -542,8 +574,11 @@ def walk_forward(
             continue
         tx, ty = matrix[:tr_end], target[:tr_end]
         ex, ey = matrix[te_start:te_end], target[te_start:te_end]
-        weights, bias, mean, std = _fit_logistic(tx, ty)
-        probs: "np.ndarray" = _predict_proba(weights, bias, mean, std, ex)
+        if model == "xgb":
+            probs = _fit_predict_xgb(tx, ty, ex)
+        else:
+            weights, bias, mean, std = _fit_logistic(tx, ty)
+            probs = _predict_proba(weights, bias, mean, std, ex)
         correct: int = int(np.sum((probs >= 0.5) == (ey >= 0.5)))
         accuracy: float = correct / len(ey)
         base_rate: float = max(float(ey.mean()), 1.0 - float(ey.mean()))
@@ -560,7 +595,7 @@ def walk_forward(
 
 
 def walk_forward_from_journal(
-    db_paths: "Path | Sequence[Path]", *, n_folds: int = WALK_FORWARD_FOLDS
+    db_paths: "Path | Sequence[Path]", *, n_folds: int = WALK_FORWARD_FOLDS, model: str = "logistic"
 ) -> Optional[List[WalkForwardFold]]:
     """CLI worker: decided trades -> expanding-window folds, logged as a table.
 
@@ -612,10 +647,11 @@ def walk_forward_from_journal(
 
     features: List[List[float]] = [features_from_record(t) for t in decided]
     labels: List[float] = [1.0 if t.status == STATUS_WIN else 0.0 for t in decided]
-    folds: List[WalkForwardFold] = walk_forward(features, labels, n_folds=n_folds)
+    folds: List[WalkForwardFold] = walk_forward(features, labels, n_folds=n_folds, model=model)
 
     logger.info(
-        "walk-forward: %d expanding-window fold(s) over %d decided trades",
+        "walk-forward (%s): %d expanding-window fold(s) over %d decided trades",
+        model,
         len(folds),
         len(decided),
     )
@@ -731,12 +767,18 @@ def main() -> int:
         default=WALK_FORWARD_FOLDS,
         help="walk-forward: number of expanding-window folds",
     )
+    parser.add_argument(
+        "--model",
+        choices=["logistic", "xgb"],
+        default="logistic",
+        help="walk-forward model: logistic (default) or xgb (gradient-boosted trees)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
     db_args: List[str] = args.db if args.db else ["journal.db"]
     paths: List[Path] = [Path(p) for p in db_args]
     if args.command == "walkforward":
-        folds = walk_forward_from_journal(paths, n_folds=args.folds)
+        folds = walk_forward_from_journal(paths, n_folds=args.folds, model=args.model)
         return 0 if folds else 1
     metrics: Optional[TrainingMetrics] = train_from_journal(paths, Path(args.out))
     return 0 if metrics is not None else 1
