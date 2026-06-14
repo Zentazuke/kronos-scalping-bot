@@ -128,7 +128,10 @@ def _equity() -> Dict[str, str] | None:
 
 _SYMBOLS: Final[List[str]] = [
     s.strip()
-    for s in os.getenv("SYMBOLS", "BTC/USDT,ADA/USDT,ETH/USDT,BNB/USDT").split(",")
+    for s in os.getenv(
+        "SYMBOLS",
+        "BTC/USDT,ADA/USDT,ETH/USDT,BNB/USDT,SOL/USDT,XRP/USDT,DOGE/USDT,LINK/USDT",
+    ).split(",")
     if s.strip()
 ]
 _KLINES_HOST: Final[str] = os.getenv("KLINES_HOST", "https://testnet.binance.vision")

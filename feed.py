@@ -74,7 +74,10 @@ logger: Final[logging.Logger] = logging.getLogger("bot.feed")
 
 SYMBOLS: Final[Tuple[str, ...]] = tuple(
     s.strip()
-    for s in os.getenv("SYMBOLS", "BTC/USDT,ADA/USDT,ETH/USDT,BNB/USDT").split(",")
+    for s in os.getenv(
+        "SYMBOLS",
+        "BTC/USDT,ADA/USDT,ETH/USDT,BNB/USDT,SOL/USDT,XRP/USDT,DOGE/USDT,LINK/USDT",
+    ).split(",")
     if s.strip()
 )
 TIMEFRAME: Final[str] = "5m"
@@ -327,6 +330,39 @@ class MultiAssetFeed:
         if self._started:
             raise RuntimeError("MultiAssetFeed.start() called twice")
         self._started = True
+
+        # Symbol guard — drop any configured pair the exchange doesn't list
+        # (e.g. a token that trades on mainnet but not on testnet). One bad
+        # SYMBOLS entry must never crash the feed. Best-effort: on any lookup
+        # failure we keep the configured list untouched so nothing is silently
+        # lost.
+        try:
+            markets: Any = await self._exchange.load_markets()
+        except Exception:  # noqa: BLE001 — market discovery must never block boot
+            logger.warning(
+                "could not load markets to verify symbols — using SYMBOLS as-is",
+                exc_info=True,
+            )
+        else:
+            available: Tuple[str, ...] = tuple(
+                s for s in self._symbols if s in markets
+            )
+            dropped: Tuple[str, ...] = tuple(
+                s for s in self._symbols if s not in markets
+            )
+            if dropped:
+                logger.warning(
+                    "dropping %d unlisted symbol(s): %s",
+                    len(dropped),
+                    ", ".join(dropped),
+                )
+            if available:
+                self._symbols = available
+            else:
+                logger.error(
+                    "none of the configured symbols are listed on the exchange — "
+                    "keeping SYMBOLS as-is so the problem stays visible"
+                )
 
         for symbol in self._symbols:
             await self._seed_history(symbol)
