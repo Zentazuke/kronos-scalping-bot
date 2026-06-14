@@ -105,6 +105,26 @@
   .sec:first-of-type { margin-top: 4px; }
   .panel, .card { box-shadow: 0 1px 2px rgba(16,24,40,.04); }
   h1 { font-size: 19px; font-weight: 800; letter-spacing: -.01em; }
+  @media (max-width: 640px) {
+    body { padding: 8px; }
+    h1 { font-size: 16px; }
+    .sub { font-size: 11px; word-break: break-word; }
+    .sec { margin: 16px 0 8px; font-size: 11px; }
+    .panel { padding: 10px; }
+    .panel h2 { font-size: 12px; line-height: 1.5; }
+    .cards { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .card { padding: 8px 10px; }
+    .card .v { font-size: 16px; }
+    .row { gap: 10px; }
+    .filters { gap: 6px; }
+    .symbtns { flex-wrap: wrap; }
+    #priceChart { height: 300px !important; }
+    .gridjs-wrapper { overflow-x: auto; }
+    td.gridjs-td, th.gridjs-th { padding: 5px 7px; font-size: 11px; white-space: nowrap; }
+    .feed { font-size: 11px; height: 240px; }
+    #livebox { max-height: 240px; }
+    .livetable th, .livetable td { padding: 4px 6px; font-size: 11.5px; }
+  }
 </style>
 
 
