@@ -133,7 +133,7 @@ _SYMBOLS: Final[List[str]] = [
 ]
 _KLINES_HOST: Final[str] = os.getenv("KLINES_HOST", "https://testnet.binance.vision")
 _CANDLE_TTL: Final[int] = 60  # seconds between background candle refreshes
-_candle_cache: Dict[str, List[List[float]]] = {}  # "BTC/USDT" -> [[ms, close], ...]
+_candle_cache: Dict[str, List[List[float]]] = {}  # "BTC/USDT" -> [[time_s, open, high, low, close], ...]
 
 
 def _fetch_candles(symbol: str) -> None:
@@ -144,7 +144,7 @@ def _fetch_candles(symbol: str) -> None:
     try:
         with urllib.request.urlopen(url, timeout=4) as resp:  # noqa: S310 — fixed host
             raw: Any = json.loads(resp.read().decode("utf-8"))
-        _candle_cache[symbol] = [[int(k[0]), float(k[4])] for k in raw]
+        _candle_cache[symbol] = [[int(k[0]) // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4])] for k in raw]
     except Exception:  # noqa: BLE001 — keep stale series, never raise
         pass
 

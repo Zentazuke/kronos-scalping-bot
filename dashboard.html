@@ -6,6 +6,7 @@
 <title>Kronos Bot — Live Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.umd.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/gridjs.umd.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/theme/mermaid.min.css">
 <style>
@@ -132,9 +133,9 @@
 
   <div class="sec">Price &amp; trades</div>
   <div class="panel" style="margin-bottom:14px">
-    <h2>Last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomOut" style="margin-left:6px">−</button><button class="symbtn" id="zoomIn">+</button><button class="symbtn" id="zoomReset">Reset</button><button class="symbtn" id="exitToggle">Exits: on</button></h2>
-    <div style="height:360px;position:relative"><canvas id="priceChart"></canvas></div>
-    <div class="rc-foot">Shape = side: ▲ long · ▼ short. Colour = outcome: green win · red loss · grey still open (◆ = exit, placed on the price at close time — actual fill price in the tooltip). Use +/− to zoom, drag to pan, Reset to re-frame.</div>
+    <h2>Last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomReset" style="margin-left:6px">Fit</button><button class="symbtn" id="exitToggle">Exits: on</button></h2>
+    <div id="priceChart" style="height:380px;position:relative"></div>
+    <div class="rc-foot">Candlesticks = price · ▲ long entry (below bar) · ▼ short entry (above bar) · ■ exit · colour = green win · red loss · grey still open. Scroll to zoom, drag to pan, Fit to reset.</div>
   </div>
 
   <div class="sec">Performance</div>
@@ -172,7 +173,7 @@
 const POLL_MS = 3000;
 let PAYLOAD = { trades: [], events: [], ts: '' };
 let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '', lastJson = '';
-let priceChart = null, priceSym = localStorage.getItem('priceSym') || '';
+let lwChart = null, lwSeries = null, lwSym = null, priceSym = localStorage.getItem('priceSym') || '';
 let showExits = localStorage.getItem('showExits') !== '0';
 let pollCount = 0;
 
@@ -240,98 +241,54 @@ function buildSymBtns() {
     buildSymBtns(); renderPriceChart();
   });
 }
-function wirePan() {
-  const cv = document.getElementById('priceChart');
-  if (!cv || cv._panWired) return;
-  cv._panWired = true;
-  cv.style.cursor = 'grab';
-  let dragging = false, lx = 0, ly = 0;
-  cv.addEventListener('mousedown', e => { dragging = true; lx = e.clientX; ly = e.clientY; cv.style.cursor = 'grabbing'; });
-  window.addEventListener('mousemove', e => {
-    if (!dragging || !priceChart || !priceChart.chartArea) return;
-    const sx = priceChart.scales.x, sy = priceChart.scales.y, area = priceChart.chartArea;
-    const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
-    const xu = (sx.max - sx.min) / area.width, yu = (sy.max - sy.min) / area.height;
-    priceChart.options.scales.x.min = sx.min - dx * xu; priceChart.options.scales.x.max = sx.max - dx * xu;
-    priceChart.options.scales.y.min = sy.min + dy * yu; priceChart.options.scales.y.max = sy.max + dy * yu;
-    priceChart.update('none');
-  });
-  window.addEventListener('mouseup', () => { dragging = false; cv.style.cursor = 'grab'; });
-}
 function renderPriceChart() {
-  const cv = document.getElementById('priceChart'); if (!cv) return;
-  const candles = (PAYLOAD.candles && PAYLOAD.candles[priceSym]) || [];
-  if (priceChart) { priceChart.destroy(); priceChart = null; }
-  if (!candles.length) return;
-  const t0 = candles[0][0];
-  const line = candles.map(c => ({ x: c[0], y: c[1] }));
+  const el = document.getElementById('priceChart'); if (!el) return;
+  if (typeof LightweightCharts === 'undefined') { el.innerHTML = '<div class="empty">chart library loading…</div>'; return; }
+  const raw = (PAYLOAD.candles && PAYLOAD.candles[priceSym]) || [];
+  if (!raw.length) { if (!lwChart) el.innerHTML = '<div class="empty">No price data yet.</div>'; return; }
+  const data = raw.map(c => ({ time: c[0], open: c[1], high: c[2], low: c[3], close: c[4] }));
+  const times = raw.map(c => c[0]);
+  const t0 = times[0], last = times[times.length - 1];
+  if (!lwChart) {
+    el.innerHTML = '';
+    lwChart = LightweightCharts.createChart(el, {
+      autoSize: true,
+      layout: { background: { color: '#ffffff' }, textColor: '#475569', fontSize: 11 },
+      grid: { vertLines: { color: '#f1f5f9' }, horzLines: { color: '#f1f5f9' } },
+      rightPriceScale: { borderColor: '#e2e8f0' },
+      timeScale: { borderColor: '#e2e8f0', timeVisible: true, secondsVisible: false },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    });
+    lwSeries = lwChart.addCandlestickSeries({
+      upColor: '#16a34a', downColor: '#dc2626', borderVisible: false,
+      wickUpColor: '#16a34a', wickDownColor: '#dc2626',
+    });
+  }
+  lwSeries.setData(data);
+  const outColor = (st) => st === 'WIN' ? '#16a34a' : st === 'LOSS' ? '#dc2626' : '#94a3b8';
+  const snap = (sec) => { let b = times[0], bd = Math.abs(times[0] - sec); for (const tt of times) { const d = Math.abs(tt - sec); if (d < bd) { bd = d; b = tt; } } return b; };
   const mine = ALL.filter(t => t.symbol === priceSym);
-  const outColor = (st, a) => st === 'WIN' ? `rgba(22,163,74,${a})` : st === 'LOSS' ? `rgba(220,38,38,${a})` : `rgba(100,116,139,${a})`;
-  const entries = mine.filter(t => { const m = toMs(t.ts_open); return m !== null && m >= t0 && n(t.entry_price) !== null; })
-    .map(t => ({ x: toMs(t.ts_open), y: n(t.entry_price), long: t.direction === 'STRAT_LONG', color: outColor(t.status, 0.8) }));
-  const priceAt = (ms) => {
-    if (ms == null || !candles.length) return null;
-    let best = candles[0], bd = Math.abs(candles[0][0] - ms);
-    for (const c of candles) { const d = Math.abs(c[0] - ms); if (d < bd) { bd = d; best = c; } }
-    return best[1];
-  };
-  const exits = mine.filter(t => (t.status === 'WIN' || t.status === 'LOSS') && n(t.exit_price) !== null && toMs(t.ts_close) !== null && toMs(t.ts_close) >= t0)
-    .map(t => ({ x: toMs(t.ts_close), y: priceAt(toMs(t.ts_close)), fill: n(t.exit_price), color: outColor(t.status, 0.65) }));
-  const scaleY = [...candles.map(c => c[1]), ...entries.map(e => e.y)];
-  const lo = Math.min(...scaleY), hi = Math.max(...scaleY);
-  const pad = (hi - lo) * 0.12 || (hi * 0.002) || 1;
-  const allY = [...scaleY, ...exits.map(e => e.y)];
-  const fullLo = Math.min(...allY), fullHi = Math.max(...allY);
-  priceChart = new Chart(cv, {
-    type: 'line',
-    data: { datasets: [
-      { type: 'line', label: priceSym, data: line, borderColor: '#3b82f6', borderWidth: 1, pointRadius: 0, tension: .15, fill: false, order: 3 },
-      { type: 'scatter', label: '▲ long / ▼ short', data: entries, order: 1, pointStyle: 'triangle', pointRadius: 5,
-        pointRotation: entries.map(e => e.long ? 0 : 180),
-        pointBackgroundColor: entries.map(e => e.color), pointBorderColor: 'rgba(255,255,255,.9)', pointBorderWidth: 1 },
-      { type: 'scatter', label: '◆ exit', data: showExits ? exits : [], order: 2, pointStyle: 'rectRot', pointRadius: 4,
-        pointBackgroundColor: showExits ? exits.map(e => e.color) : [], pointBorderColor: 'rgba(255,255,255,.9)', pointBorderWidth: 1 },
-    ]},
-    options: {
-      responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: {
-        legend: { display: true, labels: { usePointStyle: true, boxWidth: 8, font: { size: 11 } } },
-        tooltip: { callbacks: { label: c => (c.raw && c.raw.fill != null)
-          ? `exit @ ${hhmm(c.parsed.x)} UTC · filled ${c.raw.fill}`
-          : `${c.dataset.label}: ${c.parsed.y} @ ${hhmm(c.parsed.x)} UTC` } },
-        zoom: {
-          zoom: { wheel: { enabled: true }, drag: { enabled: false }, mode: 'xy' },
-          pan: { enabled: false },
-          limits: { y: { min: fullLo - pad, max: fullHi + pad } }
-        }
-      },
-      scales: {
-        x: { type: 'linear', grid: { display: false }, ticks: { maxTicksLimit: 8, callback: v => hhmm(v) } },
-        y: { min: lo - pad, max: hi + pad, grid: { color: '#eef2f7' } }
-      }
+  const markers = [];
+  for (const t of mine) {
+    const long = t.direction === 'STRAT_LONG';
+    const em = toMs(t.ts_open);
+    if (em != null && em / 1000 >= t0 && n(t.entry_price) != null)
+      markers.push({ time: snap(Math.round(em / 1000)), position: long ? 'belowBar' : 'aboveBar', color: outColor(t.status), shape: long ? 'arrowUp' : 'arrowDown' });
+    if (showExits && (t.status === 'WIN' || t.status === 'LOSS') && n(t.exit_price) != null) {
+      const xm = toMs(t.ts_close);
+      if (xm != null && xm / 1000 >= t0) markers.push({ time: snap(Math.round(xm / 1000)), position: 'inBar', color: outColor(t.status), shape: 'square' });
     }
-  });
-  wirePan();
-  const zoomBy = (factor) => {
-    if (!priceChart) return;
-    const sx = priceChart.scales.x, sy = priceChart.scales.y;
-    const cx = (sx.min + sx.max) / 2, cy = (sy.min + sy.max) / 2;
-    const hx = (sx.max - sx.min) / 2 * factor, hy = (sy.max - sy.min) / 2 * factor;
-    priceChart.options.scales.x.min = cx - hx; priceChart.options.scales.x.max = cx + hx;
-    priceChart.options.scales.y.min = cy - hy; priceChart.options.scales.y.max = cy + hy;
-    priceChart.update('none');
-  };
-  const wire = (id, fn) => { const b = document.getElementById(id); if (b) b.onclick = fn; };
-  wire('zoomIn', () => zoomBy(0.8));    // shrink the view = zoom in
-  wire('zoomOut', () => zoomBy(1.25));  // widen the view = zoom out
-  wire('zoomReset', () => renderPriceChart());  // re-frame to default
-  wire('exitToggle', () => {
-    showExits = !showExits;
-    localStorage.setItem('showExits', showExits ? '1' : '0');
-    renderPriceChart();
-  });
+  }
+  markers.sort((a, b) => a.time - b.time);
+  lwSeries.setMarkers(markers);
+  if (lwSym !== priceSym) {
+    lwSym = priceSym;
+    lwChart.timeScale().setVisibleRange({ from: Math.max(t0, last - 4 * 3600), to: last });
+  }
+  const fit = document.getElementById('zoomReset');
+  if (fit) fit.onclick = () => { const lt = times[times.length - 1]; lwChart.timeScale().setVisibleRange({ from: Math.max(times[0], lt - 4 * 3600), to: lt }); };
   const et = document.getElementById('exitToggle');
-  if (et) et.textContent = 'Exits: ' + (showExits ? 'on' : 'off');
+  if (et) { et.textContent = 'Exits: ' + (showExits ? 'on' : 'off'); et.onclick = () => { showExits = !showExits; localStorage.setItem('showExits', showExits ? '1' : '0'); renderPriceChart(); }; }
 }
 function buildFilters() {
 
