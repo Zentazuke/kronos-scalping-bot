@@ -1,0 +1,15 @@
+# /etc/systemd/system/kronos-learn.service
+# Oneshot job: label observations + walk-forward -> walkforward.json.
+# Not enabled directly — kronos-learn.timer triggers it. Run by hand with:
+#   sudo systemctl start kronos-learn.service
+[Unit]
+Description=Kronos learning refresh (label observations + walk-forward verdict)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kronos
+WorkingDirectory=/home/kronos/kronos-scalping-bot
+# Invoked via bash so the script needs no +x bit after a git pull from Windows.
+ExecStart=/bin/bash /home/kronos/kronos-scalping-bot/deploy/refresh_learning.sh

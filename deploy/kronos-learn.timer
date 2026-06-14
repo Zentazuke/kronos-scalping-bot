@@ -1,0 +1,13 @@
+# /etc/systemd/system/kronos-learn.timer
+# sudo systemctl daemon-reload && sudo systemctl enable --now kronos-learn.timer
+[Unit]
+Description=Run the Kronos learning refresh daily
+
+[Timer]
+# Server time (Hetzner defaults to UTC). Change 06:00:00 to retime it.
+OnCalendar=*-*-* 06:00:00
+# If the box was off at 06:00, run as soon as it's back up.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
