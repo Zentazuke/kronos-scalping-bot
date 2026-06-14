@@ -240,20 +240,20 @@ function render() {
   const avgWPct = wPcts.length ? wPcts.reduce((a,b)=>a+b,0)/wPcts.length : null;
   const avgLPct = lPcts.length ? lPcts.reduce((a,b)=>a+b,0)/lPcts.length : null;
 
-  // Wallet cards come from the bot's EQUITY heartbeat in bot.log.
+  // Equity cards come from the bot's EQUITY heartbeat (strategy equity) in bot.log.
   const eq = PAYLOAD.equity;
   const eqV = eq ? n(eq.equity) : null, bsV = eq ? n(eq.baseline) : null;
   const sessD = eqV !== null && bsV !== null ? eqV - bsV : null;
   const sessP = sessD !== null && bsV ? (sessD / bsV) * 100 : null;
 
   document.getElementById('cards').innerHTML = [
-    ['Wallet equity', eqV !== null ? fmt(eqV, 2) + ' $' : 'waiting…', 'neutral',
-      eq ? 'as of ' + eq.ts.slice(11) : 'restart bot to enable heartbeat'],
+    ['Strategy equity', eqV !== null ? fmt(eqV, 2) + ' $' : 'waiting…', 'neutral',
+      eq ? 'as of ' + eq.ts.slice(11) + ' · start capital + bot PnL' : 'restart bot to enable heartbeat'],
     ['Daily baseline', bsV !== null ? fmt(bsV, 2) + ' $' : '—', 'neutral',
       'snapshot at 00:00 UTC / boot'],
     ['Today vs baseline', sessD !== null
         ? `${sessD >= 0 ? '+' : ''}${fmt(sessD, 2)} $ (${sessP >= 0 ? '+' : ''}${fmt(sessP, 3)}%)` : '—',
-      sessD === null ? 'neutral' : (sessD >= 0 ? 'pos' : 'neg'), 'wallet move incl. open positions'],
+      sessD === null ? 'neutral' : (sessD >= 0 ? 'pos' : 'neg'), 'bot PnL incl. open positions'],
     ['Deployed now', fmt(deployed, 2) + ' $', 'neutral', open + ' open position' + (open === 1 ? '' : 's')],
     ['Bought', fmt(bought, 2) + ' $', 'neutral', 'long entries + short exits'],
     ['Sold', fmt(sold, 2) + ' $', 'neutral', 'short entries + long exits'],

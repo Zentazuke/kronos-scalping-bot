@@ -72,7 +72,11 @@ logger: Final[logging.Logger] = logging.getLogger("bot.feed")
 # Constants                                                                    #
 # --------------------------------------------------------------------------- #
 
-SYMBOLS: Final[Tuple[str, ...]] = ("BTC/USDT", "ADA/USDT")
+SYMBOLS: Final[Tuple[str, ...]] = tuple(
+    s.strip()
+    for s in os.getenv("SYMBOLS", "BTC/USDT,ADA/USDT,ETH/USDT,BNB/USDT").split(",")
+    if s.strip()
+)
 TIMEFRAME: Final[str] = "5m"
 TIMEFRAME_MS: Final[int] = 5 * 60 * 1_000
 #: Rolling trade-window capacity; ~20k prints comfortably covers one 5m bar
@@ -220,6 +224,11 @@ class MultiAssetFeed:
         self._lookback: int = lookback
 
         self._exchange: Any = self._build_exchange(exchange_id)
+        # Read-only MAINNET client for daily macro candles: the testnet has
+        # almost no daily history (~11 candles), so SMA50/SMA200 and the vol
+        # percentile can never compute there. Keyless, never sandboxed, never
+        # used to place an order — public market data only.
+        self._daily_exchange: Any = self._build_public_exchange(exchange_id)
 
         # Isolated per-asset state — no cross-asset sharing, ever.
         self._buffers: Dict[str, Deque[OHLCVRow]] = {
@@ -292,6 +301,23 @@ class MultiAssetFeed:
         exchange.userAgent = random.choice(DESKTOP_USER_AGENTS)
         return exchange
 
+    @staticmethod
+    def _build_public_exchange(exchange_id: Optional[str]) -> Any:
+        """A keyless, non-sandbox client used ONLY for public daily candles.
+
+        Market regime is a property of the REAL market, so daily OHLCV is read
+        from mainnet public endpoints rather than the data-starved testnet.
+        No API keys are attached and sandbox mode is never set, so it cannot
+        place orders — it only ever calls ``fetch_ohlcv``.
+        """
+        resolved: str = exchange_id or os.getenv("EXCHANGE_ID", "binance")
+        klass: Any = getattr(ccxtpro, resolved)
+        exchange: Any = klass(
+            {"enableRateLimit": True, "options": {"adjustForTimeDifference": True}}
+        )
+        exchange.userAgent = random.choice(DESKTOP_USER_AGENTS)
+        return exchange
+
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
     # ------------------------------------------------------------------ #
@@ -344,6 +370,11 @@ class MultiAssetFeed:
             await self._exchange.close()
         except Exception:  # noqa: BLE001 — shutdown must never raise upward
             logger.exception("exchange close failed during shutdown")
+
+        try:
+            await self._daily_exchange.close()
+        except Exception:  # noqa: BLE001 — shutdown must never raise upward
+            logger.exception("daily exchange close failed during shutdown")
 
         self._enqueue(None)  # sentinel: unblocks stream() consumers
 
@@ -567,7 +598,7 @@ class MultiAssetFeed:
         successful fetch (absent evidence stays absent)."""
         while not self._closed:
             try:
-                payload: Any = await self._exchange.fetch_ohlcv(
+                payload: Any = await self._daily_exchange.fetch_ohlcv(
                     symbol, timeframe="1d", limit=250
                 )
                 closes: List[float] = [float(row[4]) for row in payload or []]
