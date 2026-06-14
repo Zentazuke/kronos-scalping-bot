@@ -23,7 +23,7 @@
   .pos { color: #16a34a; } .neg { color: #dc2626; } .neutral { color: #1a202c; }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
   @media (max-width: 760px) { .row { grid-template-columns: 1fr; } }
-  .panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; }
+  .panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; min-width: 0; }
   .panel h2 { font-size: 13px; margin: 0 0 8px; color: #334155; }
   .chartbox { position: relative; height: 220px; }
   .filters { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
@@ -37,14 +37,15 @@
   .pill.OPEN { background:#dbeafe; color:#1d4ed8; } .pill.SCRATCH { background:#f1f5f9; color:#475569; }
   .pill.UNKNOWN { background:#fef9c3; color:#854d0e; }
   .long { color:#16a34a; font-weight:600; } .short { color:#dc2626; font-weight:600; }
-  .feed { max-height: 280px; overflow-y: auto; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11.5px; line-height: 1.55; }
-  .feed div { padding: 1px 5px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .feed { height: 300px; overflow: auto; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11.5px; line-height: 1.55; }
+  #livebox { max-height: 300px; overflow-y: auto; }
+  .feed div { padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
   .ev-bad  { color: #b91c1c; background: #fef2f2; }
   .ev-warn { color: #92400e; }
   .ev-good { color: #15803d; }
   .ev-info { color: #64748b; }
   .livetable { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  .livetable th { text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; padding: 4px 8px; border-bottom: 1px solid #e2e8f0; }
+  .livetable th { text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; padding: 4px 8px; border-bottom: 1px solid #e2e8f0; position: sticky; top: 0; background: #fff; z-index: 1; }
   .livetable td { padding: 5px 8px; border-bottom: 1px solid #f1f5f9; }
   .empty { color: #94a3b8; font-size: 13px; padding: 14px 4px; }
   .overlay { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: none;
@@ -98,6 +99,10 @@
   .symbtns { display:inline-flex; gap:6px; margin-left:6px; vertical-align:middle; }
   .symbtn { font-size:11px; padding:3px 9px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; color:#475569; cursor:pointer; }
   .symbtn.active { background:#2563eb; border-color:#2563eb; color:#fff; }
+  .sec { font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em; color: #94a3b8; font-weight: 700; margin: 24px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #e2e8f0; }
+  .sec:first-of-type { margin-top: 4px; }
+  .panel, .card { box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+  h1 { font-size: 19px; font-weight: 800; letter-spacing: -.01em; }
 </style>
 
 
@@ -122,31 +127,37 @@
     </label>
   </div>
 
+  <div class="sec">Account</div>
+  <div class="cards" id="cards"></div>
+
+  <div class="sec">Price &amp; trades</div>
+  <div class="panel" style="margin-bottom:14px">
+    <h2>Last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomOut" style="margin-left:6px">−</button><button class="symbtn" id="zoomIn">+</button><button class="symbtn" id="zoomReset">Reset</button><button class="symbtn" id="exitToggle">Exits: on</button></h2>
+    <div style="height:360px;position:relative"><canvas id="priceChart"></canvas></div>
+    <div class="rc-foot">Shape = side: ▲ long · ▼ short. Colour = outcome: green win · red loss · grey still open (◆ = exit, placed on the price at close time — actual fill price in the tooltip). Use +/− to zoom, drag to pan, Reset to re-frame.</div>
+  </div>
+
+  <div class="sec">Performance</div>
   <div class="row">
     <div class="panel"><h2>Cumulative PnL (USDT, decided trades)</h2><div class="chartbox"><canvas id="cumChart"></canvas></div></div>
     <div class="panel"><h2>PnL per trade (USDT)</h2><div class="chartbox"><canvas id="barChart"></canvas></div></div>
   </div>
 
-  <div class="cards" id="cards"></div>
-
-  <div class="panel" style="margin-bottom:14px">
-    <h2>Price &amp; trades — last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomOut" style="margin-left:6px">−</button><button class="symbtn" id="zoomIn">+</button><button class="symbtn" id="zoomReset">Reset</button><button class="symbtn" id="exitToggle">Exits: on</button></h2>
-    <div style="height:360px;position:relative"><canvas id="priceChart"></canvas></div>
-    <div class="rc-foot">Shape = side: ▲ long · ▼ short. Colour = outcome: green win · red loss · grey still open (◆ = exit, placed on the price at close time — actual fill price in the tooltip). Use +/− to zoom, drag to pan, Reset to re-frame.</div>
-  </div>
+  <div class="sec">Model &amp; learning</div>
   <div class="row">
     <div class="panel"><h2>Kronos report card — win rate by conviction</h2><div id="kronosCard"></div></div>
     <div class="panel"><h2>Meta shadow — actual win rate by predicted probability</h2><div id="metaCard"></div></div>
   </div>
   <div class="panel" style="margin-bottom:14px"><h2>Shadow Kelly — suggested sizing from your live edge</h2><div id="kellyCard"></div></div>
 
+  <div class="sec">Live</div>
   <div class="row">
-    <div class="panel"><h2>Live — open positions (waiting on TP or SL)</h2><div id="livebox"></div></div>
-    <div class="panel"><h2>Activity feed — what the bot is doing (newest first)</h2><div class="feed" id="feed"></div></div>
+    <div class="panel"><h2>Open positions (waiting on TP or SL)</h2><div id="livebox"></div></div>
+    <div class="panel"><h2>Activity feed — newest first</h2><div class="feed" id="feed"></div></div>
   </div>
 
+  <div class="sec">All trades</div>
   <div class="panel">
-    <h2>All trades — entry, targets, exit</h2>
     <p class="clickhint">Click any row to see the full decision chain that opened that position.</p>
     <div id="grid"></div>
   </div>
