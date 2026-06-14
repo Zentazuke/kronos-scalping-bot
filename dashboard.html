@@ -93,6 +93,15 @@
   .rc-meta { flex:0 0 100px; color:#64748b; font-size:11px; text-align:right; }
   .rc-foot { margin-top:8px; font-size:11px; color:#94a3b8; line-height:1.5; }
   .rc-empty { font-size:12px; color:#64748b; line-height:1.5; }
+  .wf-obs { font-size:12px; color:#475569; margin-bottom:10px; padding-bottom:8px; border-bottom:1px solid #eef2f7; }
+  .wf-row { display:flex; align-items:center; gap:10px; font-size:12px; padding:6px 0; border-bottom:1px solid #f1f5f9; }
+  .wf-name { flex:1; font-weight:600; color:#334155; }
+  .wf-ds { font-weight:400; color:#94a3b8; font-size:11px; margin-left:6px; }
+  .wf-edge { flex:0 0 84px; text-align:right; font-weight:700; font-variant-numeric:tabular-nums; }
+  .wf-beat { flex:0 0 96px; text-align:right; color:#64748b; }
+  .wf-n { flex:0 0 56px; text-align:right; color:#94a3b8; }
+  .wf-spark { display:inline-flex; gap:2px; align-items:flex-end; height:18px; margin-left:8px; }
+  .wf-spark i { width:5px; border-radius:1px; display:inline-block; }
   .kgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:8px; }
   .kcell { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:8px; }
   .kcell .k { font-size:10.5px; color:#64748b; text-transform:uppercase; letter-spacing:.03em; }
@@ -171,6 +180,7 @@
     <div class="panel"><h2>Meta shadow — actual win rate by predicted probability</h2><div id="metaCard"></div></div>
   </div>
   <div class="panel" style="margin-bottom:14px"><h2>Shadow Kelly — suggested sizing from your live edge</h2><div id="kellyCard"></div></div>
+  <div class="panel" style="margin-bottom:14px"><h2>Walk-forward verdict — does the model beat a coin-flip?</h2><div id="wfCard"></div></div>
 
   <div class="sec">Live</div>
   <div class="row">
@@ -216,7 +226,7 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
@@ -425,6 +435,7 @@ function render() {
   renderKronosCard(decided);
   renderMetaCard(decided);
   renderKellyCard(decided, wins, losses, avgW, avgL);
+  renderWalkforward(PAYLOAD);
   buildSymBtns();
   renderPriceChart();
 
@@ -546,6 +557,51 @@ function renderKellyCard(decided, wins, losses, avgW, avgL) {
             : 'Half-Kelly is the practical bet; full Kelly is too swingy. ') +
     (nT < 30 ? `<b>Only ${nT} decided trades — treat as noise until ~30+.</b> ` : '') +
     'Preview only: harvester mode uses fixed notional, so this is not live sizing yet.</div>';
+}
+function renderWalkforward(data) {
+  const el = document.getElementById('wfCard'); if (!el) return;
+  const wf = data.walkforward || {};
+  const obs = data.observations || {};
+  let head = '';
+  if (obs.total != null) {
+    const pend = obs.total - (obs.labeled || 0);
+    const winPct = obs.labeled ? Math.round(100 * (obs.wins || 0) / obs.labeled) : null;
+    head = `<div class="wf-obs">Observation journal: <b>${obs.total}</b> recorded` +
+      ` · <b>${obs.labeled || 0}</b> labeled` +
+      (pend > 0 ? ` · ${pend} awaiting resolve` : '') +
+      (winPct !== null ? ` · ${winPct}% win` : '') + '</div>';
+  }
+  const keys = Object.keys(wf).sort();
+  if (!keys.length) {
+    el.innerHTML = head + '<div class="rc-foot">No walk-forward run recorded yet. On the server, run:<br>' +
+      '<code>python learner.py walkforward --db observations.db --model xgb --json walkforward.json</code><br>' +
+      'and it will appear here on the next refresh.</div>';
+    return;
+  }
+  const rows = keys.map(k => {
+    const e = wf[k];
+    const edge = (e.mean_edge || 0) * 100;
+    const col = edge > 0.05 ? '#16a34a' : (edge < -0.05 ? '#dc2626' : '#64748b');
+    const sign = edge > 0 ? '+' : '';
+    const modelName = e.model === 'xgb' ? 'XGBoost' : 'Logistic';
+    const spark = (e.folds || []).map(f => {
+      const ed = (f.edge || 0) * 100;
+      const h = Math.max(2, Math.min(18, Math.abs(ed) * 2.2));
+      const c = ed > 0 ? '#86efac' : (ed < 0 ? '#fca5a5' : '#cbd5e1');
+      return `<i style="height:${h}px;background:${c}" title="fold ${f.fold}: ${ed > 0 ? '+' : ''}${ed.toFixed(1)} pp"></i>`;
+    }).join('');
+    return `<div class="wf-row">` +
+      `<div class="wf-name">${modelName}<span class="wf-ds">${e.dataset || ''}</span>` +
+      `<span class="wf-spark">${spark}</span></div>` +
+      `<div class="wf-edge" style="color:${col}">${sign}${edge.toFixed(1)} pp</div>` +
+      `<div class="wf-beat">${e.folds_beat}/${e.n_folds} folds beat</div>` +
+      `<div class="wf-n">${e.n_decided}t</div>` +
+      `</div>`;
+  }).join('');
+  el.innerHTML = head + rows +
+    '<div class="rc-foot">Mean edge = the model’s accuracy minus the always-guess-the-majority baseline, averaged across expanding-window folds. ' +
+    '<b>Green and consistent across folds</b> (the bars) is a real, tradeable edge; a single lucky fold is not. ' +
+    'XGBoost on the larger observation journal is the live test of whether there is an edge to learn.</div>';
 }
 function v(x, d) {
  return x === null || x === undefined ? '<i>not recorded</i>' : fmt(x, d ?? 2); }

@@ -594,8 +594,65 @@ def walk_forward(
     return results
 
 
+def _write_walkforward_report(
+    json_path: Path,
+    *,
+    paths: List[Path],
+    model: str,
+    n_decided: int,
+    n_excluded: int,
+    folds: List[WalkForwardFold],
+) -> None:
+    """Merge this run's verdict into a JSON the dashboard reads. Keyed by
+    '<dataset>:<model>' so logistic/xgb on journal/observations coexist in one
+    file. Best-effort: a write failure must never sink a successful run."""
+    dataset: str = "+".join(p.name for p in paths)
+    key: str = f"{dataset}:{model}"
+    mean_acc: float = sum(f.accuracy for f in folds) / len(folds) if folds else 0.0
+    mean_edge: float = sum(f.edge for f in folds) / len(folds) if folds else 0.0
+    beat: int = sum(1 for f in folds if f.edge > 0)
+    entry: Dict[str, object] = {
+        "dataset": dataset,
+        "model": model,
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "n_decided": n_decided,
+        "n_excluded": n_excluded,
+        "mean_accuracy": round(mean_acc, 4),
+        "mean_edge": round(mean_edge, 4),
+        "folds_beat": beat,
+        "n_folds": len(folds),
+        "folds": [
+            {
+                "fold": f.fold,
+                "n_train": f.n_train,
+                "n_test": f.n_test,
+                "accuracy": round(f.accuracy, 4),
+                "base_rate": round(f.base_rate, 4),
+                "edge": round(f.edge, 4),
+            }
+            for f in folds
+        ],
+    }
+    report: Dict[str, object] = {}
+    if json_path.exists():
+        try:
+            report = json.loads(json_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            report = {}
+    report[key] = entry
+    try:
+        json_path.write_text(json.dumps(report, indent=2), "utf-8")
+        logger.info("walk-forward report written to %s [%s]", json_path, key)
+    except OSError as exc:  # pragma: no cover — disk/permission edge
+        logger.warning("could not write walk-forward report %s: %s", json_path, exc)
+
+
 def walk_forward_from_journal(
-    db_paths: "Path | Sequence[Path]", *, n_folds: int = WALK_FORWARD_FOLDS, model: str = "logistic"
+    db_paths: "Path | Sequence[Path]",
+    *,
+    n_folds: int = WALK_FORWARD_FOLDS,
+    model: str = "logistic",
+    json_path: Optional[Path] = None,
 ) -> Optional[List[WalkForwardFold]]:
     """CLI worker: decided trades -> expanding-window folds, logged as a table.
 
@@ -682,6 +739,15 @@ def walk_forward_from_journal(
             edge_sum / len(folds) * 100,
             beat,
             len(folds),
+        )
+    if json_path is not None and folds:
+        _write_walkforward_report(
+            json_path,
+            paths=paths,
+            model=model,
+            n_decided=len(decided),
+            n_excluded=dropped,
+            folds=folds,
         )
     return folds
 
@@ -773,12 +839,22 @@ def main() -> int:
         default="logistic",
         help="walk-forward model: logistic (default) or xgb (gradient-boosted trees)",
     )
+    parser.add_argument(
+        "--json",
+        default=None,
+        help="walk-forward: also write the verdict to this JSON for the dashboard",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
     db_args: List[str] = args.db if args.db else ["journal.db"]
     paths: List[Path] = [Path(p) for p in db_args]
     if args.command == "walkforward":
-        folds = walk_forward_from_journal(paths, n_folds=args.folds, model=args.model)
+        folds = walk_forward_from_journal(
+            paths,
+            n_folds=args.folds,
+            model=args.model,
+            json_path=Path(args.json) if args.json else None,
+        )
         return 0 if folds else 1
     metrics: Optional[TrainingMetrics] = train_from_journal(paths, Path(args.out))
     return 0 if metrics is not None else 1

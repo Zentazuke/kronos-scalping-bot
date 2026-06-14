@@ -158,6 +158,43 @@ def _candle_loop() -> None:
         time.sleep(_CANDLE_TTL)
 
 
+_WALKFORWARD_PATH: Final[Path] = Path(os.getenv("WALKFORWARD_JSON", "walkforward.json"))
+_OBS_DB_PATH: Final[Path] = Path(os.getenv("OBSERVATIONS_DB", "observations.db"))
+
+
+def _walkforward() -> Dict[str, Any]:
+    """Latest walk-forward verdicts written by `learner.py walkforward --json`.
+    Empty dict if the file isn't there yet — the panel just shows 'no runs'."""
+    if not _WALKFORWARD_PATH.exists():
+        return {}
+    try:
+        return json.loads(_WALKFORWARD_PATH.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _obs_stats() -> Dict[str, int]:
+    """Observation-journal counts: how much learning data has accrued and how
+    much of it the offline labeler has resolved. Read-only, never raises up."""
+    if not _OBS_DB_PATH.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{_OBS_DB_PATH}?mode=ro", uri=True)
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            labeled = conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE status IN ('WIN','LOSS','SCRATCH')"
+            ).fetchone()[0]
+            wins = conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE status='WIN'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        return {"total": int(total), "labeled": int(labeled), "wins": int(wins)}
+    except sqlite3.Error:
+        return {}
+
+
 def _payload() -> bytes:
     out: Dict[str, Any] = {
         "source": "db",
@@ -166,6 +203,8 @@ def _payload() -> bytes:
         "equity": None,
         "decisions": {},
         "candles": {},
+        "walkforward": {},
+        "observations": {},
         "error": "",
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -188,6 +227,8 @@ def _payload() -> bytes:
     except OSError as exc:
         out["error"] += f" | log: {exc}"
     out["candles"] = dict(_candle_cache)
+    out["walkforward"] = _walkforward()
+    out["observations"] = _obs_stats()
     return json.dumps(out, default=str).encode("utf-8")
 
 
