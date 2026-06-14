@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kronos Bot — Live Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/gridjs.umd.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridjs@5.0.2/dist/theme/mermaid.min.css">
 <style>
@@ -82,7 +83,24 @@
   .sdot.ok { background: #16a34a; } .sdot.no { background: #dc2626; }
   .sdot.warn { background: #f59e0b; } .sdot.na { background: #cbd5e1; }
   .srow.stale { opacity: .45; }
+  .rc { display:flex; flex-direction:column; gap:6px; }
+  .rc-row { display:flex; align-items:center; gap:8px; font-size:12px; }
+  .rc-label { flex:0 0 112px; color:#475569; }
+  .rc-track { flex:1; background:#f1f5f9; border-radius:5px; height:16px; overflow:hidden; }
+  .rc-fill { height:100%; border-radius:5px; }
+  .rc-meta { flex:0 0 100px; color:#64748b; font-size:11px; text-align:right; }
+  .rc-foot { margin-top:8px; font-size:11px; color:#94a3b8; line-height:1.5; }
+  .rc-empty { font-size:12px; color:#64748b; line-height:1.5; }
+  .kgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:8px; }
+  .kcell { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:8px; }
+  .kcell .k { font-size:10.5px; color:#64748b; text-transform:uppercase; letter-spacing:.03em; }
+  .kcell .v { font-size:16px; font-weight:700; margin-top:2px; }
+  .symbtns { display:inline-flex; gap:6px; margin-left:6px; vertical-align:middle; }
+  .symbtn { font-size:11px; padding:3px 9px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; color:#475569; cursor:pointer; }
+  .symbtn.active { background:#2563eb; border-color:#2563eb; color:#fff; }
 </style>
+
+
 </head>
 <body>
 <h1>Kronos Scalping Bot — Live</h1>
@@ -111,6 +129,17 @@
 
   <div class="cards" id="cards"></div>
 
+  <div class="panel" style="margin-bottom:14px">
+    <h2>Price &amp; trades — last 24h <span id="symBtns" class="symbtns"></span><button class="symbtn" id="zoomOut" style="margin-left:6px">−</button><button class="symbtn" id="zoomIn">+</button><button class="symbtn" id="zoomReset">Reset</button><button class="symbtn" id="exitToggle">Exits: on</button></h2>
+    <div style="height:360px;position:relative"><canvas id="priceChart"></canvas></div>
+    <div class="rc-foot">▲ entry (green = long, red = short) · ◆ exit (green = win, red = loss). Use +/− to zoom, drag to pan when zoomed in, Reset to re-frame. View framed to the price line; some exits filled far off-market (thin testnet liquidity) — zoom out to see those.</div>
+  </div>
+  <div class="row">
+    <div class="panel"><h2>Kronos report card — win rate by conviction</h2><div id="kronosCard"></div></div>
+    <div class="panel"><h2>Meta shadow — actual win rate by predicted probability</h2><div id="metaCard"></div></div>
+  </div>
+  <div class="panel" style="margin-bottom:14px"><h2>Shadow Kelly — suggested sizing from your live edge</h2><div id="kellyCard"></div></div>
+
   <div class="row">
     <div class="panel"><h2>Live — open positions (waiting on TP or SL)</h2><div id="livebox"></div></div>
     <div class="panel"><h2>Activity feed — what the bot is doing (newest first)</h2><div class="feed" id="feed"></div></div>
@@ -132,6 +161,8 @@
 const POLL_MS = 3000;
 let PAYLOAD = { trades: [], events: [], ts: '' };
 let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '', lastJson = '';
+let priceChart = null, priceSym = localStorage.getItem('priceSym') || '';
+let showExits = localStorage.getItem('showExits') !== '0';
 let pollCount = 0;
 
 function n(x) { const v = parseFloat(x); return isNaN(v) ? null : v; }
@@ -152,7 +183,7 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
@@ -176,7 +207,113 @@ async function poll() {
   }
 }
 
+function toMs(ts) {
+  if (!ts) return null;
+  let s = String(ts).replace(' ', 'T');
+  if (!/[zZ]|[+-]\d\d:?\d\d$/.test(s)) s += 'Z';
+  const m = Date.parse(s);
+  return isNaN(m) ? null : m;
+}
+function hhmm(ms) {
+  const d = new Date(ms);
+  return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+}
+function buildSymBtns() {
+  const el = document.getElementById('symBtns'); if (!el) return;
+  const syms = Object.keys(PAYLOAD.candles || {}).filter(s => (PAYLOAD.candles[s] || []).length);
+  if (!syms.length) { el.innerHTML = '<span style="font-size:11px;color:#94a3b8">no price data yet</span>'; return; }
+  if (!priceSym || !syms.includes(priceSym)) priceSym = syms[0];
+  el.innerHTML = syms.map(s => `<button class="symbtn ${s === priceSym ? 'active' : ''}" data-sym="${s}">${s}</button>`).join('');
+  el.querySelectorAll('.symbtn').forEach(b => b.onclick = () => {
+    priceSym = b.dataset.sym; localStorage.setItem('priceSym', priceSym);
+    buildSymBtns(); renderPriceChart();
+  });
+}
+function wirePan() {
+  const cv = document.getElementById('priceChart');
+  if (!cv || cv._panWired) return;
+  cv._panWired = true;
+  cv.style.cursor = 'grab';
+  let dragging = false, lx = 0, ly = 0;
+  cv.addEventListener('mousedown', e => { dragging = true; lx = e.clientX; ly = e.clientY; cv.style.cursor = 'grabbing'; });
+  window.addEventListener('mousemove', e => {
+    if (!dragging || !priceChart || !priceChart.chartArea) return;
+    const sx = priceChart.scales.x, sy = priceChart.scales.y, area = priceChart.chartArea;
+    const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
+    const xu = (sx.max - sx.min) / area.width, yu = (sy.max - sy.min) / area.height;
+    priceChart.options.scales.x.min = sx.min - dx * xu; priceChart.options.scales.x.max = sx.max - dx * xu;
+    priceChart.options.scales.y.min = sy.min + dy * yu; priceChart.options.scales.y.max = sy.max + dy * yu;
+    priceChart.update('none');
+  });
+  window.addEventListener('mouseup', () => { dragging = false; cv.style.cursor = 'grab'; });
+}
+function renderPriceChart() {
+  const cv = document.getElementById('priceChart'); if (!cv) return;
+  const candles = (PAYLOAD.candles && PAYLOAD.candles[priceSym]) || [];
+  if (priceChart) { priceChart.destroy(); priceChart = null; }
+  if (!candles.length) return;
+  const t0 = candles[0][0];
+  const line = candles.map(c => ({ x: c[0], y: c[1] }));
+  const mine = ALL.filter(t => t.symbol === priceSym);
+  const entries = mine.filter(t => { const m = toMs(t.ts_open); return m !== null && m >= t0 && n(t.entry_price) !== null; })
+    .map(t => ({ x: toMs(t.ts_open), y: n(t.entry_price), long: t.direction === 'STRAT_LONG' }));
+  const exits = mine.filter(t => (t.status === 'WIN' || t.status === 'LOSS') && n(t.exit_price) !== null && toMs(t.ts_close) !== null && toMs(t.ts_close) >= t0)
+    .map(t => ({ x: toMs(t.ts_close), y: n(t.exit_price), win: t.status === 'WIN' }));
+  const scaleY = [...candles.map(c => c[1]), ...entries.map(e => e.y)];
+  const lo = Math.min(...scaleY), hi = Math.max(...scaleY);
+  const pad = (hi - lo) * 0.12 || (hi * 0.002) || 1;
+  const allY = [...scaleY, ...exits.map(e => e.y)];
+  const fullLo = Math.min(...allY), fullHi = Math.max(...allY);
+  priceChart = new Chart(cv, {
+    type: 'line',
+    data: { datasets: [
+      { type: 'line', label: priceSym, data: line, borderColor: '#2563eb', borderWidth: 1.4, pointRadius: 0, tension: .1, fill: false, order: 3 },
+      { type: 'scatter', label: 'Entry', data: entries, order: 1, pointStyle: 'triangle', pointRadius: 7,
+        pointBackgroundColor: entries.map(e => e.long ? '#16a34a' : '#dc2626'), pointBorderColor: '#fff', pointBorderWidth: 1 },
+      { type: 'scatter', label: 'Exit', data: showExits ? exits : [], order: 2, pointStyle: 'rectRot', pointRadius: 7,
+        pointBackgroundColor: exits.map(e => e.win ? '#16a34a' : '#dc2626'), pointBorderColor: '#fff', pointBorderWidth: 1 },
+    ]},
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display: true, labels: { usePointStyle: true, boxWidth: 8, font: { size: 11 } } },
+        tooltip: { callbacks: { label: c => `${c.dataset.label}: ${c.parsed.y} @ ${hhmm(c.parsed.x)} UTC` } },
+        zoom: {
+          zoom: { wheel: { enabled: true }, drag: { enabled: false }, mode: 'xy' },
+          pan: { enabled: false },
+          limits: { y: { min: fullLo - pad, max: fullHi + pad } }
+        }
+      },
+      scales: {
+        x: { type: 'linear', grid: { display: false }, ticks: { maxTicksLimit: 8, callback: v => hhmm(v) } },
+        y: { min: lo - pad, max: hi + pad, grid: { color: '#eef2f7' } }
+      }
+    }
+  });
+  wirePan();
+  const zoomBy = (factor) => {
+    if (!priceChart) return;
+    const sx = priceChart.scales.x, sy = priceChart.scales.y;
+    const cx = (sx.min + sx.max) / 2, cy = (sy.min + sy.max) / 2;
+    const hx = (sx.max - sx.min) / 2 * factor, hy = (sy.max - sy.min) / 2 * factor;
+    priceChart.options.scales.x.min = cx - hx; priceChart.options.scales.x.max = cx + hx;
+    priceChart.options.scales.y.min = cy - hy; priceChart.options.scales.y.max = cy + hy;
+    priceChart.update('none');
+  };
+  const wire = (id, fn) => { const b = document.getElementById(id); if (b) b.onclick = fn; };
+  wire('zoomIn', () => zoomBy(0.8));    // shrink the view = zoom in
+  wire('zoomOut', () => zoomBy(1.25));  // widen the view = zoom out
+  wire('zoomReset', () => renderPriceChart());  // re-frame to default
+  wire('exitToggle', () => {
+    showExits = !showExits;
+    localStorage.setItem('showExits', showExits ? '1' : '0');
+    renderPriceChart();
+  });
+  const et = document.getElementById('exitToggle');
+  if (et) et.textContent = 'Exits: ' + (showExits ? 'on' : 'off');
+}
 function buildFilters() {
+
   const vSel = document.getElementById('fVariant'), sSel = document.getElementById('fSymbol');
   const variants = [...new Set(ALL.map(t => t.variant).filter(Boolean))];
   const symbols  = [...new Set(ALL.map(t => t.symbol).filter(Boolean))];
@@ -261,12 +398,20 @@ function render() {
     ['Won / Lost', `+${fmt(grossWon, 2)} / ${fmt(grossLost, 2)} $`, 'neutral', wins + 'W · ' + losses + 'L'],
     ['Win rate', decided.length ? Math.round(100*wins/decided.length) + '%' : '—', 'neutral',
       decided.length + ' decided'],
+    ['Profit factor', grossLost !== 0 ? (grossWon/Math.abs(grossLost)).toFixed(2) : '—',
+      (grossLost !== 0 && grossWon/Math.abs(grossLost) >= 1) ? 'pos' : 'neg', 'gross won / gross lost'],
     ['Avg win', `${fmt(avgW, 2)} $` + (avgWPct !== null ? ` (+${fmt(avgWPct, 2)}%)` : ''), 'pos',
       'per winning trade'],
     ['Avg loss', `${fmt(avgL, 2)} $` + (avgLPct !== null ? ` (${fmt(avgLPct, 2)}%)` : ''), 'neg',
       'per losing trade'],
   ].map(c => `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div>` +
        `<div class="k" style="text-transform:none;margin-top:2px">${c[3]}</div></div>`).join('');
+
+  renderKronosCard(decided);
+  renderMetaCard(decided);
+  renderKellyCard(decided, wins, losses, avgW, avgL);
+  buildSymBtns();
+  renderPriceChart();
 
   const dec = decided.slice().sort((a,b) => a.id - b.id);
   let run = 0;
@@ -331,7 +476,64 @@ function render() {
   grid.on('rowClick', (e, row) => openChain(row.cells[0].data));
 }
 
-function v(x, d) { return x === null || x === undefined ? '<i>not recorded</i>' : fmt(x, d ?? 2); }
+function rcBar(pct, color) {
+  return `<div class="rc-track"><div class="rc-fill" style="width:${Math.max(2, pct)}%;background:${color}"></div></div>`;
+}
+function renderKronosCard(decided) {
+  const el = document.getElementById('kronosCard'); if (!el) return;
+  const bks = [[0.50,0.55],[0.55,0.60],[0.60,0.65],[0.65,1.01]];
+  const rows = bks.map(([lo,hi]) => {
+    const inB = decided.filter(t => { const c = t.direction === 'STRAT_LONG' ? n(t.p_up) : n(t.p_down); return c !== null && c >= lo && c < hi; });
+    const w = inB.filter(t => t.status === 'WIN').length;
+    return { lo, hi, count: inB.length, wr: inB.length ? w/inB.length : null };
+  });
+  if (!rows.some(r => r.count > 0)) { el.innerHTML = '<div class="rc-empty">No decided trades with Kronos conviction recorded yet.</div>'; return; }
+  el.innerHTML = '<div class="rc">' + rows.map(r => {
+    const lbl = `${r.lo.toFixed(2)}–${r.hi > 1 ? '1.00' : r.hi.toFixed(2)}`;
+    if (!r.count) return `<div class="rc-row"><div class="rc-label">${lbl}</div><div class="rc-track"></div><div class="rc-meta">0 trades</div></div>`;
+    const pct = r.wr*100, col = r.wr >= 0.5 ? '#16a34a' : '#dc2626';
+    return `<div class="rc-row"><div class="rc-label">${lbl}</div>${rcBar(pct, col)}<div class="rc-meta">${Math.round(pct)}% · ${r.count}t</div></div>`;
+  }).join('') + '</div><div class="rc-foot">Higher conviction should win more — a rising staircase means Kronos is calibrated.</div>';
+}
+function renderMetaCard(decided) {
+  const el = document.getElementById('metaCard'); if (!el) return;
+  const withMeta = decided.filter(t => n(t.meta_p_win) !== null);
+  if (!withMeta.length) { el.innerHTML = '<div class="rc-empty">Meta-labeler dormant — no predictions recorded yet. Train it (<code>python learner.py train</code>) and restart; this panel fills in as shadow predictions accrue.</div>'; return; }
+  const bks = [[0,0.40],[0.40,0.50],[0.50,0.60],[0.60,1.01]];
+  el.innerHTML = '<div class="rc">' + bks.map(([lo,hi]) => {
+    const inB = withMeta.filter(t => { const m = n(t.meta_p_win); return m >= lo && m < hi; });
+    const w = inB.filter(t => t.status === 'WIN').length;
+    const wr = inB.length ? w/inB.length : null;
+    const lbl = `pred ${lo.toFixed(2)}–${hi > 1 ? '1.00' : hi.toFixed(2)}`;
+    if (!inB.length) return `<div class="rc-row"><div class="rc-label">${lbl}</div><div class="rc-track"></div><div class="rc-meta">0t</div></div>`;
+    const pct = wr*100, col = wr >= 0.5 ? '#16a34a' : '#dc2626';
+    return `<div class="rc-row"><div class="rc-label">${lbl}</div>${rcBar(pct, col)}<div class="rc-meta">${Math.round(pct)}% · ${inB.length}t</div></div>`;
+  }).join('') + '</div><div class="rc-foot">Actual win rate should climb with the predicted probability if the meta is learning.</div>';
+}
+function renderKellyCard(decided, wins, losses, avgW, avgL) {
+  const el = document.getElementById('kellyCard'); if (!el) return;
+  const nT = decided.length;
+  const W = nT ? wins/nT : 0;
+  const R = avgL !== 0 ? Math.abs(avgW/avgL) : 0;
+  const f = R > 0 ? (W - (1-W)/R) : 0;
+  const half = Math.max(0, f)/2;
+  const eqV = PAYLOAD.equity ? n(PAYLOAD.equity.equity) : null;
+  const size = eqV !== null ? eqV*half : null;
+  const cell = (k, val, c) => `<div class="kcell"><div class="k">${k}</div><div class="v ${c || 'neutral'}">${val}</div></div>`;
+  el.innerHTML = '<div class="kgrid">' +
+    cell('Win rate (W)', nT ? Math.round(W*100) + '%' : '—') +
+    cell('Payoff (R)', R ? R.toFixed(2) + '×' : '—') +
+    cell('Full Kelly', (f*100).toFixed(1) + '%', f > 0 ? 'pos' : 'neg') +
+    cell('Half-Kelly', (half*100).toFixed(1) + '%') +
+    cell('Suggested size', size !== null ? fmt(size, 2) + ' $' : '—') +
+    '</div><div class="rc-foot">' +
+    (f <= 0 ? 'Negative edge: Kelly says do not size up (trade minimum or sit out). '
+            : 'Half-Kelly is the practical bet; full Kelly is too swingy. ') +
+    (nT < 30 ? `<b>Only ${nT} decided trades — treat as noise until ~30+.</b> ` : '') +
+    'Preview only: harvester mode uses fixed notional, so this is not live sizing yet.</div>';
+}
+function v(x, d) {
+ return x === null || x === undefined ? '<i>not recorded</i>' : fmt(x, d ?? 2); }
 
 function openChain(id) {
   const t = ALL.find(x => x.id === id);
