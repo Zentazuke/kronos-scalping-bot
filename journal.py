@@ -50,6 +50,7 @@ from execution import ExecutionResult, PerformanceTracker
 __all__ = [
     "TradeJournal",
     "OutcomeMonitor",
+    "ObservationJournal",
     "TradeRecord",
     "TradeOutcome",
     "PerformanceSnapshot",
@@ -558,6 +559,82 @@ class TradeJournal:
                 replayed,
             )
         return replayed
+
+
+# --------------------------------------------------------------------------- #
+# Observation journal                                                          #
+# --------------------------------------------------------------------------- #
+
+
+class ObservationJournal:
+    """Every directional setup the bot *evaluated* — including the ones blocked
+    by the position cap or vetoed, which never become real trades. That is the
+    10x data the meta-learner is starved for.
+
+    Uses the SAME schema as the trade journal, so the learner reads it directly
+    (``learner.py walkforward --db observations.db``). Each row is a
+    *hypothetical* trade, written OPEN and unlabeled; ``label_observations.py``
+    later replays its bracket against real candles to stamp WIN/LOSS — which
+    also means observation labels are free of testnet phantom fills.
+
+    Append-only, in its own file. It can never touch the trade journal.
+    """
+
+    _FEATURE_COLS: Final[Tuple[str, ...]] = (
+        "adx", "atr", "atr_sma", "rsi", "plus_di", "minus_di", "book_imbalance",
+        "p_up", "p_down", "confluence_votes", "spread_bps", "relative_volume",
+        "depth_imbalance", "total_depth", "trade_imbalance", "ofi_rel",
+        "mvwap_gap_bps", "microprice_gap_bps", "trend_1h", "trend_4h", "rsi_1h",
+        "day_range_pos", "trend_1d", "macro_trend", "dist_30d_high", "vol_pct_1d",
+    )
+
+    def __init__(self, db_path: Path) -> None:
+        self._conn: sqlite3.Connection = sqlite3.connect(str(db_path))
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+    def record(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        entry_price: Decimal,
+        **features: Any,
+    ) -> None:
+        """Append one OPEN, unlabeled observation. ``features`` accepts the same
+        keyword columns the trade journal stores (adx, atr ... vol_pct_1d);
+        None values and unknown keys are skipped (left NULL)."""
+        cols: List[str] = [
+            "ts_open", "symbol", "direction", "amount",
+            "entry_price", "variant", "status",
+        ]
+        vals: List[Any] = [
+            _utc_now(), symbol, direction, "1",
+            _to_text(entry_price), "observation", STATUS_OPEN,
+        ]
+        for col in self._FEATURE_COLS:
+            value: Any = features.get(col)
+            if value is None:
+                continue
+            cols.append(col)
+            vals.append(int(value) if col == "confluence_votes" else _to_text(value))
+        placeholders: str = ", ".join("?" for _ in cols)
+        self._conn.execute(
+            f"INSERT INTO trades ({', '.join(cols)}) VALUES ({placeholders})",
+            vals,
+        )
+        self._conn.commit()
+
+    def open_count(self) -> int:
+        """How many observations still await a label (status OPEN)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE status = ?", (STATUS_OPEN,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 # --------------------------------------------------------------------------- #

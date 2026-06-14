@@ -75,7 +75,7 @@ from feed import (
     TradeFlowSnapshot,
 )
 from gatekeeper import ConfluenceReport, MarketGatekeeper, RegimeReport
-from journal import OutcomeMonitor, TradeJournal, TradeOutcome
+from journal import ObservationJournal, OutcomeMonitor, TradeJournal, TradeOutcome
 from learner import MetaFilter, features_from_context
 from predictor import KronosInferenceEngine, PredictionReport, SignalDirection
 from sentiment_shadow_client import SentimentShadowClient
@@ -345,6 +345,19 @@ class TradingSupervisor:
         )
         self._tracker: PerformanceTracker = PerformanceTracker()
         self._journal.replay_into(self._tracker)
+        # Observation journal — every directional setup (traded or not) written
+        # to its own db for offline learning (the 10x data). Isolated, optional,
+        # fail-safe: if it can't open we log and keep trading.
+        self._observations: Optional[ObservationJournal] = None
+        try:
+            self._observations = ObservationJournal(
+                Path(os.getenv("OBSERVATIONS_DB") or "observations.db")
+            )
+        except Exception:  # noqa: BLE001 — observation store is never load-bearing
+            logger.warning(
+                "observation journal unavailable — continuing without it",
+                exc_info=True,
+            )
         self._monitor: OutcomeMonitor = OutcomeMonitor(
             self._exchange,
             self._journal,
@@ -563,6 +576,8 @@ class TradingSupervisor:
             if visualizer_task is not None:
                 await asyncio.gather(visualizer_task, return_exceptions=True)
             self._journal.close()
+            if self._observations is not None:
+                self._observations.close()
             logger.info("supervisor loop closed (exit code %d)", self._exit_code)
 
         return self._exit_code
@@ -1042,6 +1057,46 @@ class TradingSupervisor:
                 result.status.value,
                 result.reason,
             )
+
+            # Observation journal — record this directional setup for offline
+            # learning whether or not it routed to a real trade. The blocked-by-
+            # cap and vetoed bars are the 10x data the learner is starved for.
+            # Fail-safe: bookkeeping must never disturb a trading bar.
+            if self._observations is not None:
+                try:
+                    self._observations.record(
+                        symbol=symbol,
+                        direction=direction.value,
+                        entry_price=trigger_price,
+                        adx=regime.adx,
+                        atr=regime.atr,
+                        atr_sma=regime.atr_sma,
+                        rsi=regime.rsi,
+                        plus_di=regime.plus_di,
+                        minus_di=regime.minus_di,
+                        book_imbalance=regime.book_imbalance,
+                        p_up=prediction.p_up,
+                        p_down=prediction.p_down,
+                        confluence_votes=confluence.votes,
+                        spread_bps=regime.spread_bps,
+                        relative_volume=regime.relative_volume,
+                        depth_imbalance=regime.depth_imbalance,
+                        total_depth=regime.total_depth,
+                        trade_imbalance=flow_imbalance,
+                        ofi_rel=ofi_rel,
+                        mvwap_gap_bps=mvwap_gap_bps,
+                        microprice_gap_bps=regime.microprice_gap_bps,
+                        trend_1h=regime.trend_1h,
+                        trend_4h=regime.trend_4h,
+                        rsi_1h=regime.rsi_1h,
+                        day_range_pos=regime.day_range_pos,
+                        trend_1d=trend_1d,
+                        macro_trend=macro_trend,
+                        dist_30d_high=dist_30d_high,
+                        vol_pct_1d=vol_pct_1d,
+                    )
+                except Exception:  # noqa: BLE001 — observation logging is never load-bearing
+                    logger.debug("%s: observation record skipped", symbol, exc_info=True)
 
             # Step D½ — journal the bracket with its full decision context.
             if (
