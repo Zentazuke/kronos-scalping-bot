@@ -24,19 +24,22 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import logging
 import math
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from statistics import NormalDist
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("bot.search")
 
 _EULER_GAMMA = 0.5772156649015329
-MIN_TRADES = 25          # a rule must select at least this many to be trusted
+MIN_TRADES = 25          # a rule must select at least this many to be trusted (in-sample AND holdout)
 HOLDOUT_FRAC = 0.30      # last 30% of time held out for confirmation
+HISTORY_JSONL = "search_history.jsonl"  # one machine-readable record per run
+HISTORY_TXT = "search_history.txt"       # human-readable append, newest at the bottom
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +156,23 @@ def load_setups(db_path: str) -> List[Setup]:
             v = _f(r, key)
             if v is not None:
                 feats[name] = v
+        # sentiment / alt-data ingredients — None until the engine is wired in,
+        # so they simply won't enter the search until enough rows carry them.
+        ss = _f(r, "sent_score")
+        if ss is not None:
+            feats["sent_aligned"] = ss if is_long else -ss
+        ol = _f(r, "outlook_1h")
+        if ol is not None:
+            feats["outlook_aligned"] = ol if is_long else -ol
+        for key, name in (
+            ("fear_greed", "fear_greed"),
+            ("funding_rate", "funding"),
+            ("long_short_ratio", "ls_ratio"),
+            ("attention_spike", "attention"),
+        ):
+            v = _f(r, key)
+            if v is not None:
+                feats[name] = v
         out.append(Setup(ts=_ts_ms(r["ts_open"]), ret=pnl / entry, feats=feats))
     return out
 
@@ -244,6 +264,42 @@ def _fmt_rule(rule: Tuple[Condition, ...]) -> str:
     return " AND ".join(f"{f}>={thr:g}" for f, thr in rule)
 
 
+def _format_history(r: Dict[str, Any]) -> str:
+    """Human-readable block for search_history.txt, so you can eyeball the trend
+    across runs without parsing JSON."""
+    lines = ["=" * 78]
+    lines.append(f"{r['ts']}  db={r['db']}  n={r['n_decided']}  "
+                 f"max_cond={r['max_conditions']}  trials={r['n_trials']}")
+    lines.append(f"take-all: Sharpe {r['take_all_sharpe']:+.3f}, win {r['take_all_win']*100:.0f}%"
+                 f"   |   noise floor {r['noise_floor']:.3f}")
+    lines.append(f"VERDICT: {r['verdict']}")
+    lines.append(f"best: {r['best_rule']}")
+    lines.append(f"      in {r['best_in_sharpe']:+.3f}/{r['best_in_n']}   "
+                 f"oos {r['best_oos_sharpe']:+.3f}/{r['best_oos_n']}   psr {r['best_psr']*100:.0f}%")
+    if r["pattern"]:
+        lines.append("pattern: " + ", ".join(f"{k}x{v}" for k, v in r["pattern"].items()))
+    lines.append("top rules (in-sample | out-of-sample):")
+    for t in r["top"][:8]:
+        lines.append(f"  {t['rule'][:48]:<48}  in {t['in_sharpe']:+.2f}/{t['in_n']:<3} "
+                     f"{t['in_win']*100:>3.0f}%  |  oos {t['oos_sharpe']:+.2f}/{t['oos_n']:<3} "
+                     f"{t['oos_win']*100:>3.0f}%")
+    return "\n".join(lines) + "\n"
+
+
+def _append_history(record: Dict[str, Any]) -> None:
+    """Append one run to the persistent history (JSONL + readable text) so every
+    test is kept and comparable over time. Best-effort: a logging failure must
+    never sink a successful search."""
+    try:
+        with open(HISTORY_JSONL, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+        with open(HISTORY_TXT, "a", encoding="utf-8") as fh:
+            fh.write(_format_history(record))
+        logger.info("\nrun saved to %s (and %s)", HISTORY_JSONL, HISTORY_TXT)
+    except OSError as exc:  # pragma: no cover — disk/permission edge
+        logger.warning("could not write search history: %s", exc)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Search entry-filter combinations honestly")
     p.add_argument("--db", default="observations.db")
@@ -274,31 +330,36 @@ def main() -> int:
                     r.n_hold, r.sharpe_hold, r.win_hold * 100)
 
     # honest verdict: did the BEST rule beat the noise floor of trying this many
-    # combos, and does it then hold up on the untouched holdout?
+    # combos, AND hold up on a holdout big enough to trust (>= MIN_TRADES)?
     sr_star = _deflated_benchmark_sr(var_sr, n_trials)
     best = results[0]  # sorted by in-sample Sharpe
     hold_start = int(len(setups) * (1 - HOLDOUT_FRAC))
+    hold_rets = [s.ret for s in setups[hold_start:] if _passes(s, best.rule)]
+    g3, g4 = _moments(hold_rets)
+    psr = _psr(best.sharpe_hold, best.n_hold, g3, g4, 0.0)
+    if best.sharpe_search <= sr_star:
+        verdict = "even the best rule sits within the noise floor — no real edge yet"
+    elif best.n_hold < MIN_TRADES:
+        verdict = (f"best rule beats the noise floor in-sample, but its holdout is too small "
+                   f"({best.n_hold} trades, need {MIN_TRADES}) to trust — needs more data")
+    elif best.sharpe_hold > 0:
+        verdict = (f"best rule BEATS the noise floor AND holds out-of-sample "
+                   f"(OOS Sharpe {best.sharpe_hold:.3f} over {best.n_hold}, "
+                   f"edge-is-real {psr * 100:.0f}%) — worth a closer look")
+    else:
+        verdict = (f"best rule beats the noise floor in-sample but FAILS out-of-sample "
+                   f"(OOS Sharpe {best.sharpe_hold:.3f}) — overfit, not real")
+
     logger.info("\n=== honesty check ===")
     logger.info("noise floor — expected best Sharpe from %d random tries: %.3f", n_trials, sr_star)
     logger.info("best rule in-sample: Sharpe %.3f over %d trades  (%s)",
                 best.sharpe_search, best.n_search, _fmt_rule(best.rule))
-    survivors: List[RuleResult] = []
-    if best.sharpe_search <= sr_star:
-        logger.info("VERDICT: even the best rule sits within the noise floor — no real edge "
-                    "on this data yet. Keep collecting and re-run later.")
-    else:
-        hold_rets = [s.ret for s in setups[hold_start:] if _passes(s, best.rule)]
-        g3, g4 = _moments(hold_rets)
-        psr = _psr(best.sharpe_hold, best.n_hold, g3, g4, 0.0)
-        if best.sharpe_hold > 0:
-            logger.info("VERDICT: best rule BEATS the noise floor and HOLDS out-of-sample "
-                        "(Sharpe %.3f over %d, edge-is-real %.0f%%). Worth a closer look.",
-                        best.sharpe_hold, best.n_hold, psr * 100)
-        else:
-            logger.info("VERDICT: best rule beats the noise floor in-sample but FAILS "
-                        "out-of-sample (Sharpe %.3f) — overfit, not real.", best.sharpe_hold)
-        survivors = [r for r in results
-                     if r.sharpe_search > sr_star and r.n_hold >= MIN_TRADES and r.sharpe_hold > 0]
+    logger.info("VERDICT: %s", verdict)
+
+    survivors: List[RuleResult] = [
+        r for r in results
+        if r.sharpe_search > sr_star and r.n_hold >= MIN_TRADES and r.sharpe_hold > 0
+    ]
 
     # patterns: ingredients of rules that beat the floor AND held out-of-sample
     logger.info("\n=== patterns (ingredients of rules that beat the floor + held OOS) ===")
@@ -311,6 +372,35 @@ def main() -> int:
             logger.info("  %-12s in %d of %d surviving rules", feat, cnt, len(survivors))
     else:
         logger.info("  (none survived — no consistent winning ingredient on this data yet)")
+
+    # persist this run so every test is kept and comparable over time
+    record: Dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "db": args.db,
+        "n_decided": len(setups),
+        "take_all_sharpe": round(base_sr, 3),
+        "take_all_win": round(base_win, 3),
+        "max_conditions": args.max_conditions,
+        "n_trials": n_trials,
+        "noise_floor": round(sr_star, 3),
+        "verdict": verdict,
+        "best_rule": _fmt_rule(best.rule),
+        "best_in_sharpe": round(best.sharpe_search, 3),
+        "best_in_n": best.n_search,
+        "best_oos_sharpe": round(best.sharpe_hold, 3),
+        "best_oos_n": best.n_hold,
+        "best_psr": round(psr, 3),
+        "survivors": len(survivors),
+        "pattern": dict(sorted(tally.items(), key=lambda kv: kv[1], reverse=True)),
+        "top": [
+            {"rule": _fmt_rule(r.rule), "in_sharpe": round(r.sharpe_search, 3),
+             "in_n": r.n_search, "in_win": round(r.win_search, 3),
+             "oos_sharpe": round(r.sharpe_hold, 3), "oos_n": r.n_hold,
+             "oos_win": round(r.win_hold, 3)}
+            for r in results[: args.top]
+        ],
+    }
+    _append_history(record)
     return 0
 
 
