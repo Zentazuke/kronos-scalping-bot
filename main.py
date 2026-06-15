@@ -79,6 +79,11 @@ from journal import ObservationJournal, OutcomeMonitor, TradeJournal, TradeOutco
 from learner import MetaFilter, features_from_context
 from predictor import KronosInferenceEngine, PredictionReport, SignalDirection
 from sentiment_shadow_client import SentimentShadowClient
+
+try:  # optional TA-board indicators recorded as observation features
+    from ta_signals import compute_signals as _ta_compute
+except Exception:  # noqa: BLE001
+    _ta_compute = None  # type: ignore[assignment]
 from visualizer import (
     ConfluenceUpdate,
     EquityUpdate,
@@ -1071,6 +1076,33 @@ class TradingSupervisor:
                 except Exception:  # noqa: BLE001 — sentiment capture is never load-bearing
                     sentiment = {}
 
+            # TA-board indicators (MACD, Supertrend, Stochastic, CCI, Bollinger,
+            # Donchian, OBV) computed from this bar's frame and journaled as
+            # search ingredients — each as the indicator's own bullish(+)/
+            # bearish(-) vote x strength. Fail-safe: never disturbs a trading bar.
+            ta: Dict[str, Any] = {}
+            if _ta_compute is not None:
+                try:
+                    _rows = frame[["open", "high", "low", "close", "volume"]].to_numpy()
+                    _candles = [
+                        [0.0, float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])]
+                        for x in _rows
+                    ]
+                    _res = _ta_compute(_candles)
+                    if _res:
+                        _vote = {"long": 1, "short": -1, "neutral": 0}
+                        _names = {
+                            "MACD": "ta_macd", "Supertrend": "ta_supertrend",
+                            "Stochastic": "ta_stoch", "CCI": "ta_cci",
+                            "Bollinger": "ta_boll", "Donchian": "ta_donchian", "OBV": "ta_obv",
+                        }
+                        for _s in _res["signals"]:
+                            _col = _names.get(_s["name"])
+                            if _col:
+                                ta[_col] = _vote.get(_s["dir"], 0) * _s["strength"]
+                except Exception:  # noqa: BLE001 — TA capture is never load-bearing
+                    ta = {}
+
             # Observation journal — record this directional setup for offline
             # learning whether or not it routed to a real trade. The blocked-by-
             # cap and vetoed bars are the 10x data the learner is starved for.
@@ -1115,6 +1147,13 @@ class TradingSupervisor:
                         funding_rate=sentiment.get("funding_rate"),
                         open_interest=sentiment.get("open_interest"),
                         outlook_1h=sentiment.get("outlook_1h"),
+                        ta_macd=ta.get("ta_macd"),
+                        ta_supertrend=ta.get("ta_supertrend"),
+                        ta_stoch=ta.get("ta_stoch"),
+                        ta_cci=ta.get("ta_cci"),
+                        ta_boll=ta.get("ta_boll"),
+                        ta_donchian=ta.get("ta_donchian"),
+                        ta_obv=ta.get("ta_obv"),
                     )
                 except Exception:  # noqa: BLE001 — observation logging is never load-bearing
                     logger.debug("%s: observation record skipped", symbol, exc_info=True)

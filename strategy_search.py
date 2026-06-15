@@ -173,6 +173,14 @@ def load_setups(db_path: str) -> List[Setup]:
             v = _f(r, key)
             if v is not None:
                 feats[name] = v
+        # TA-board indicators (direction-aware: + = indicator agrees with the trade)
+        for key, name in (
+            ("ta_macd", "macd"), ("ta_supertrend", "supertrend"), ("ta_stoch", "stoch"),
+            ("ta_cci", "cci"), ("ta_boll", "boll"), ("ta_donchian", "donchian"), ("ta_obv", "obv"),
+        ):
+            v = _f(r, key)
+            if v is not None:
+                feats[name] = v if is_long else -v
         out.append(Setup(ts=_ts_ms(r["ts_open"]), ret=pnl / entry, feats=feats))
     return out
 

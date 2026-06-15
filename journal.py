@@ -124,6 +124,13 @@ CREATE TABLE IF NOT EXISTS trades (
     funding_rate    TEXT,
     open_interest   TEXT,
     outlook_1h      TEXT,
+    ta_macd         TEXT,
+    ta_supertrend   TEXT,
+    ta_stoch        TEXT,
+    ta_cci          TEXT,
+    ta_boll         TEXT,
+    ta_donchian     TEXT,
+    ta_obv          TEXT,
     variant         TEXT NOT NULL DEFAULT 'prod',
     status          TEXT NOT NULL DEFAULT 'OPEN',
     ts_close        TEXT,
@@ -596,6 +603,8 @@ class ObservationJournal:
         "day_range_pos", "trend_1d", "macro_trend", "dist_30d_high", "vol_pct_1d",
         "sent_score", "sent_velocity", "attention_spike", "fear_greed",
         "long_short_ratio", "funding_rate", "open_interest", "outlook_1h",
+        "ta_macd", "ta_supertrend", "ta_stoch", "ta_cci", "ta_boll",
+        "ta_donchian", "ta_obv",
     )
 
     def __init__(self, db_path: Path) -> None:
