@@ -1,0 +1,13 @@
+# /etc/systemd/system/kronos-label.timer
+# sudo systemctl daemon-reload && sudo systemctl enable --now kronos-label.timer
+[Unit]
+Description=Resolve Kronos observations every 2 hours
+
+[Timer]
+# Every 2 hours, on the hour (00:00, 02:00, 04:00 ... server time / UTC).
+OnCalendar=*-*-* 00/2:00:00
+# If the box was off, catch up on next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+# /etc/systemd/system/kronos-label.service
+# Lightweight, frequent labeler — resolves OPEN observations against mainnet
+# candles so the clean dataset fills in fast. Triggered by kronos-label.timer.
+# (The heavier daily kronos-learn.service still runs the full walk-forward.)
+[Unit]
+Description=Kronos observation labeler (resolve OPEN observations vs mainnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kronos
+WorkingDirectory=/home/kronos/kronos-scalping-bot
+ExecStart=/home/kronos/kronos-scalping-bot/.venv/bin/python label_observations.py --db observations.db
