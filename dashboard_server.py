@@ -19,6 +19,7 @@ import os
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -26,6 +27,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Final, List
+from urllib.parse import parse_qs, urlparse
 
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 DB_PATH: Final[Path] = BASE_DIR / "journal.db"
@@ -243,6 +245,46 @@ def _ta_signals() -> Dict[str, Any]:
     return out
 
 
+_SEARCH_DBS: Final[Dict[str, str]] = {"observations": "observations.db", "journal": "journal.db"}
+
+
+def _run_search(path: str) -> bytes:
+    """Run strategy_search.py on demand and return the latest run record as JSON
+    (the dashboard's Run-Simulation button). Constrained for safety: only the two
+    known journals, 1-3 conditions, no user-controlled paths. Never raises."""
+    q = parse_qs(urlparse(path).query)
+    db_file = _SEARCH_DBS.get((q.get("db", ["observations"])[0]).lower())
+    try:
+        cond = max(1, min(3, int(q.get("cond", ["2"])[0])))
+    except ValueError:
+        cond = 2
+    if db_file is None:
+        return json.dumps({"error": "unknown dataset"}).encode("utf-8")
+    if not (BASE_DIR / db_file).exists():
+        return json.dumps({"error": f"{db_file} not found on the server yet"}).encode("utf-8")
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(BASE_DIR / "strategy_search.py"),
+             "--db", db_file, "--max-conditions", str(cond), "--top", "12"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "search timed out — try fewer conditions"}).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"could not start search: {exc}"}).encode("utf-8")
+    if proc.returncode != 0:
+        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-300:]
+        return json.dumps(
+            {"error": "not enough clean data yet, or no rule qualified", "detail": detail}
+        ).encode("utf-8")
+    hist = BASE_DIR / "search_history.jsonl"
+    try:
+        last = hist.read_text("utf-8").strip().split("\n")[-1]
+        return json.dumps(json.loads(last), default=str).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"ran, but could not read result: {exc}"}).encode("utf-8")
+
+
 def _payload() -> bytes:
     out: Dict[str, Any] = {
         "source": "db",
@@ -290,6 +332,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path.split("?")[0] in ("/", "/index.html"):
             body = HTML_PATH.read_bytes()
             content_type = "text/html; charset=utf-8"
+        elif self.path.split("?")[0] == "/run-search":
+            body = _run_search(self.path)
+            content_type = "application/json"
         else:
             self.send_error(404)
             return
