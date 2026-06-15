@@ -49,6 +49,7 @@ import logging
 import math
 import unittest
 from dataclasses import dataclass
+from statistics import NormalDist
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -460,6 +461,7 @@ class WalkForwardFold:
     n_test: int
     accuracy: float
     base_rate: float
+    n_purged: int = 0
 
     @property
     def edge(self) -> float:
@@ -538,21 +540,111 @@ def _fit_predict_xgb(
     return proba
 
 
+# --------------------------------------------------------------------------- #
+# Purging + Deflated Sharpe — statistical honesty for the verdict             #
+# --------------------------------------------------------------------------- #
+WALK_FORWARD_EMBARGO_FRAC: Final[float] = 0.01  # buffer (fraction of total span) purged before each test block
+DSR_DEFAULT_TRIALS: Final[int] = 4              # model/dataset configs tried, used to deflate the Sharpe
+_EULER_GAMMA: Final[float] = 0.5772156649015329
+
+
+def _ts_ms(ts: Optional[str]) -> Optional[int]:
+    """UTC ISO timestamp -> epoch milliseconds (None if unparseable)."""
+    if not ts:
+        return None
+    s = ts.replace(" ", "T")
+    tail = s[10:]
+    if not (s.endswith("Z") or "+" in tail or "-" in tail):
+        s += "+00:00"
+    s = s.replace("Z", "+00:00")
+    try:
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _pnl_of(trade: TradeRecord) -> float:
+    try:
+        return float(trade.pnl) if trade.pnl is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sharpe(returns: Sequence[float]) -> float:
+    """Per-observation Sharpe (mean / sample-std). 0.0 when undefined."""
+    n = len(returns)
+    if n < 2:
+        return 0.0
+    m = sum(returns) / n
+    var = sum((r - m) ** 2 for r in returns) / (n - 1)
+    sd = var ** 0.5
+    return m / sd if sd > 0 else 0.0
+
+
+def _moments(returns: Sequence[float]) -> Tuple[float, float]:
+    """(skewness, kurtosis) — kurtosis on the normal-equals-3 convention."""
+    n = len(returns)
+    if n < 4:
+        return 0.0, 3.0
+    m = sum(returns) / n
+    s2 = sum((r - m) ** 2 for r in returns) / n
+    if s2 <= 0:
+        return 0.0, 3.0
+    sd = s2 ** 0.5
+    g3 = sum(((r - m) / sd) ** 3 for r in returns) / n
+    g4 = sum(((r - m) / sd) ** 4 for r in returns) / n
+    return g3, g4
+
+
+def _psr(sr: float, n_obs: int, g3: float, g4: float, sr_benchmark: float = 0.0) -> float:
+    """Probabilistic Sharpe Ratio — P(true Sharpe > benchmark), correcting for
+    skewness, kurtosis and sample length (Bailey & López de Prado, 2014)."""
+    if n_obs < 2:
+        return 0.0
+    denom = 1.0 - g3 * sr + ((g4 - 1.0) / 4.0) * sr * sr
+    if denom <= 0:
+        return 0.0
+    z = (sr - sr_benchmark) * math.sqrt(n_obs - 1) / math.sqrt(denom)
+    return NormalDist().cdf(z)
+
+
+def _deflated_benchmark_sr(sr_variance: float, n_trials: int) -> float:
+    """Expected maximum Sharpe under the null after ``n_trials`` independent
+    attempts — the bar a genuine edge must clear. Grows with how many
+    configurations were tried (the multiple-testing penalty)."""
+    if n_trials < 2 or sr_variance <= 0:
+        return 0.0
+    nd = NormalDist()
+    e_max = (1.0 - _EULER_GAMMA) * nd.inv_cdf(1.0 - 1.0 / n_trials) + _EULER_GAMMA * nd.inv_cdf(
+        1.0 - 1.0 / (n_trials * math.e)
+    )
+    return (sr_variance ** 0.5) * e_max
+
+
 def walk_forward(
     features: Sequence[Sequence[float]],
     labels: Sequence[float],
     *,
     n_folds: int = WALK_FORWARD_FOLDS,
     model: str = "logistic",
-) -> List[WalkForwardFold]:
-    """Expanding-window time-series validation.
+    times: Optional[Sequence[Tuple[int, int]]] = None,
+    embargo_frac: float = 0.0,
+    return_oos: bool = False,
+) -> "List[WalkForwardFold] | Tuple[List[WalkForwardFold], List[Tuple[int, int, float, float]], int]":
+    """Expanding-window time-series validation, with optional purging.
 
     Splits the chronological trades into ``n_folds + 1`` contiguous blocks.
     Fold k (1..n_folds) trains on every block before k and tests on block k,
     so each successive fold sees more history and is always tested on unseen,
-    later trades. A single holdout (as in ``train_model``) can flatter or
-    damn a model on the luck of one split; agreement across folds is the
-    real evidence that an edge is stable rather than noise.
+    later trades.
+
+    When ``times`` (per-sample ``(open_ms, close_ms)``) is supplied, training
+    rows whose label window resolves at or after the test block begins — within
+    an ``embargo_frac`` buffer — are *purged*: the model must never be trained
+    on an outcome that was still unfolding during the period it is tested on.
+    On dense, overlapping data this is the difference between a real edge and a
+    leaked one. With ``return_oos`` the per-test predictions and the total
+    purge count come back too, for the Deflated-Sharpe verdict.
     """
     if len(features) != len(labels) or not features:
         raise ValueError("features and labels must be equal-length and non-empty")
@@ -565,15 +657,30 @@ def walk_forward(
     if n < (n_folds + 1) * 2:
         n_folds = max(1, n // 2 - 1)
 
+    embargo_ms: int = 0
+    if times is not None and embargo_frac > 0 and len(times) >= 2:
+        embargo_ms = int(embargo_frac * (times[-1][1] - times[0][0]))
+
     edges: List[int] = [round(n * i / (n_folds + 1)) for i in range(n_folds + 2)]
     results: List[WalkForwardFold] = []
+    oos: List[Tuple[int, int, float, float]] = []  # (fold, global_index, prob, label)
+    purge_total: int = 0
     for k in range(1, n_folds + 1):
         tr_end: int = edges[k]
         te_start, te_end = edges[k], edges[k + 1]
         if tr_end < 1 or te_end <= te_start:
             continue
-        tx, ty = matrix[:tr_end], target[:tr_end]
         ex, ey = matrix[te_start:te_end], target[te_start:te_end]
+        n_purged: int = 0
+        if times is not None:
+            cutoff = times[te_start][0] - embargo_ms
+            keep = [i for i in range(tr_end) if times[i][1] < cutoff]
+            n_purged = tr_end - len(keep)
+            if not keep:
+                continue
+            tx, ty = matrix[keep], target[keep]
+        else:
+            tx, ty = matrix[:tr_end], target[:tr_end]
         if model == "xgb":
             probs = _fit_predict_xgb(tx, ty, ex)
         else:
@@ -582,15 +689,21 @@ def walk_forward(
         correct: int = int(np.sum((probs >= 0.5) == (ey >= 0.5)))
         accuracy: float = correct / len(ey)
         base_rate: float = max(float(ey.mean()), 1.0 - float(ey.mean()))
+        purge_total += n_purged
+        for j in range(len(ey)):
+            oos.append((k, te_start + j, float(probs[j]), float(ey[j])))
         results.append(
             WalkForwardFold(
                 fold=k,
-                n_train=int(tr_end),
+                n_train=int(len(ty)),
                 n_test=int(len(ey)),
                 accuracy=accuracy,
                 base_rate=base_rate,
+                n_purged=n_purged,
             )
         )
+    if return_oos:
+        return results, oos, purge_total
     return results
 
 
@@ -602,6 +715,12 @@ def _write_walkforward_report(
     n_decided: int,
     n_excluded: int,
     folds: List[WalkForwardFold],
+    purge_total: int = 0,
+    sharpe_filtered: float = 0.0,
+    sharpe_baseline: float = 0.0,
+    psr: float = 0.0,
+    dsr: float = 0.0,
+    trials: int = 0,
 ) -> None:
     """Merge this run's verdict into a JSON the dashboard reads. Keyed by
     '<dataset>:<model>' so logistic/xgb on journal/observations coexist in one
@@ -617,8 +736,14 @@ def _write_walkforward_report(
         "updated": datetime.now(timezone.utc).isoformat(),
         "n_decided": n_decided,
         "n_excluded": n_excluded,
+        "purged": purge_total,
         "mean_accuracy": round(mean_acc, 4),
         "mean_edge": round(mean_edge, 4),
+        "sharpe_filtered": round(sharpe_filtered, 4),
+        "sharpe_baseline": round(sharpe_baseline, 4),
+        "psr": round(psr, 4),
+        "dsr": round(dsr, 4),
+        "trials": trials,
         "folds_beat": beat,
         "n_folds": len(folds),
         "folds": [
@@ -653,6 +778,7 @@ def walk_forward_from_journal(
     n_folds: int = WALK_FORWARD_FOLDS,
     model: str = "logistic",
     json_path: Optional[Path] = None,
+    trials: int = DSR_DEFAULT_TRIALS,
 ) -> Optional[List[WalkForwardFold]]:
     """CLI worker: decided trades -> expanding-window folds, logged as a table.
 
@@ -702,15 +828,31 @@ def walk_forward_from_journal(
         )
         return None
 
+    decided.sort(key=lambda t: _ts_ms(t.ts_open) or 0)
     features: List[List[float]] = [features_from_record(t) for t in decided]
     labels: List[float] = [1.0 if t.status == STATUS_WIN else 0.0 for t in decided]
-    folds: List[WalkForwardFold] = walk_forward(features, labels, n_folds=n_folds, model=model)
+    times: List[Tuple[int, int]] = [
+        ((_ts_ms(t.ts_open) or 0), (_ts_ms(t.ts_close) or _ts_ms(t.ts_open) or 0))
+        for t in decided
+    ]
+    pnls: List[float] = [_pnl_of(t) for t in decided]
+    folds, oos, purge_total = walk_forward(
+        features,
+        labels,
+        n_folds=n_folds,
+        model=model,
+        times=times,
+        embargo_frac=WALK_FORWARD_EMBARGO_FRAC,
+        return_oos=True,
+    )
 
     logger.info(
-        "walk-forward (%s): %d expanding-window fold(s) over %d decided trades",
+        "walk-forward (%s): %d purged expanding-window fold(s) over %d decided "
+        "trades (%d training row(s) purged for label overlap)",
         model,
         len(folds),
         len(decided),
+        purge_total,
     )
     beat: int = 0
     acc_sum: float = 0.0
@@ -718,11 +860,12 @@ def walk_forward_from_journal(
     for f in folds:
         verdict: str = "beats baseline" if f.edge > 0 else "at/below baseline"
         logger.info(
-            "  fold %d: train %4d -> test %4d | accuracy %5.1f%% vs baseline "
-            "%5.1f%% (edge %+.1f pp) %s",
+            "  fold %d: train %4d -> test %4d (purged %d) | accuracy %5.1f%% vs "
+            "baseline %5.1f%% (edge %+.1f pp) %s",
             f.fold,
             f.n_train,
             f.n_test,
+            f.n_purged,
             f.accuracy * 100,
             f.base_rate * 100,
             f.edge * 100,
@@ -731,6 +874,29 @@ def walk_forward_from_journal(
         beat += 1 if f.edge > 0 else 0
         acc_sum += f.accuracy
         edge_sum += f.edge
+
+    # Deflated-Sharpe verdict on the model-as-filter strategy: take the setup
+    # when P(win) >= 0.5, otherwise stand aside (0 return). PSR asks "is the
+    # edge real, given skew/kurtosis and sample size?"; DSR additionally
+    # discounts for how many model/dataset configs were tried.
+    filt: List[float] = [pnls[i] if p >= 0.5 else 0.0 for (_fk, i, p, _y) in oos]
+    base: List[float] = [pnls[i] for (_fk, i, _p, _y) in oos]
+    sr_filt: float = _sharpe(filt)
+    sr_base: float = _sharpe(base)
+    g3, g4 = _moments(filt)
+    psr: float = _psr(sr_filt, len(filt), g3, g4, 0.0)
+    by_fold: Dict[int, List[float]] = {}
+    for (fk, i, p, _y) in oos:
+        by_fold.setdefault(fk, []).append(pnls[i] if p >= 0.5 else 0.0)
+    fold_srs: List[float] = [_sharpe(rs) for rs in by_fold.values() if len(rs) >= 2]
+    if len(fold_srs) >= 2:
+        msr = sum(fold_srs) / len(fold_srs)
+        var_sr = sum((x - msr) ** 2 for x in fold_srs) / (len(fold_srs) - 1)
+    else:
+        var_sr = 0.0
+    sr_star: float = _deflated_benchmark_sr(var_sr, trials)
+    dsr: float = _psr(sr_filt, len(filt), g3, g4, sr_star)
+
     if folds:
         logger.info(
             "walk-forward summary: mean accuracy %.1f%% | mean edge %+.1f pp | "
@@ -740,6 +906,19 @@ def walk_forward_from_journal(
             beat,
             len(folds),
         )
+        logger.info(
+            "filtered strategy per-trade Sharpe %.3f vs take-all %.3f over %d OOS setups",
+            sr_filt,
+            sr_base,
+            len(filt),
+        )
+        logger.info(
+            "Probabilistic Sharpe (edge real?) %.1f%% | Deflated Sharpe "
+            "(survives %d trials?) %.1f%%",
+            psr * 100,
+            trials,
+            dsr * 100,
+        )
     if json_path is not None and folds:
         _write_walkforward_report(
             json_path,
@@ -748,6 +927,12 @@ def walk_forward_from_journal(
             n_decided=len(decided),
             n_excluded=dropped,
             folds=folds,
+            purge_total=purge_total,
+            sharpe_filtered=sr_filt,
+            sharpe_baseline=sr_base,
+            psr=psr,
+            dsr=dsr,
+            trials=trials,
         )
     return folds
 
@@ -844,6 +1029,13 @@ def main() -> int:
         default=None,
         help="walk-forward: also write the verdict to this JSON for the dashboard",
     )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=DSR_DEFAULT_TRIALS,
+        help="walk-forward: number of model/dataset configs tried, for the "
+        "Deflated Sharpe multiple-testing penalty (default %(default)s)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
     db_args: List[str] = args.db if args.db else ["journal.db"]
@@ -854,6 +1046,7 @@ def main() -> int:
             n_folds=args.folds,
             model=args.model,
             json_path=Path(args.json) if args.json else None,
+            trials=args.trials,
         )
         return 0 if folds else 1
     metrics: Optional[TrainingMetrics] = train_from_journal(paths, Path(args.out))
