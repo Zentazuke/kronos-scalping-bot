@@ -116,6 +116,14 @@ CREATE TABLE IF NOT EXISTS trades (
     macro_trend     TEXT,
     dist_30d_high   TEXT,
     vol_pct_1d      TEXT,
+    sent_score      TEXT,
+    sent_velocity   TEXT,
+    attention_spike TEXT,
+    fear_greed      TEXT,
+    long_short_ratio TEXT,
+    funding_rate    TEXT,
+    open_interest   TEXT,
+    outlook_1h      TEXT,
     variant         TEXT NOT NULL DEFAULT 'prod',
     status          TEXT NOT NULL DEFAULT 'OPEN',
     ts_close        TEXT,
@@ -586,12 +594,21 @@ class ObservationJournal:
         "depth_imbalance", "total_depth", "trade_imbalance", "ofi_rel",
         "mvwap_gap_bps", "microprice_gap_bps", "trend_1h", "trend_4h", "rsi_1h",
         "day_range_pos", "trend_1d", "macro_trend", "dist_30d_high", "vol_pct_1d",
+        "sent_score", "sent_velocity", "attention_spike", "fear_greed",
+        "long_short_ratio", "funding_rate", "open_interest", "outlook_1h",
     )
 
     def __init__(self, db_path: Path) -> None:
         self._conn: sqlite3.Connection = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        # Migrate older observation DBs: add any feature column they predate
+        # (e.g. the sentiment columns). Idempotent, additive (NULL on old rows).
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(trades)")}
+        for col in self._FEATURE_COLS:
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT")
+                logger.info("observations migrated: %s column added", col)
         self._conn.commit()
 
     def record(

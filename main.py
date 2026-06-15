@@ -1058,6 +1058,19 @@ class TradingSupervisor:
                 result.reason,
             )
 
+            # Capture the sentiment engine's current alt-data signals for this
+            # setup so the search can test them as ingredients (news sentiment,
+            # Fear & Greed, crowd positioning, funding...). Off the event loop
+            # and fail-safe: blanks on any failure, never blocks the trading bar.
+            sentiment: Dict[str, Any] = {}
+            if self._sentiment_shadow is not None:
+                try:
+                    sentiment = await asyncio.get_running_loop().run_in_executor(
+                        None, self._sentiment_shadow.signals, symbol
+                    )
+                except Exception:  # noqa: BLE001 — sentiment capture is never load-bearing
+                    sentiment = {}
+
             # Observation journal — record this directional setup for offline
             # learning whether or not it routed to a real trade. The blocked-by-
             # cap and vetoed bars are the 10x data the learner is starved for.
@@ -1094,6 +1107,14 @@ class TradingSupervisor:
                         macro_trend=macro_trend,
                         dist_30d_high=dist_30d_high,
                         vol_pct_1d=vol_pct_1d,
+                        sent_score=sentiment.get("sentiment_score"),
+                        sent_velocity=sentiment.get("sentiment_velocity"),
+                        attention_spike=sentiment.get("attention_spike"),
+                        fear_greed=sentiment.get("fear_greed"),
+                        long_short_ratio=sentiment.get("long_short_ratio"),
+                        funding_rate=sentiment.get("funding_rate"),
+                        open_interest=sentiment.get("open_interest"),
+                        outlook_1h=sentiment.get("outlook_1h"),
                     )
                 except Exception:  # noqa: BLE001 — observation logging is never load-bearing
                     logger.debug("%s: observation record skipped", symbol, exc_info=True)

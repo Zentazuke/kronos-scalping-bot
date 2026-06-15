@@ -47,6 +47,13 @@ logger = logging.getLogger("sentiment_shadow_client")
 
 _VALID_DIRECTIONS = ("STRAT_LONG", "STRAT_SHORT")
 
+#: Flat fields the engine's GET /signals/{symbol} endpoint returns (all optional;
+#: None means "unavailable", never a fake zero).
+_SIGNAL_FIELDS = (
+    "sentiment_score", "sentiment_velocity", "attention_spike", "fear_greed",
+    "long_short_ratio", "funding_rate", "open_interest", "outlook_1h",
+)
+
 
 def _neutral_result(symbol: str, bot_confidence: float, reason: str) -> Dict[str, Any]:
     """The safe answer used whenever the engine cannot be consulted."""
@@ -159,6 +166,33 @@ class SentimentShadowClient:
                 return json.loads(response.read().decode("utf-8"))
         except Exception:  # noqa: BLE001
             return None
+
+    def signals(self, symbol: str, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Fetch the engine's current alt-data signals for one symbol so the bot
+        can journal them as observation features (news sentiment, Fear & Greed,
+        crowd positioning, funding, ...). Fail-safe: returns a dict with every
+        field None on ANY failure/timeout. Never raises. Intended to be called
+        off the event loop (it does blocking I/O)."""
+        blank: Dict[str, Any] = {field: None for field in _SIGNAL_FIELDS}
+        key = symbol.replace("/", "-")
+        tmo = self.timeout if timeout is None else timeout
+        try:
+            with urllib.request.urlopen(f"{self.base_url}/signals/{key}", timeout=tmo) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            out = dict(blank)
+            for field in _SIGNAL_FIELDS:
+                value = data.get(field)
+                out[field] = float(value) if isinstance(value, (int, float)) else None
+            with self._lock:
+                self.stats["sent"] += 1
+                self.stats["ok"] += 1
+            return out
+        except Exception as exc:  # noqa: BLE001 - the bot must never break
+            with self._lock:
+                self.stats["sent"] += 1
+                self.stats["failed"] += 1
+            logger.debug("sentiment signals unreachable (%s); blanks", type(exc).__name__)
+            return blank
 
     def close(self) -> None:
         self._executor.shutdown(wait=False)
