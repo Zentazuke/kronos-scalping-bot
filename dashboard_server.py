@@ -148,6 +148,26 @@ _candle_cache: Dict[str, List[List[float]]] = {}  # 5m, "BTC/USDT" -> [[t,o,h,l,
 _TA_EXTRA_TFS: Final[Tuple[str, ...]] = ("15m", "1h")
 _ta_extra: Dict[str, Dict[str, List[List[float]]]] = {tf: {} for tf in _TA_EXTRA_TFS}
 
+# Sentiment engine — read its /signals per symbol so the dashboard can show
+# the live feed and whether the engine is reachable. Same box as the bot.
+_SENTIMENT_URL: Final[str] = os.getenv("SENTIMENT_ENGINE_URL", "http://127.0.0.1:8787").rstrip("/")
+_sentiment_cache: Dict[str, Dict[str, Any]] = {}
+_sentiment_state: Dict[str, Any] = {"ok": False, "ts": ""}
+
+
+def _fetch_sentiment(symbol: str) -> None:
+    """Pull one symbol's current signals from the engine into the cache. On any
+    failure the previous values are kept and the engine is flagged unreachable."""
+    key: str = symbol.replace("/", "-")
+    try:
+        with urllib.request.urlopen(f"{_SENTIMENT_URL}/signals/{key}", timeout=2) as resp:  # noqa: S310
+            data: Any = json.loads(resp.read().decode("utf-8"))
+        _sentiment_cache[symbol] = data
+        _sentiment_state["ok"] = True
+        _sentiment_state["ts"] = time.strftime("%H:%M:%S")
+    except Exception:  # noqa: BLE001 — engine is optional; keep stale, mark not-ok
+        _sentiment_state["ok"] = False
+
 
 def _fetch_klines(symbol: str, interval: str, limit: int = 288) -> List[List[float]]:
     """One REST pull of OHLCV bars. Volume (k[5]) is carried for OBV."""
@@ -182,6 +202,7 @@ def _candle_loop() -> None:
     while True:
         for sym in _SYMBOLS:
             _fetch_candles(sym)
+            _fetch_sentiment(sym)
         time.sleep(_CANDLE_TTL)
 
 
@@ -296,6 +317,9 @@ def _payload() -> bytes:
         "walkforward": {},
         "observations": {},
         "ta_signals": {},
+        "sentiment": {},
+        "sentiment_ok": False,
+        "sentiment_ts": "",
         "error": "",
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -321,6 +345,9 @@ def _payload() -> bytes:
     out["walkforward"] = _walkforward()
     out["observations"] = _obs_stats()
     out["ta_signals"] = _ta_signals()
+    out["sentiment"] = dict(_sentiment_cache)
+    out["sentiment_ok"] = _sentiment_state["ok"]
+    out["sentiment_ts"] = _sentiment_state["ts"]
     return json.dumps(out, default=str).encode("utf-8")
 
 

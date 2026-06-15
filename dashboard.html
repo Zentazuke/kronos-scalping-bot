@@ -131,6 +131,15 @@
   .sim-tbl th { color:#64748b; font-size:10.5px; font-weight:700; }
   .sim-tbl td.sim-rule, .sim-tbl th.sim-rule { text-align:left; font-weight:600; color:#334155; }
   .sim-pat { font-size:11.5px; color:#475569; margin-top:8px; }
+  .se-badge { font-size:12px; font-weight:600; padding:3px 10px; border-radius:999px; }
+  .se-ok { background:#dcfce7; color:#166534; } .se-bad { background:#fee2e2; color:#991b1b; }
+  .se-sym { font-size:12px; font-weight:600; padding:3px 11px; border:1px solid #e2e8f0; background:#fff; color:#475569; border-radius:999px; cursor:pointer; }
+  .se-sym.active { background:#7c3aed; color:#fff; border-color:#7c3aed; }
+  .se-grp { font-size:10.5px; font-weight:700; color:#7c3aed; letter-spacing:.6px; margin:11px 0 3px; text-transform:uppercase; }
+  .se-row { display:flex; justify-content:space-between; padding:4px 2px; border-bottom:1px solid #f1f5f9; font-size:13px; }
+  .se-k { color:#475569; } .se-v { font-weight:600; font-variant-numeric:tabular-nums; color:#334155; }
+  .se-pos { color:#16a34a; } .se-neg { color:#dc2626; }
+  .se-empty { font-size:12.5px; color:#64748b; padding:8px 2px; }
   .kgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr)); gap:8px; }
   .kcell { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:8px; }
   .kcell .k { font-size:10.5px; color:#64748b; text-transform:uppercase; letter-spacing:.03em; }
@@ -226,6 +235,15 @@
     <div id="simResult"><div class="sim-meta">Runs the honest combination search on the server and shows the verdict here — no terminal needed. Each run is also saved to the history file.</div></div>
   </div>
 
+  <div class="sec">Sentiment Engine</div>
+  <div class="panel" style="margin-bottom:14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+      <span id="seStatus" class="se-badge se-bad">connecting…</span>
+      <span id="seSyms" style="display:inline-flex;gap:6px;flex-wrap:wrap"></span>
+    </div>
+    <div id="seBody"><div class="se-empty">Waiting for the engine…</div></div>
+  </div>
+
   <div class="sec">TA Signals</div>
   <div class="panel" style="margin-bottom:14px">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">
@@ -283,7 +301,7 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
@@ -494,6 +512,7 @@ function render() {
   renderKellyCard(decided, wins, losses, avgW, avgL);
   renderWalkforward(PAYLOAD);
   renderTASignals();
+  renderSentiment();
   buildSymBtns();
   renderPriceChart();
 
@@ -693,6 +712,41 @@ function renderSim(d){
   const p = d.pattern || {}, k = Object.keys(p);
   h += '<div class="sim-pat">' + (k.length ? ('Surviving ingredients: ' + k.map(x => x + '×' + p[x]).join(', ')) : 'No ingredient survived the holdout yet.') + '</div>';
   out.innerHTML = h;
+}
+let seSym = (function(){ try { return localStorage.getItem('seSym') || ''; } catch(e){ return ''; } })();
+function seSetSym(s){ seSym = s; try { localStorage.setItem('seSym', s); } catch(e){} renderSentiment(); }
+function seFG(v){ if (v==null) return ''; if (v<25) return 'Extreme Fear'; if (v<45) return 'Fear'; if (v<55) return 'Neutral'; if (v<75) return 'Greed'; return 'Extreme Greed'; }
+function seBig(v){ if (v==null) return '—'; const a=Math.abs(v); if (a>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if (a>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if (a>=1e3) return '$'+(v/1e3).toFixed(1)+'K'; return '$'+v.toFixed(0); }
+function seNum(v, dp){ return (v==null) ? '—' : (typeof v==='number' ? (v>0?'+':'')+v.toFixed(dp) : String(v)); }
+function renderSentiment(){
+  const badge = document.getElementById('seStatus'); if (!badge) return;
+  const syms = document.getElementById('seSyms'), body = document.getElementById('seBody');
+  const data = (typeof PAYLOAD !== 'undefined' && PAYLOAD && PAYLOAD.sentiment) || {};
+  const ok = (typeof PAYLOAD !== 'undefined' && PAYLOAD && PAYLOAD.sentiment_ok);
+  badge.className = 'se-badge ' + (ok ? 'se-ok' : 'se-bad');
+  badge.textContent = ok ? ('● engine connected · ' + ((PAYLOAD && PAYLOAD.sentiment_ts) || '')) : '● engine unreachable';
+  const keys = Object.keys(data).sort();
+  if (!keys.length){ syms.innerHTML = ''; body.innerHTML = '<div class="se-empty">No signals yet — make sure the engine is running on the server (127.0.0.1:8787).</div>'; return; }
+  if (!seSym || !keys.includes(seSym)) seSym = keys[0];
+  syms.innerHTML = keys.map(s => '<button class="se-sym ' + (s===seSym?'active':'') + '" onclick="seSetSym(\'' + s + '\')">' + s.split('/')[0] + '</button>').join('');
+  const d = data[seSym] || {};
+  const sgn = v => v==null ? '' : (v>0 ? 'se-pos' : v<0 ? 'se-neg' : '');
+  const row = (label, val, cls) => '<div class="se-row"><span class="se-k">' + label + '</span><span class="se-v ' + (cls||'') + '">' + val + '</span></div>';
+  let h = '';
+  h += '<div class="se-grp">Text / social sentiment</div>';
+  h += row('Sentiment score', seNum(d.sentiment_score, 2), sgn(d.sentiment_score));
+  h += row('Velocity', seNum(d.sentiment_velocity, 3), sgn(d.sentiment_velocity));
+  h += row('Attention spike', d.attention_spike==null ? '—' : d.attention_spike.toFixed(2) + '×', '');
+  h += '<div class="se-grp">Market-wide mood</div>';
+  h += row('Fear &amp; Greed', d.fear_greed==null ? '—' : (d.fear_greed + ' · ' + seFG(d.fear_greed)), '');
+  h += '<div class="se-grp">Crowd positioning</div>';
+  h += row('Long / short ratio', d.long_short_ratio==null ? '—' : d.long_short_ratio.toFixed(2), '');
+  h += '<div class="se-grp">Derivatives / leverage</div>';
+  h += row('Funding rate', d.funding_rate==null ? '—' : (d.funding_rate * 100).toFixed(4) + '%', sgn(d.funding_rate));
+  h += row('Open interest', seBig(d.open_interest), '');
+  h += '<div class="se-grp">Engine forecast</div>';
+  h += row('1h outlook', seNum(d.outlook_1h, 2), sgn(d.outlook_1h));
+  body.innerHTML = h;
 }
 function taArrows(s){
   if (s.dir === 'long')  return '<span class="ta-up">' + '▲'.repeat(s.strength) + '</span>';
