@@ -1100,6 +1100,15 @@ class TradingSupervisor:
                             _col = _names.get(_s["name"])
                             if _col:
                                 ta[_col] = _vote.get(_s["dir"], 0) * _s["strength"]
+                        # Consensus = how strongly the whole TA board agrees on a
+                        # direction (sum of the 7 votes, bullish + / bearish -).
+                        ta["ta_consensus"] = sum(
+                            ta.get(_k, 0)
+                            for _k in (
+                                "ta_macd", "ta_supertrend", "ta_stoch", "ta_cci",
+                                "ta_boll", "ta_donchian", "ta_obv",
+                            )
+                        )
                 except Exception:  # noqa: BLE001 — TA capture is never load-bearing
                     ta = {}
 
@@ -1154,6 +1163,7 @@ class TradingSupervisor:
                         ta_boll=ta.get("ta_boll"),
                         ta_donchian=ta.get("ta_donchian"),
                         ta_obv=ta.get("ta_obv"),
+                        ta_consensus=ta.get("ta_consensus"),
                     )
                 except Exception:  # noqa: BLE001 — observation logging is never load-bearing
                     logger.debug("%s: observation record skipped", symbol, exc_info=True)

@@ -235,6 +235,18 @@
     <div id="simResult"><div class="sim-meta">Runs the honest combination search on the server and shows the verdict here — no terminal needed. Each run is also saved to the history file.</div></div>
   </div>
 
+  <div class="sec">Sweep TP / SL geometry</div>
+  <div class="panel" style="margin-bottom:14px">
+    <div class="sim-bar">
+      <label style="font-size:12.5px;color:#475569">Resolve window
+        <select id="geoWin"><option value="48">48 bars (4h)</option><option value="24">24 bars (2h)</option><option value="72">72 bars (6h)</option><option value="96">96 bars (8h)</option></select>
+      </label>
+      <button id="geoRun" onclick="runGeo()">▶ Sweep geometry</button>
+      <span id="geoStatus" style="font-size:12px;color:#64748b"></span>
+    </div>
+    <div id="geoResult"><div class="sim-meta">Coarse-to-fine: first a wide pass with big steps, then — only if something looks promising — a fine zoom around the winner. Re-replays every observation against real mainnet candles, then tells you which bracket ratio survives out-of-sample. The live bracket (TP 1.5 / SL 2.5) is always scored and highlighted. Heavier than the search — it fetches candles, so give it up to a minute.</div></div>
+  </div>
+
   <div class="sec">Sentiment Engine</div>
   <div class="panel" style="margin-bottom:14px">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px">
@@ -711,6 +723,53 @@ function renderSim(d){
   h += '</tbody></table>';
   const p = d.pattern || {}, k = Object.keys(p);
   h += '<div class="sim-pat">' + (k.length ? ('Surviving ingredients: ' + k.map(x => x + '×' + p[x]).join(', ')) : 'No ingredient survived the holdout yet.') + '</div>';
+  out.innerHTML = h;
+}
+function runGeo(){
+  const btn = document.getElementById('geoRun'), st = document.getElementById('geoStatus'), out = document.getElementById('geoResult');
+  const win = document.getElementById('geoWin').value;
+  btn.disabled = true; st.textContent = 'replaying candles… (up to ~60s)'; out.innerHTML = '<div class="sim-meta">working…</div>';
+  fetch('/run-geometry?window=' + win + '&t=' + Date.now(), { cache: 'no-store' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) {
+        out.innerHTML = '<div class="sim-err">' + d.error + (d.detail ? '<br><span style="opacity:.7">' + d.detail + '</span>' : '') + '</div>';
+        st.textContent = '';
+      } else { renderGeo(d); st.textContent = 'done · ' + (d.ts || ''); }
+    })
+    .catch(e => { out.innerHTML = '<div class="sim-err">failed: ' + e.message + '</div>'; st.textContent = ''; })
+    .finally(() => { btn.disabled = false; });
+}
+function renderGeo(d){
+  const out = document.getElementById('geoResult');
+  const v = d.verdict || '';
+  const cls = /adopting|holds out-of-sample/.test(v) ? 'sim-good' : /noise floor|too small|overfit/.test(v) ? 'sim-warn' : 'sim-neu';
+  const pct = x => (x * 100).toFixed(3) + '%';
+  let h = '<div class="sim-verdict ' + cls + '">' + v + '</div>';
+  let stageTxt;
+  if (d.zoomed && d.zoom_center) {
+    stageTxt = 'coarse ' + (d.coarse_n || 0) + ' → zoomed ' + (d.zoom_n || 0) + ' around TP' + d.zoom_center.tp + '/SL' + d.zoom_center.sl;
+  } else {
+    stageTxt = 'coarse ' + (d.coarse_n || 0) + ' → no zoom (nothing promising yet)';
+  }
+  h += '<div class="sim-meta">' + stageTxt + ' · ' + (d.n_trials || 0) + ' geometries total · window ' + d.window + ' bars · noise floor ' + d.noise_floor + '</div>';
+  h += '<table class="sim-tbl"><thead><tr><th class="sim-rule">geometry</th><th>stage</th><th>R:R</th><th>Sharpe</th><th>n</th><th>win</th><th>exp</th><th>OOS</th><th>n</th><th>win</th><th>exp</th></tr></thead><tbody>';
+  (d.grid || []).forEach((g, i) => {
+    const isLive = (g.tp === 1.5 && g.sl === 2.5);
+    const isBest = (i === 0);
+    const style = isLive ? ' style="background:#eff6ff"' : '';
+    const tag = (isBest ? ' ⭐' : '') + (isLive ? ' <span style="color:#2563eb;font-size:10px">live</span>' : '');
+    const stageChip = g.stage === 'zoom' ? '<span style="color:#7c3aed;font-size:10px">zoom</span>' : '<span style="color:#94a3b8;font-size:10px">coarse</span>';
+    h += '<tr' + style + '><td class="sim-rule">TP' + g.tp + '/SL' + g.sl + tag + '</td><td>' + stageChip + '</td><td>' + g.rr.toFixed(2)
+      + '</td><td>' + g.in_sharpe.toFixed(2) + '</td><td>' + g.in_n + '</td><td>' + Math.round(g.in_win * 100) + '%</td><td>' + pct(g.in_exp)
+      + '</td><td>' + g.oos_sharpe.toFixed(2) + '</td><td>' + g.oos_n + '</td><td>' + Math.round(g.oos_win * 100) + '%</td><td>' + pct(g.oos_exp) + '</td></tr>';
+  });
+  h += '</tbody></table>';
+  if (d.best && d.live) {
+    const be = d.best.oos_exp, lv = d.live.oos_exp;
+    const delta = pct(be - lv);
+    h += '<div class="sim-pat">Best <b>TP' + d.best.tp + '/SL' + d.best.sl + '</b> vs live TP1.5/SL2.5 — out-of-sample expectancy edge of ' + delta + ' per trade.</div>';
+  }
   out.innerHTML = h;
 }
 let seSym = (function(){ try { return localStorage.getItem('seSym') || ''; } catch(e){ return ''; } })();

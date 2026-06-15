@@ -306,6 +306,50 @@ def _run_search(path: str) -> bytes:
         return json.dumps({"error": f"ran, but could not read result: {exc}"}).encode("utf-8")
 
 
+def _run_geometry(path: str) -> bytes:
+    """Run geometry_search.py on demand and return its latest run record as JSON
+    (the dashboard's Sweep-TP/SL button). Re-replays every observation against
+    mainnet candles at a grid of bracket geometries, so it fetches candles and is
+    heavier than the entry-filter search. observations.db only. Never raises."""
+    q = parse_qs(urlparse(path).query)
+    try:
+        window = max(12, min(96, int(q.get("window", ["48"])[0])))
+    except ValueError:
+        window = 48
+    db_file = "observations.db"
+    if not (BASE_DIR / db_file).exists():
+        return json.dumps({"error": f"{db_file} not found on the server yet"}).encode("utf-8")
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(BASE_DIR / "geometry_search.py"),
+             "--db", db_file, "--window", str(window), "--json"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "sweep timed out — too many observations / candles"}).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"could not start sweep: {exc}"}).encode("utf-8")
+    if proc.returncode != 0:
+        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-300:]
+        return json.dumps(
+            {"error": "not enough resolved observations yet to sweep geometry", "detail": detail}
+        ).encode("utf-8")
+    # geometry_search prints the run record as JSON on stdout (--json); fall back
+    # to the persisted history if stdout was empty for any reason.
+    out = (proc.stdout or "").strip()
+    if out:
+        try:
+            return json.dumps(json.loads(out.split("\n")[-1]), default=str).encode("utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+    hist = BASE_DIR / "geometry_history.jsonl"
+    try:
+        last = hist.read_text("utf-8").strip().split("\n")[-1]
+        return json.dumps(json.loads(last), default=str).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"ran, but could not read result: {exc}"}).encode("utf-8")
+
+
 def _payload() -> bytes:
     out: Dict[str, Any] = {
         "source": "db",
@@ -361,6 +405,9 @@ class _Handler(BaseHTTPRequestHandler):
             content_type = "text/html; charset=utf-8"
         elif self.path.split("?")[0] == "/run-search":
             body = _run_search(self.path)
+            content_type = "application/json"
+        elif self.path.split("?")[0] == "/run-geometry":
+            body = _run_geometry(self.path)
             content_type = "application/json"
         else:
             self.send_error(404)

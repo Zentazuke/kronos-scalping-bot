@@ -181,6 +181,11 @@ def load_setups(db_path: str) -> List[Setup]:
             v = _f(r, key)
             if v is not None:
                 feats[name] = v if is_long else -v
+        # consensus: how strongly the whole TA board agreed with the scalp
+        # direction (+ = board agrees with the trade, - = board disagrees).
+        cons = _f(r, "ta_consensus")
+        if cons is not None:
+            feats["consensus"] = cons if is_long else -cons
         out.append(Setup(ts=_ts_ms(r["ts_open"]), ret=pnl / entry, feats=feats))
     return out
 
