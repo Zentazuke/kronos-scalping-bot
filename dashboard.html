@@ -733,19 +733,21 @@ function renderSentiment(){
   const sgn = v => v==null ? '' : (v>0 ? 'se-pos' : v<0 ? 'se-neg' : '');
   const row = (label, val, cls) => '<div class="se-row"><span class="se-k">' + label + '</span><span class="se-v ' + (cls||'') + '">' + val + '</span></div>';
   let h = '';
-  h += '<div class="se-grp">Text / social sentiment</div>';
-  h += row('Sentiment score', seNum(d.sentiment_score, 2), sgn(d.sentiment_score));
-  h += row('Velocity', seNum(d.sentiment_velocity, 3), sgn(d.sentiment_velocity));
-  h += row('Attention spike', d.attention_spike==null ? '—' : d.attention_spike.toFixed(2) + '×', '');
   h += '<div class="se-grp">Market-wide mood</div>';
   h += row('Fear &amp; Greed', d.fear_greed==null ? '—' : (d.fear_greed + ' · ' + seFG(d.fear_greed)), '');
   h += '<div class="se-grp">Crowd positioning</div>';
-  h += row('Long / short ratio', d.long_short_ratio==null ? '—' : d.long_short_ratio.toFixed(2), '');
+  const _lsr = d.long_short_ratio;
+  h += row('Long / short ratio', _lsr==null ? '—' : _lsr.toFixed(2), '');
+  h += row('Crowd long', _lsr==null ? '—' : Math.round(_lsr / (_lsr + 1) * 100) + '% long', '');
   h += '<div class="se-grp">Derivatives / leverage</div>';
   h += row('Funding rate', d.funding_rate==null ? '—' : (d.funding_rate * 100).toFixed(4) + '%', sgn(d.funding_rate));
   h += row('Open interest', seBig(d.open_interest), '');
   h += '<div class="se-grp">Engine forecast</div>';
   h += row('1h outlook', seNum(d.outlook_1h, 2), sgn(d.outlook_1h));
+  h += '<div class="se-grp">Text / social sentiment</div>';
+  h += row('Sentiment score', seNum(d.sentiment_score, 2), sgn(d.sentiment_score));
+  h += row('Velocity', seNum(d.sentiment_velocity, 3), sgn(d.sentiment_velocity));
+  h += row('Attention spike', d.attention_spike==null ? '—' : d.attention_spike.toFixed(2) + '×', '');
   body.innerHTML = h;
 }
 function taArrows(s){
