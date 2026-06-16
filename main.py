@@ -400,6 +400,19 @@ class TradingSupervisor:
         )
         self._feed.add_reconciliation_hook(self._router.on_reconnect)
 
+        # OFI gate (live forward test): when OFI_GATE_MIN is set, only ROUTE
+        # setups whose direction-aligned order-flow imbalance clears the
+        # threshold; every bar is still OBSERVED, so harvesting/persistence
+        # analysis continues unbroken. Off (None) by default — fully reversible.
+        _ofi_env: str = os.getenv("OFI_GATE_MIN", "")
+        self._ofi_gate_min: Optional[float] = float(_ofi_env) if _ofi_env not in ("", None) else None
+        # rolling counters for the dashboard's live view
+        self._ofi_routed: int = 0
+        self._ofi_gated: int = 0
+        if self._ofi_gate_min is not None:
+            logger.info("OFI gate ACTIVE — routing only setups with aligned OFI >= %.3f",
+                        self._ofi_gate_min)
+
         # Mission Control dashboard — pure observer, drop-oldest telemetry.
         self._visualizer: Optional[TradingBotVisualizer] = (
             None
@@ -1044,24 +1057,55 @@ class TradingSupervisor:
                     trigger_price=float(trigger_price),
                 )
 
-            # Step D — protective execution routing. The live open-trade
-            # count feeds the concurrent-position cap (harvester mode);
-            # single-position mode ignores it.
-            result: ExecutionResult = await self._router.route_trade(
-                symbol,
-                direction,
-                frame,
-                book,
-                trigger_price,
-                open_positions=len(self._journal.open_trades(symbol)),
+            # Step D — protective execution routing, behind the OFI gate (live
+            # forward test). When OFI_GATE_MIN is set we ROUTE only setups whose
+            # direction-aligned order-flow imbalance clears the threshold; the
+            # rest are still OBSERVED below, so harvesting/persistence continues.
+            # Gate off (unset) => routes every setup exactly as before.
+            _aligned_ofi: Optional[float] = (
+                None if ofi_rel is None
+                else (float(ofi_rel) if direction is SignalDirection.LONG else -float(ofi_rel))
             )
+            result: ExecutionResult
+            if self._ofi_gate_min is not None and (
+                _aligned_ofi is None or _aligned_ofi < self._ofi_gate_min
+            ):
+                self._ofi_gated += 1
+                result = ExecutionResult(
+                    status=ExecutionStatus.BLOCKED_STATE,
+                    symbol=symbol,
+                    direction=direction,
+                    reason="OFI gate: aligned order-flow below threshold",
+                )
+                logger.info(
+                    "%s: OFI gate — aligned %s < %.3f, live trade SKIPPED (still observed) "
+                    "[routed=%d gated=%d]",
+                    symbol,
+                    "n/a" if _aligned_ofi is None else f"{_aligned_ofi:.3f}",
+                    self._ofi_gate_min, self._ofi_routed, self._ofi_gated,
+                )
+            else:
+                result = await self._router.route_trade(
+                    symbol,
+                    direction,
+                    frame,
+                    book,
+                    trigger_price,
+                    open_positions=len(self._journal.open_trades(symbol)),
+                )
+                if self._ofi_gate_min is not None:
+                    self._ofi_routed += 1
+                    logger.info(
+                        "%s: OFI gate — aligned %.3f >= %.3f, ROUTED -> %s [routed=%d gated=%d]",
+                        symbol, _aligned_ofi, self._ofi_gate_min, result.status.value,
+                        self._ofi_routed, self._ofi_gated,
+                    )
+                else:
+                    logger.info(
+                        "%s: routing outcome %s — %s",
+                        symbol, result.status.value, result.reason,
+                    )
             self._publish(ExecutionUpdate(result=result))
-            logger.info(
-                "%s: routing outcome %s — %s",
-                symbol,
-                result.status.value,
-                result.reason,
-            )
 
             # Capture the sentiment engine's current alt-data signals for this
             # setup so the search can test them as ingredients (news sentiment,

@@ -114,6 +114,34 @@ def _decisions(text: str) -> Dict[str, Dict[str, Dict[str, str]]]:
     return out
 
 
+_OFI_GATE = re.compile(
+    r"([A-Z0-9]+/[A-Z0-9]+): OFI gate — aligned (\S+) [<>]=? [\d.]+, "
+    r"(ROUTED|live trade SKIPPED).*?\[routed=(\d+) gated=(\d+)\]"
+)
+_OFI_TS = re.compile(r"^([\d-]+ [\d:]+)")
+
+
+def _ofi_gate(text: str) -> Dict[str, object]:
+    """Recent OFI-gate decisions + running routed/gated tally from the log tail
+    (the live forward-test view). Empty dict when the gate isn't active."""
+    recent: List[Dict[str, object]] = []
+    routed = gated = 0
+    for line in text.splitlines()[-2000:]:
+        m = _OFI_GATE.search(line)
+        if not m:
+            continue
+        sym, aligned, decision, r, g = m.groups()
+        routed, gated = int(r), int(g)
+        tsm = _OFI_TS.match(line)
+        recent.append({
+            "ts": tsm.group(1) if tsm else "",
+            "symbol": sym, "aligned": aligned, "routed": decision == "ROUTED",
+        })
+    if not recent:
+        return {}
+    return {"active": True, "routed": routed, "gated": gated, "recent": recent[-15:][::-1]}
+
+
 _EQUITY = re.compile(
     r"^([\d-]+ [\d:]+),\d+ .*EQUITY ([\d.]+) baseline ([\d.]+)", re.M
 )
@@ -380,9 +408,9 @@ def _payload() -> bytes:
         if LOG_PATH.exists():
             with LOG_PATH.open("rb") as fh:
                 fh.seek(max(0, LOG_PATH.stat().st_size - LOG_TAIL_BYTES))
-                out["decisions"] = _decisions(
-                    fh.read().decode("utf-8", errors="replace")
-                )
+                _logtext = fh.read().decode("utf-8", errors="replace")
+            out["decisions"] = _decisions(_logtext)
+            out["ofi_gate"] = _ofi_gate(_logtext)
     except OSError as exc:
         out["error"] += f" | log: {exc}"
     out["candles"] = dict(_candle_cache)

@@ -220,6 +220,11 @@
   <div class="panel" style="margin-bottom:14px"><h2>Shadow Kelly — suggested sizing from your live edge</h2><div id="kellyCard"></div></div>
   <div class="panel" style="margin-bottom:14px"><h2>Walk-forward verdict — does the model beat a coin-flip?</h2><div id="wfCard"></div></div>
 
+  <div class="sec">OFI Gate — live forward test</div>
+  <div class="panel" style="margin-bottom:14px">
+    <div id="ofiGate"><div class="sim-meta">Inactive. Set <code>OFI_GATE_MIN</code> on the bot to route only strong order-flow setups — every decision still streams here live.</div></div>
+  </div>
+
   <div class="sec">Run a Simulation</div>
   <div class="panel" style="margin-bottom:14px">
     <div class="sim-bar">
@@ -525,6 +530,7 @@ function render() {
   renderWalkforward(PAYLOAD);
   renderTASignals();
   renderSentiment();
+  renderOfiGate();
   buildSymBtns();
   renderPriceChart();
 
@@ -777,6 +783,26 @@ function seSetSym(s){ seSym = s; try { localStorage.setItem('seSym', s); } catch
 function seFG(v){ if (v==null) return ''; if (v<25) return 'Extreme Fear'; if (v<45) return 'Fear'; if (v<55) return 'Neutral'; if (v<75) return 'Greed'; return 'Extreme Greed'; }
 function seBig(v){ if (v==null) return '—'; const a=Math.abs(v); if (a>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if (a>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if (a>=1e3) return '$'+(v/1e3).toFixed(1)+'K'; return '$'+v.toFixed(0); }
 function seNum(v, dp){ return (v==null) ? '—' : (typeof v==='number' ? (v>0?'+':'')+v.toFixed(dp) : String(v)); }
+function renderOfiGate(){
+  const el = document.getElementById('ofiGate'); if(!el) return;
+  const g = PAYLOAD.ofi_gate || {};
+  if(!g.active){
+    el.innerHTML = '<div class="sim-meta">Inactive. Set <code>OFI_GATE_MIN</code> on the bot to route only strong order-flow setups — every decision still streams here live.</div>';
+    return;
+  }
+  const total = (g.routed||0) + (g.gated||0);
+  const pass = total ? Math.round(100*(g.routed||0)/total) : 0;
+  let h = '<div class="sim-meta"><b style="color:#166534">ACTIVE</b> · routed <b>'+(g.routed||0)
+        + '</b> / gated '+(g.gated||0)+' · '+pass+'% pass-through · only strong-OFI setups are traded (all bars still observed)</div>';
+  h += '<table class="sim-tbl"><thead><tr><th class="sim-rule">time</th><th class="sim-rule">symbol</th><th>aligned OFI</th><th>decision</th></tr></thead><tbody>';
+  (g.recent||[]).forEach(r => {
+    h += '<tr><td class="sim-rule">'+(r.ts||'').slice(11)+'</td><td class="sim-rule">'+r.symbol
+       + '</td><td>'+r.aligned+'</td><td style="font-weight:700;color:'+(r.routed?'#166534':'#94a3b8')+'">'
+       + (r.routed?'ROUTED':'gated')+'</td></tr>';
+  });
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
 function renderSentiment(){
   const badge = document.getElementById('seStatus'); if (!badge) return;
   const syms = document.getElementById('seSyms'), body = document.getElementById('seBody');
