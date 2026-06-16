@@ -217,6 +217,11 @@ async def run_all(args: argparse.Namespace) -> int:
         if len(frame) < need:
             logger.warning("%s: only %d bars, need >= %d — skipped", sym, len(frame), need)
             continue
+        if "amount" not in frame.columns:
+            # Kronos expects quote turnover; backtest.fetch_history omits it, so
+            # derive it the same way predictor.py's own frames do (close * volume).
+            frame = frame.copy()
+            frame["amount"] = frame["close"] * frame["volume"]
         samples = await swing_replay(frame, engine, symbol=sym,
                                      hold_bars=hold_bars, stride=args.stride)
         if not samples:
