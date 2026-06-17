@@ -44,6 +44,7 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
 SPLIT = 8           # UTC hour: morning = 00:00->08:00, afternoon = 08:00->day close
 VOL_WINDOW = 60     # trailing days for the vol-gate threshold (no lookahead)
 VOL_Q = 0.667       # top-tertile |morning move|
+REGIME_WINDOW = 30  # trailing days for the autocorr regime gate (hardened config)
 FEE_BPS = 10.0
 FETCH_DAYS = 80     # enough for the 60d trailing window + settle backlog
 
@@ -93,6 +94,20 @@ def trailing_threshold(candles: List[List[float]], today: str) -> Optional[float
     return float(np.quantile(hist[-VOL_WINDOW:], VOL_Q))
 
 
+def regime_on(candles: List[List[float]], today: str) -> Optional[bool]:
+    """Hardened-config regime gate: is the trailing early->late autocorrelation positive?
+    Trade only in momentum regimes; sit out the reverting ones. No lookahead."""
+    hist = [(m, a) for (d, m, a) in day_samples(candles, SPLIT) if d < today]
+    if len(hist) < REGIME_WINDOW:
+        return None
+    recent = hist[-REGIME_WINDOW:]
+    mo = np.array([m for m, _a in recent])
+    af = np.array([a for _m, a in recent])
+    if mo.std() == 0 or af.std() == 0:
+        return False
+    return float(np.corrcoef(mo, af)[0, 1]) > 0
+
+
 def decide(conn: sqlite3.Connection, symbol: str, candles: List[List[float]],
            today: str, now_iso: str) -> Optional[str]:
     """Log today's pre-committed decision for one symbol (idempotent)."""
@@ -110,14 +125,16 @@ def decide(conn: sqlite3.Connection, symbol: str, candles: List[List[float]],
     if not open_px or not split_px:
         return None  # not enough of today's session yet
     thr = trailing_threshold(candles, today)
-    if thr is None:
-        return None  # not enough history to set the gate honestly
+    regime = regime_on(candles, today)
+    if thr is None or regime is None:
+        return None  # not enough history to set the gates honestly
     morning = split_px / open_px - 1.0
-    if abs(morning) >= thr:
+    # Hardened config: trade only on a high-vol day AND in a momentum regime.
+    if abs(morning) >= thr and regime:
         direction = "LONG" if morning > 0 else "SHORT"
         status, entry = "PENDING", split_px
     else:
-        direction, status, entry = "FLAT", "SETTLED", split_px  # gated out
+        direction, status, entry = "FLAT", "SETTLED", split_px  # gated out (vol or regime)
     conn.execute(
         "INSERT INTO forward_trades (decision_day,symbol,direction,morning_ret,vol_thr,"
         "entry_price,entry_ts,status,exit_price,exit_ts,gross_ret,net_ret,created_at,settled_at)"
