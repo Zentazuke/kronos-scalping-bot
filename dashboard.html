@@ -232,6 +232,11 @@
     <div id="tsmForward"></div>
   </div>
 
+  <div class="sec">Auto forward-tests — every green rule, vetted by time</div>
+  <div class="panel" style="margin-bottom:14px">
+    <div id="fwdRules"></div>
+  </div>
+
   <div class="sec">Run a Simulation</div>
   <div class="panel" style="margin-bottom:14px">
     <div class="sim-bar">
@@ -325,7 +330,7 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.tsm_forward, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.tsm_forward, PAYLOAD.forward_rules, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
@@ -539,6 +544,7 @@ function render() {
   renderSentiment();
   renderOfiGate();
   renderTsmForward();
+  renderFwdRules();
   buildSymBtns();
   renderPriceChart();
 
@@ -870,6 +876,35 @@ function renderTsmForward(){
       d.pending.map(p=> p.coin+' <b style="color:'+(p.dir==='LONG'?'#166534':'#b91c1c')+'">'+p.dir+'</b>').join(' · ')+'</div>';
   }
   h += '<div class="sim-meta" style="margin-top:8px;color:#94a3b8">Shadow test — no live orders. Pre-committed at 08:00 UTC, settled at day-close. Expect ugly stretches; what matters is staying net-positive and broad across coins over weeks.</div>';
+  el.innerHTML = h;
+}
+function renderFwdRules(){
+  const el = document.getElementById('fwdRules'); if(!el) return;
+  const d = PAYLOAD.forward_rules || {};
+  if(!d.present){
+    el.innerHTML = '<div class="sim-meta">Auto-enroll is off (registry module not loaded on the server). Once present, every GREEN search rule locks itself here and accrues out-of-sample evidence automatically — no manual vetting.</div>';
+    return;
+  }
+  if(d.error){ el.innerHTML = '<div class="sim-meta">Registry read error: '+d.error+'</div>'; return; }
+  const rules = d.rules || [];
+  if(!rules.length){
+    el.innerHTML = '<div class="sim-meta">No rules enrolled yet. Press <b>Run simulation</b> above — any green result auto-locks here and the machine forward-tests it for you. Verdict matures as the rule fires live (these are rare, ~1–2/week).</div>';
+    return;
+  }
+  const pct = v => (v>=0?'+':'')+(v*100).toFixed(3)+'%';
+  const badge = v => v==='holding' ? '<b style="color:#166534">HOLDING</b>'
+                   : v==='failing' ? '<b style="color:#b91c1c">FAILING</b>'
+                   : '<b style="color:#94a3b8">ACCRUING</b>';
+  let h = '<div class="sim-meta">Every green search rule, locked the moment it appeared, judged only on observations recorded <i>after</i> the lock. Need '+(d.min_forward||30)+' forward trades before a verdict counts.</div>';
+  h += '<table class="sim-tbl"><thead><tr><th class="sim-rule">rule</th><th>locked</th><th>fwd n</th><th>win%</th><th>net/trade</th><th>verdict</th></tr></thead><tbody>';
+  rules.forEach(r => {
+    h += '<tr><td class="sim-rule">'+r.rule+'</td><td>'+r.lock_date+'</td><td>'+r.n+'</td>'+
+         '<td>'+(r.n?Math.round(r.win*100)+'%':'—')+'</td>'+
+         '<td style="color:'+(r.exp>0?'#166534':(r.exp<0?'#b91c1c':'#64748b'))+'">'+(r.n?pct(r.exp):'—')+'</td>'+
+         '<td>'+badge(r.verdict)+'</td></tr>';
+  });
+  h += '</tbody></table>';
+  h += '<div class="sim-meta" style="margin-top:8px;color:#94a3b8">HOLDING = forward-positive &amp; &gt;50% win past the threshold · ACCRUING = still gathering · FAILING = green in the search, coin-flip live. The search can\'t be trusted on its own; this lets time settle each claim.</div>';
   el.innerHTML = h;
 }
 function renderSentiment(){

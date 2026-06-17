@@ -41,6 +41,11 @@ try:  # optional TA-signals engine; the dashboard must run even if it's absent
 except Exception:  # noqa: BLE001
     _compute_signals = None  # type: ignore[assignment]
 
+try:  # optional auto-forward-test registry; dashboard runs fine without it
+    import forward_rules as _forward_rules_mod
+except Exception:  # noqa: BLE001
+    _forward_rules_mod = None  # type: ignore[assignment]
+
 _LINE = re.compile(r"^([\d-]+ [\d:]+),\d+ (\w+)\s+([\w.]+) — (.*)$")
 _KEEP = re.compile(
     r"bracket live|closed (WIN|LOSS|SCRATCH|UNKNOWN)|journaled|ABORT|BLOCKED"
@@ -195,6 +200,16 @@ def _tsm_forward() -> Dict[str, Any]:
             "n_days": len(days), "n_settled": n, "n_pending": len(pending), "n_flat": len(flat),
             "win": win, "exp": exp, "total": total,
             "by_coin": by_coin, "curve": curve, "pending": pend}
+
+
+def _fwd_rules() -> Dict[str, Any]:
+    """Auto-enrolled green search rules + their live forward results (read-only)."""
+    if _forward_rules_mod is None:
+        return {"present": False, "rules": []}
+    try:
+        return _forward_rules_mod.summary(str(_OBS_DB_PATH), str(BASE_DIR / "forward_rules.db"))
+    except Exception as exc:  # noqa: BLE001
+        return {"present": True, "error": str(exc), "rules": []}
 
 
 _EQUITY = re.compile(
@@ -384,7 +399,19 @@ def _run_search(path: str) -> bytes:
     hist = BASE_DIR / "search_history.jsonl"
     try:
         last = hist.read_text("utf-8").strip().split("\n")[-1]
-        return json.dumps(json.loads(last), default=str).encode("utf-8")
+        record = json.loads(last)
+        # Auto-enroll a green rule into the forward-test registry — so the user
+        # never has to vet a green by hand again; the rule starts accruing
+        # out-of-sample evidence the moment it appears.
+        if _forward_rules_mod is not None:
+            try:
+                enrolled = _forward_rules_mod.auto_from_history(
+                    str(hist), str(BASE_DIR / "forward_rules.db"))
+                if enrolled:
+                    record["auto_enrolled"] = enrolled
+            except Exception:  # noqa: BLE001 — never let enrollment break the search view
+                pass
+        return json.dumps(record, default=str).encode("utf-8")
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"ran, but could not read result: {exc}"}).encode("utf-8")
 
@@ -445,6 +472,7 @@ def _payload() -> bytes:
         "observations": {},
         "ta_signals": {},
         "tsm_forward": {},
+        "forward_rules": {},
         "sentiment": {},
         "sentiment_ok": False,
         "sentiment_ts": "",
@@ -474,6 +502,7 @@ def _payload() -> bytes:
     out["observations"] = _obs_stats()
     out["ta_signals"] = _ta_signals()
     out["tsm_forward"] = _tsm_forward()
+    out["forward_rules"] = _fwd_rules()
     out["sentiment"] = dict(_sentiment_cache)
     out["sentiment_ok"] = _sentiment_state["ok"]
     out["sentiment_ts"] = _sentiment_state["ts"]
