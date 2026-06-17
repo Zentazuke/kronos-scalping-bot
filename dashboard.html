@@ -225,6 +225,13 @@
     <div id="ofiGate"><div class="sim-meta">Inactive. Set <code>OFI_GATE_MIN</code> on the bot to route only strong order-flow setups — every decision still streams here live.</div></div>
   </div>
 
+  <div class="sec">Intraday-TSM — live shadow forward test</div>
+  <div class="panel" style="margin-bottom:14px">
+    <div id="tsmCards" class="cards" style="margin-bottom:10px"></div>
+    <div class="chartbox" style="height:200px"><canvas id="tsmChart"></canvas></div>
+    <div id="tsmForward"></div>
+  </div>
+
   <div class="sec">Run a Simulation</div>
   <div class="panel" style="margin-bottom:14px">
     <div class="sim-bar">
@@ -295,7 +302,7 @@
 <script>
 const POLL_MS = 3000;
 let PAYLOAD = { trades: [], events: [], ts: '' };
-let ALL = [], cumChart = null, barChart = null, grid = null, filterSig = '', lastJson = '';
+let ALL = [], cumChart = null, barChart = null, tsmChart = null, grid = null, filterSig = '', lastJson = '';
 let lwChart = null, lwSeries = null, lwSym = null, lwTip = null, lwTradeMap = {}, priceSym = localStorage.getItem('priceSym') || '';
 let showExits = localStorage.getItem('showExits') !== '0';
 let pollCount = 0;
@@ -318,7 +325,7 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.tsm_forward, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
@@ -531,6 +538,7 @@ function render() {
   renderTASignals();
   renderSentiment();
   renderOfiGate();
+  renderTsmForward();
   buildSymBtns();
   renderPriceChart();
 
@@ -801,6 +809,67 @@ function renderOfiGate(){
        + (r.routed?'ROUTED':'gated')+'</td></tr>';
   });
   h += '</tbody></table>';
+  el.innerHTML = h;
+}
+function renderTsmForward(){
+  const el = document.getElementById('tsmForward'); if(!el) return;
+  const cardsEl = document.getElementById('tsmCards');
+  const d = PAYLOAD.tsm_forward || {};
+  if(!d.present){
+    if(cardsEl) cardsEl.innerHTML = '';
+    if(tsmChart){ tsmChart.destroy(); tsmChart = null; }
+    el.innerHTML = '<div class="sim-meta">No forward-test data yet. Once <code>intraday_tsm_forward.py</code> runs daily on the server (08:05 UTC), committed trades + outcomes appear here.</div>';
+    return;
+  }
+  if(d.error){ el.innerHTML = '<div class="sim-meta">Forward-test DB read error: '+d.error+'</div>'; return; }
+  const pct = v => (v>=0?'+':'')+(v*100).toFixed(3)+'%';
+  const cls = v => v>0?'pos':(v<0?'neg':'neutral');
+  const span = (d.span&&d.span.length)? (d.span[0]+' → '+d.span[1]) : '—';
+  // KPI cards
+  const cards = [
+    ['Net / trade', d.n_settled? pct(d.exp):'—', d.n_settled?cls(d.exp):'neutral', 'after '+ (10) +'bps, settled only'],
+    ['Win rate', d.n_settled? Math.round(d.win*100)+'%':'—', 'neutral', d.n_settled+' settled trade'+(d.n_settled===1?'':'s')],
+    ['Cumulative net', d.n_settled? pct(d.total):'—', d.n_settled?cls(d.total):'neutral', 'sum of net returns'],
+    ['Committed', String(d.n_pending), 'neutral', 'awaiting day-close'],
+    ['Gated out', String(d.n_flat), 'neutral', 'low-vol days, no trade'],
+    ['Span', String(d.n_days)+'d', 'neutral', span],
+  ];
+  if(cardsEl) cardsEl.innerHTML = cards.map(c =>
+    '<div class="card"><div class="k">'+c[0]+'</div><div class="v '+c[2]+'">'+c[1]+'</div>'+
+    '<div class="k" style="text-transform:none;margin-top:2px">'+c[3]+'</div></div>').join('');
+  // cumulative-net curve
+  const curve = d.curve || [];
+  if(tsmChart){ tsmChart.destroy(); tsmChart = null; }
+  if(curve.length){
+    tsmChart = new Chart(document.getElementById('tsmChart'), {
+      type:'line',
+      data:{ labels: curve.map((p,i)=> p.day+(p.coin?(' '+p.coin):'')),
+        datasets:[{ data: curve.map(p=>+(p.cum*100).toFixed(3)),
+          borderColor:'#7c3aed', backgroundColor:'rgba(124,58,237,.08)', fill:true, tension:.25, pointRadius:2 }] },
+      options:{ responsive:true, maintainAspectRatio:false, animation:false,
+        plugins:{ legend:{display:false}, tooltip:{callbacks:{ label:c=>'cum '+c.parsed.y+'%' }} },
+        scales:{ y:{ grid:{color:'#eef2f7'}, title:{display:true,text:'cumulative net %'} },
+          x:{ grid:{display:false}, ticks:{maxTicksLimit:8} } } }
+    });
+  }
+  // by-coin + pending
+  let h = '';
+  if((d.by_coin||[]).length){
+    h += '<table class="sim-tbl"><thead><tr><th class="sim-rule">coin</th><th>trades</th><th>win%</th><th>net/trade</th><th>total</th></tr></thead><tbody>';
+    d.by_coin.forEach(c => {
+      h += '<tr><td class="sim-rule">'+c.coin+'</td><td>'+c.n+'</td><td>'+Math.round(c.win*100)+'%</td>'+
+           '<td style="color:'+(c.exp>0?'#166534':'#b91c1c')+'">'+pct(c.exp)+'</td>'+
+           '<td style="color:'+(c.total>0?'#166534':'#b91c1c')+'">'+pct(c.total)+'</td></tr>';
+    });
+    h += '</tbody></table>';
+  } else {
+    h += '<div class="sim-meta">No settled trades yet — decisions are committed and waiting to mature at day-close (00:00 UTC).</div>';
+  }
+  if((d.pending||[]).length){
+    h += '<div class="sim-meta" style="margin-top:8px"><b>Committed, awaiting close:</b> '+
+      d.pending.map(p=> p.coin+' <b style="color:'+(p.dir==='LONG'?'#166534':'#b91c1c')+'">'+p.dir+'</b>').join(' · ')+'</div>';
+  }
+  h += '<div class="sim-meta" style="margin-top:8px;color:#94a3b8">Shadow test — no live orders. Pre-committed at 08:00 UTC, settled at day-close. Expect ugly stretches; what matters is staying net-positive and broad across coins over weeks.</div>';
   el.innerHTML = h;
 }
 function renderSentiment(){

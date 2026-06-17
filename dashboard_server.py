@@ -33,6 +33,7 @@ BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 DB_PATH: Final[Path] = BASE_DIR / "journal.db"
 LOG_PATH: Final[Path] = BASE_DIR / "bot.log"
 HTML_PATH: Final[Path] = BASE_DIR / "dashboard.html"
+TSM_DB_PATH: Final[Path] = BASE_DIR / "tsm_forward.db"
 LOG_TAIL_BYTES: Final[int] = 600_000
 
 try:  # optional TA-signals engine; the dashboard must run even if it's absent
@@ -140,6 +141,60 @@ def _ofi_gate(text: str) -> Dict[str, object]:
     if not recent:
         return {}
     return {"active": True, "routed": routed, "gated": gated, "recent": recent[-15:][::-1]}
+
+
+def _tsm_forward() -> Dict[str, Any]:
+    """Read-only summary of the intraday-TSM shadow forward test (tsm_forward.db):
+    headline net/trade + win%, per-coin breakdown, a cumulative-net curve, and the
+    pending (committed, not-yet-matured) trades. Empty when the DB isn't there yet."""
+    if not TSM_DB_PATH.exists():
+        return {"present": False}
+    try:
+        conn = sqlite3.connect(f"file:{TSM_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT decision_day, symbol, direction, status, morning_ret, net_ret "
+            "FROM forward_trades ORDER BY decision_day, symbol")]
+        conn.close()
+    except sqlite3.Error as exc:
+        return {"present": True, "error": str(exc)}
+
+    settled = [r for r in rows if r["status"] == "SETTLED"
+               and r["direction"] != "FLAT" and r["net_ret"] is not None]
+    pending = [r for r in rows if r["status"] == "PENDING"]
+    flat = [r for r in rows if r["direction"] == "FLAT"]
+    days = sorted({r["decision_day"] for r in rows})
+
+    nets = [float(r["net_ret"]) for r in settled]
+    n = len(nets)
+    total = sum(nets)
+    win = (sum(1 for x in nets if x > 0) / n) if n else 0.0
+    exp = (total / n) if n else 0.0
+
+    by_coin_map: Dict[str, List[float]] = {}
+    for r in settled:
+        by_coin_map.setdefault(r["symbol"].split("/")[0], []).append(float(r["net_ret"]))
+    by_coin = sorted(
+        ({"coin": c, "n": len(a), "win": sum(1 for x in a if x > 0) / len(a),
+          "exp": sum(a) / len(a), "total": sum(a)} for c, a in by_coin_map.items()),
+        key=lambda d: -d["total"])
+
+    cum = 0.0
+    curve: List[Dict[str, Any]] = []
+    for r in sorted(settled, key=lambda r: (r["decision_day"], r["symbol"])):
+        cum += float(r["net_ret"])
+        curve.append({"day": r["decision_day"], "coin": r["symbol"].split("/")[0],
+                      "dir": r["direction"], "net": float(r["net_ret"]), "cum": cum})
+
+    pend = [{"day": r["decision_day"], "coin": r["symbol"].split("/")[0],
+             "dir": r["direction"], "morning": r["morning_ret"]} for r in pending]
+    pend.sort(key=lambda d: (d["day"], d["coin"]))
+
+    return {"present": True, "error": "",
+            "span": [days[0], days[-1]] if days else [],
+            "n_days": len(days), "n_settled": n, "n_pending": len(pending), "n_flat": len(flat),
+            "win": win, "exp": exp, "total": total,
+            "by_coin": by_coin, "curve": curve, "pending": pend}
 
 
 _EQUITY = re.compile(
@@ -389,6 +444,7 @@ def _payload() -> bytes:
         "walkforward": {},
         "observations": {},
         "ta_signals": {},
+        "tsm_forward": {},
         "sentiment": {},
         "sentiment_ok": False,
         "sentiment_ts": "",
@@ -417,6 +473,7 @@ def _payload() -> bytes:
     out["walkforward"] = _walkforward()
     out["observations"] = _obs_stats()
     out["ta_signals"] = _ta_signals()
+    out["tsm_forward"] = _tsm_forward()
     out["sentiment"] = dict(_sentiment_cache)
     out["sentiment_ok"] = _sentiment_state["ok"]
     out["sentiment_ts"] = _sentiment_state["ts"]
