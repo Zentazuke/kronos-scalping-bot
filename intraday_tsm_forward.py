@@ -45,6 +45,7 @@ SPLIT = 8           # UTC hour: morning = 00:00->08:00, afternoon = 08:00->day c
 VOL_WINDOW = 60     # trailing days for the vol-gate threshold (no lookahead)
 VOL_Q = 0.667       # top-tertile |morning move|
 REGIME_WINDOW = 30  # trailing days for the autocorr regime gate (hardened config)
+ONCHAIN_WINDOW = 7  # trailing days for the stablecoin supply-growth sign (risk-off gate)
 FEE_BPS = 10.0
 FETCH_DAYS = 80     # enough for the 60d trailing window + settle backlog
 
@@ -108,8 +109,24 @@ def regime_on(candles: List[List[float]], today: str) -> Optional[bool]:
     return float(np.corrcoef(mo, af)[0, 1]) > 0
 
 
+def onchain_risk_off(today: str) -> bool:
+    """Second leg: True if aggregate stablecoin (USDT+USDC) supply is CONTRACTING over
+    the trailing window -> capital leaving -> suppress longs. Sign-only (no lookahead).
+    Fail-open: returns False if the data is unavailable, so an outage never blocks trades."""
+    try:
+        from onchain_flow_scanner import aggregate_supply
+        supply = aggregate_supply(FETCH_DAYS)
+        days = sorted(d for d in supply if d <= today)
+        if len(days) <= ONCHAIN_WINDOW:
+            return False
+        d_now, d_prev = days[-1], days[-1 - ONCHAIN_WINDOW]
+        return supply[d_prev] > 0 and (supply[d_now] / supply[d_prev] - 1.0) < 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def decide(conn: sqlite3.Connection, symbol: str, candles: List[List[float]],
-           today: str, now_iso: str) -> Optional[str]:
+           today: str, now_iso: str, risk_off_today: bool = False) -> Optional[str]:
     """Log today's pre-committed decision for one symbol (idempotent)."""
     row = conn.execute("SELECT 1 FROM forward_trades WHERE decision_day=? AND symbol=?",
                        (today, symbol)).fetchone()
@@ -129,12 +146,14 @@ def decide(conn: sqlite3.Connection, symbol: str, candles: List[List[float]],
     if thr is None or regime is None:
         return None  # not enough history to set the gates honestly
     morning = split_px / open_px - 1.0
-    # Hardened config: trade only on a high-vol day AND in a momentum regime.
-    if abs(morning) >= thr and regime:
+    # Hardened + two-leg config: trade only on a high-vol day, in a momentum regime,
+    # AND not a LONG when stablecoin supply is contracting (on-chain risk-off gate).
+    long_blocked = morning > 0 and risk_off_today
+    if abs(morning) >= thr and regime and not long_blocked:
         direction = "LONG" if morning > 0 else "SHORT"
         status, entry = "PENDING", split_px
     else:
-        direction, status, entry = "FLAT", "SETTLED", split_px  # gated out (vol or regime)
+        direction, status, entry = "FLAT", "SETTLED", split_px  # gated (vol / regime / on-chain)
     conn.execute(
         "INSERT INTO forward_trades (decision_day,symbol,direction,morning_ret,vol_thr,"
         "entry_price,entry_ts,status,exit_price,exit_ts,gross_ret,net_ret,created_at,settled_at)"
@@ -178,6 +197,9 @@ def run_daily(db_path: str = DB_PATH) -> int:
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     conn = sqlite3.connect(db_path)
     ensure_db(conn)
+    risk_off_today = onchain_risk_off(today)   # second leg, fetched once per run (fail-open)
+    if risk_off_today:
+        print("  on-chain: stablecoin supply CONTRACTING — longs suppressed today (risk-off).")
     settled = decided = 0
     decisions: List[str] = []
     for sym in SYMBOLS:
@@ -187,7 +209,7 @@ def run_daily(db_path: str = DB_PATH) -> int:
             print(f"  {sym:<10} fetch failed ({str(exc)[:40]})")
             continue
         settled += settle(conn, sym, candles, today, now_iso, fee)
-        d = decide(conn, sym, candles, today, now_iso)
+        d = decide(conn, sym, candles, today, now_iso, risk_off_today)
         if d:
             decided += 1
             if d != "FLAT":
