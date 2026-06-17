@@ -100,6 +100,12 @@ def decide(conn: sqlite3.Connection, symbol: str, candles: List[List[float]],
                        (today, symbol)).fetchone()
     if row:
         return None  # already logged today
+    # Only commit once the morning window is COMPLETE: the bar at hour (SPLIT-1) must
+    # have closed, so morning return + entry price match the backtest exactly. Running
+    # before ~08:00 UTC would commit on a partial morning — refuse and wait.
+    today_bars = [b for b in candles if _day(int(b[0])) == today]
+    if not any(_hour(int(b[0])) == SPLIT - 1 for b in today_bars):
+        return None  # too early: the 07:00 UTC bar hasn't closed yet
     open_px, split_px, _close = day_prices(candles, today, SPLIT)
     if not open_px or not split_px:
         return None  # not enough of today's session yet
