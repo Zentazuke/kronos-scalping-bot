@@ -30,6 +30,15 @@ from typing import Any, Dict, Final, List
 from urllib.parse import parse_qs, urlparse
 
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
+
+# Load .env (USE_SANDBOX, EXCHANGE_API_KEY/SECRET, ...) so the manual-close feature
+# works no matter how the dashboard is launched — not just when the shell sourced it.
+try:  # optional; the read-only dashboard runs fine without it
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except Exception:  # noqa: BLE001
+    pass
+
 DB_PATH: Final[Path] = BASE_DIR / "journal.db"
 LOG_PATH: Final[Path] = BASE_DIR / "bot.log"
 HTML_PATH: Final[Path] = BASE_DIR / "dashboard.html"
