@@ -212,6 +212,119 @@ def _fwd_rules() -> Dict[str, Any]:
         return {"present": True, "error": str(exc), "rules": []}
 
 
+# --------------------------------------------------------------------------- #
+# Manual position control (testnet ONLY) — live P&L + close-only flatten.
+# This is the one place the dashboard is allowed to act on the exchange. It is
+# hard-guarded to sandbox mode and can only REDUCE/close, never open.
+# --------------------------------------------------------------------------- #
+_TRADE_EX: Dict[str, Any] = {"ex": None, "tried": False, "err": ""}
+_POS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _trade_exchange():
+    """Lazily build a sandbox ccxt client for reading positions + closing. Returns
+    None (with a reason) unless USE_SANDBOX=true and API keys are present."""
+    if _TRADE_EX["tried"]:
+        return _TRADE_EX["ex"]
+    _TRADE_EX["tried"] = True
+    if os.getenv("USE_SANDBOX", "").strip().lower() != "true":
+        _TRADE_EX["err"] = "USE_SANDBOX is not 'true' — manual close disabled"; return None
+    key, sec = os.getenv("EXCHANGE_API_KEY"), os.getenv("EXCHANGE_API_SECRET")
+    if not (key and sec):
+        _TRADE_EX["err"] = "no API keys in env — manual close disabled"; return None
+    try:
+        import ccxt  # type: ignore[import-untyped]
+        klass = getattr(ccxt, os.getenv("EXCHANGE_ID", "binance"))
+        ex = klass({"enableRateLimit": True, "apiKey": key, "secret": sec,
+                    "options": {"defaultType": "future", "adjustForTimeDifference": True}})
+        sm = getattr(ex, "set_sandbox_mode", None)
+        if callable(sm):
+            sm(True)
+        if not (getattr(ex, "isSandboxModeEnabled", False) or getattr(ex, "sandboxMode", False)):
+            _TRADE_EX["err"] = "sandbox mode could not be verified — refusing"; return None
+        _TRADE_EX["ex"] = ex
+        return ex
+    except Exception as exc:  # noqa: BLE001
+        _TRADE_EX["err"] = f"client init failed: {str(exc)[:80]}"; return None
+
+
+def _positions(ttl: float = 5.0) -> Dict[str, Any]:
+    """Open positions with live unrealized P&L. Cached ttl seconds (the dashboard
+    polls often; fetch_positions is rate-limited)."""
+    now = time.time()
+    if _POS_CACHE["data"] is not None and now - _POS_CACHE["ts"] < ttl:
+        return _POS_CACHE["data"]
+    ex = _trade_exchange()
+    if ex is None:
+        out = {"ok": False, "err": _TRADE_EX["err"], "list": []}
+        _POS_CACHE.update(ts=now, data=out); return out
+    try:
+        poss = ex.fetch_positions()
+    except Exception as exc:  # noqa: BLE001
+        out = {"ok": False, "err": str(exc)[:100], "list": []}
+        _POS_CACHE.update(ts=now, data=out); return out
+    rows: List[Dict[str, Any]] = []
+    for p in poss:
+        try:
+            size = abs(float(p.get("contracts") or 0))
+        except (TypeError, ValueError):
+            size = 0.0
+        if not size:
+            continue
+        entry = float(p.get("entryPrice") or 0) or 0.0
+        mark = float(p.get("markPrice") or 0) or 0.0
+        side = str(p.get("side") or "").lower()
+        try:
+            upnl = float(p.get("unrealizedPnl"))
+        except (TypeError, ValueError):
+            upnl = None
+        pct = ((mark / entry - 1) * 100 * (1 if side == "long" else -1)) if entry and mark else None
+        rows.append({"symbol": p.get("symbol"), "side": side, "size": size,
+                     "entry": entry, "mark": mark, "upnl": upnl, "pct": pct,
+                     "notional": (mark * size) if mark else None})
+    out = {"ok": True, "err": "", "list": rows}
+    _POS_CACHE.update(ts=now, data=out)
+    return out
+
+
+def _close_position(symbol: str) -> Dict[str, Any]:
+    """Cancel a symbol's resting orders, then market-close its position (reduceOnly).
+    Mirrors the bot's emergency_flatten. Sandbox-only, close-only."""
+    ex = _trade_exchange()
+    if ex is None:
+        return {"ok": False, "err": _TRADE_EX["err"] or "trading not configured"}
+    try:
+        try:
+            ca = getattr(ex, "cancel_all_orders", None)
+            if callable(ca):
+                ca(symbol)
+        except Exception:  # noqa: BLE001 — nothing to cancel is fine
+            pass
+        closed = []
+        for p in ex.fetch_positions([symbol]):
+            try:
+                size = abs(float(p.get("contracts") or 0))
+            except (TypeError, ValueError):
+                size = 0.0
+            if not size:
+                continue
+            side = str(p.get("side") or "long").lower()
+            exit_side = "sell" if side == "long" else "buy"
+            try:
+                spot = bool((ex.market(symbol) or {}).get("spot"))
+            except Exception:  # noqa: BLE001
+                spot = False
+            params = {} if spot else {"reduceOnly": True}
+            ex.create_order(symbol, "market", exit_side, size, None, params)
+            closed.append({"side": exit_side, "size": size})
+        _POS_CACHE["ts"] = 0.0  # force refresh next poll
+        if not closed:
+            return {"ok": True, "msg": f"no open position on {symbol}"}
+        return {"ok": True, "msg": f"closed {symbol}", "closed": closed}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "err": str(exc)[:140]}
+
+
 _EQUITY = re.compile(
     r"^([\d-]+ [\d:]+),\d+ .*EQUITY ([\d.]+) baseline ([\d.]+)", re.M
 )
@@ -473,6 +586,7 @@ def _payload() -> bytes:
         "ta_signals": {},
         "tsm_forward": {},
         "forward_rules": {},
+        "positions": {},
         "sentiment": {},
         "sentiment_ok": False,
         "sentiment_ts": "",
@@ -503,6 +617,7 @@ def _payload() -> bytes:
     out["ta_signals"] = _ta_signals()
     out["tsm_forward"] = _tsm_forward()
     out["forward_rules"] = _fwd_rules()
+    out["positions"] = _positions()
     out["sentiment"] = dict(_sentiment_cache)
     out["sentiment_ok"] = _sentiment_state["ok"]
     out["sentiment_ts"] = _sentiment_state["ts"]
@@ -528,6 +643,31 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802 — http.server API
+        if self.path.split("?")[0] != "/close":
+            self.send_error(404); return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else ""
+            q = parse_qs(raw) or parse_qs(urlparse(self.path).query)
+            symbol = (q.get("symbol", [""])[0]).strip()
+            if symbol == "__ALL__":
+                res = {"ok": True, "results": [_close_position(p["symbol"])
+                                               for p in _positions().get("list", [])]}
+            elif symbol:
+                res = _close_position(symbol)
+            else:
+                res = {"ok": False, "err": "no symbol given"}
+        except Exception as exc:  # noqa: BLE001
+            res = {"ok": False, "err": str(exc)[:120]}
+        body = json.dumps(res).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()

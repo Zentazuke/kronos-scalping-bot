@@ -196,6 +196,11 @@
     </label>
   </div>
 
+  <div class="sec">Open positions — live P&amp;L &amp; manual close (testnet)</div>
+  <div class="panel" style="margin-bottom:14px">
+    <div id="positionsBox"></div>
+  </div>
+
   <div class="sec">Account</div>
   <div class="cards" id="cards"></div>
 
@@ -330,6 +335,7 @@ async function poll() {
       `<span class="dot ok"></span>LIVE · ${ALL.length} trades · journal read ${PAYLOAD.ts} · poll #${pollCount} (every ${POLL_MS/1000}s)`;
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
+    try { renderPositions(); } catch(e) {}   // live P&L: update every poll, no full re-render
     const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.tsm_forward, PAYLOAD.forward_rules, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
     if (sig === lastJson) return;
     lastJson = sig;
@@ -906,6 +912,41 @@ function renderFwdRules(){
   h += '</tbody></table>';
   h += '<div class="sim-meta" style="margin-top:8px;color:#94a3b8">HOLDING = forward-positive &amp; &gt;50% win past the threshold · ACCRUING = still gathering · FAILING = green in the search, coin-flip live. The search can\'t be trusted on its own; this lets time settle each claim.</div>';
   el.innerHTML = h;
+}
+function _pf(v,d){ return (v===null||v===undefined||isNaN(v))?'—':(+v).toLocaleString(undefined,{maximumFractionDigits:d}); }
+function renderPositions(){
+  const el=document.getElementById('positionsBox'); if(!el) return;
+  const p=(typeof PAYLOAD!=='undefined' && PAYLOAD && PAYLOAD.positions) || {};
+  if(p.ok===false || (!p.ok && !p.list)){
+    el.innerHTML='<div class="sim-meta">Live close unavailable: '+(p.err||'not configured')+
+      '. It needs the dashboard running on the server (same box as the bot) with <code>USE_SANDBOX=true</code> and the API keys in the environment.</div>';
+    return;
+  }
+  const list=p.list||[];
+  if(!list.length){ el.innerHTML='<div class="sim-meta">No open positions right now. When the bot opens one it appears here with live P&amp;L and a Close button.</div>'; return; }
+  let h='<table class="sim-tbl"><thead><tr><th class="sim-rule">symbol</th><th>side</th><th>size</th><th>entry</th><th>mark</th><th>P&amp;L %</th><th>P&amp;L $</th><th></th></tr></thead><tbody>';
+  list.forEach(r=>{
+    const win=(r.upnl!=null? r.upnl>=0 : (r.pct||0)>=0); const col=win?'#166534':'#b91c1c';
+    h+='<tr><td class="sim-rule">'+r.symbol+'</td>'+
+      '<td style="font-weight:700;color:'+(r.side==='long'?'#166534':'#b91c1c')+'">'+(r.side||'').toUpperCase()+'</td>'+
+      '<td>'+_pf(r.size,6)+'</td><td>'+_pf(r.entry,4)+'</td><td>'+_pf(r.mark,4)+'</td>'+
+      '<td style="color:'+col+';font-weight:700">'+(r.pct!=null?(r.pct>=0?'+':'')+r.pct.toFixed(2)+'%':'—')+'</td>'+
+      '<td style="color:'+col+'">'+(r.upnl!=null?(r.upnl>=0?'+':'')+_pf(r.upnl,2)+' $':'—')+'</td>'+
+      '<td><button class="symbtn" style="background:#dc2626;color:#fff;border-color:#dc2626" onclick="closePosition(\''+r.symbol+'\')">Close</button></td></tr>';
+  });
+  h+='</tbody></table><div style="margin-top:8px">'+
+     '<button class="symbtn" style="background:#b91c1c;color:#fff;border-color:#b91c1c" onclick="closePosition(\'__ALL__\')">Close ALL</button>'+
+     '<span class="sim-meta" id="closeMsg" style="margin-left:10px"></span></div>';
+  el.innerHTML=h;
+}
+function closePosition(sym){
+  const label=sym==='__ALL__'?'ALL open positions':sym;
+  if(!confirm('Close '+label+' now at market?\nThis sends a real (testnet) close order.')) return;
+  const msg=document.getElementById('closeMsg'); if(msg){ msg.textContent='closing '+label+'…'; msg.style.color='#475569'; }
+  fetch('/close',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'symbol='+encodeURIComponent(sym)})
+    .then(r=>r.json()).then(d=>{ if(msg){ const ok=d.ok&&!(d.results&&d.results.some(x=>!x.ok));
+        msg.style.color=ok?'#166534':'#b91c1c'; msg.textContent=ok?('done — '+(d.msg||'closed')):('error: '+(d.err||(d.results?JSON.stringify(d.results):'failed'))); } })
+    .catch(e=>{ if(msg){ msg.style.color='#b91c1c'; msg.textContent='error: '+e; } });
 }
 function renderSentiment(){
   const badge = document.getElementById('seStatus'); if (!badge) return;
