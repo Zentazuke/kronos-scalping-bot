@@ -43,6 +43,7 @@ DB_PATH: Final[Path] = BASE_DIR / "journal.db"
 LOG_PATH: Final[Path] = BASE_DIR / "bot.log"
 HTML_PATH: Final[Path] = BASE_DIR / "dashboard.html"
 TSM_DB_PATH: Final[Path] = BASE_DIR / "tsm_forward.db"
+TSM_LIVE_DB: Final[Path] = BASE_DIR / "tsm_live.db"
 LOG_TAIL_BYTES: Final[int] = 600_000
 
 try:  # optional TA-signals engine; the dashboard must run even if it's absent
@@ -227,12 +228,13 @@ def _fwd_rules() -> Dict[str, Any]:
 # hard-guarded to sandbox mode and can only REDUCE/close, never open.
 # --------------------------------------------------------------------------- #
 _TRADE_EX: Dict[str, Any] = {"ex": None, "tried": False, "err": ""}
-_POS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
 
 
 def _trade_exchange():
-    """Lazily build a sandbox ccxt client for reading positions + closing. Returns
-    None (with a reason) unless USE_SANDBOX=true and API keys are present."""
+    """Lazily build a sandbox ccxt client for CLOSING orders. Mirrors the bot's own
+    config — plain `binance` + set_sandbox_mode, NO defaultType (the futures testnet
+    is deprecated in ccxt; the bot runs on the spot/margin testnet). None unless
+    USE_SANDBOX=true and API keys are present."""
     if _TRADE_EX["tried"]:
         return _TRADE_EX["ex"]
     _TRADE_EX["tried"] = True
@@ -245,63 +247,131 @@ def _trade_exchange():
         import ccxt  # type: ignore[import-untyped]
         klass = getattr(ccxt, os.getenv("EXCHANGE_ID", "binance"))
         ex = klass({"enableRateLimit": True, "apiKey": key, "secret": sec,
-                    "options": {"defaultType": "future", "adjustForTimeDifference": True}})
+                    "options": {"adjustForTimeDifference": True}})  # no defaultType — match the bot
         sm = getattr(ex, "set_sandbox_mode", None)
         if callable(sm):
             sm(True)
-        if not (getattr(ex, "isSandboxModeEnabled", False) or getattr(ex, "sandboxMode", False)):
-            _TRADE_EX["err"] = "sandbox mode could not be verified — refusing"; return None
         _TRADE_EX["ex"] = ex
         return ex
     except Exception as exc:  # noqa: BLE001
-        _TRADE_EX["err"] = f"client init failed: {str(exc)[:80]}"; return None
+        _TRADE_EX["err"] = f"client init failed: {str(exc)[:90]}"; return None
 
 
-def _positions(ttl: float = 5.0) -> Dict[str, Any]:
-    """Open positions with live unrealized P&L. Cached ttl seconds (the dashboard
-    polls often; fetch_positions is rate-limited)."""
-    now = time.time()
-    if _POS_CACHE["data"] is not None and now - _POS_CACHE["ts"] < ttl:
-        return _POS_CACHE["data"]
-    ex = _trade_exchange()
-    if ex is None:
-        out = {"ok": False, "err": _TRADE_EX["err"], "list": []}
-        _POS_CACHE.update(ts=now, data=out); return out
+def _fnum(v):
     try:
-        poss = ex.fetch_positions()
-    except Exception as exc:  # noqa: BLE001
-        out = {"ok": False, "err": str(exc)[:100], "list": []}
-        _POS_CACHE.update(ts=now, data=out); return out
-    rows: List[Dict[str, Any]] = []
-    for p in poss:
-        try:
-            size = abs(float(p.get("contracts") or 0))
-        except (TypeError, ValueError):
-            size = 0.0
-        if not size:
-            continue
-        entry = float(p.get("entryPrice") or 0) or 0.0
-        mark = float(p.get("markPrice") or 0) or 0.0
-        side = str(p.get("side") or "").lower()
-        try:
-            upnl = float(p.get("unrealizedPnl"))
-        except (TypeError, ValueError):
-            upnl = None
-        pct = ((mark / entry - 1) * 100 * (1 if side == "long" else -1)) if entry and mark else None
-        rows.append({"symbol": p.get("symbol"), "side": side, "size": size,
-                     "entry": entry, "mark": mark, "upnl": upnl, "pct": pct,
-                     "notional": (mark * size) if mark else None})
-    out = {"ok": True, "err": "", "list": rows}
-    _POS_CACHE.update(ts=now, data=out)
-    return out
+        return float(v) if v is not None and v != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_price(symbol: str):
+    c = _candle_cache.get(symbol)
+    try:
+        return float(c[-1][4]) if c else None
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _positions() -> Dict[str, Any]:
+    """Open positions from the JOURNAL (status=OPEN), priced live against the 5m
+    candle feed. No fragile futures API — works on the bot's spot/margin testnet."""
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM trades WHERE status='OPEN' ORDER BY id")]
+        conn.close()
+    except sqlite3.Error as exc:
+        return {"ok": False, "err": str(exc)[:90], "list": [], "can_close": False}
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = r.get("symbol"); entry = _fnum(r.get("entry_price")); amt = _fnum(r.get("amount"))
+        is_long = str(r.get("direction", "")).endswith("LONG")
+        mark = _last_price(sym)
+        pct = upnl = None
+        if entry and mark:
+            pct = (mark / entry - 1) * 100 * (1 if is_long else -1)
+            if amt:
+                upnl = (mark - entry) * amt * (1 if is_long else -1)
+        out.append({"symbol": sym, "side": "long" if is_long else "short", "size": amt,
+                    "entry": entry, "mark": mark, "upnl": upnl, "pct": pct,
+                    "tp": _fnum(r.get("tp_price")), "sl": _fnum(r.get("sl_price"))})
+    # merge the intraday-TSM live trader's open positions (tsm_live.db)
+    try:
+        if TSM_LIVE_DB.exists():
+            lc = sqlite3.connect(f"file:{TSM_LIVE_DB}?mode=ro", uri=True, timeout=2.0)
+            lc.row_factory = sqlite3.Row
+            for r in lc.execute("SELECT * FROM positions WHERE status='OPEN'"):
+                sym = r["symbol"]; entry = _fnum(r["entry_price"]); amt = _fnum(r["amount"])
+                is_long = str(r["side"]).upper() == "LONG"
+                mark = _last_price(sym); pct = upnl = None
+                if entry and mark:
+                    pct = (mark / entry - 1) * 100 * (1 if is_long else -1)
+                    if amt:
+                        upnl = (mark - entry) * amt * (1 if is_long else -1)
+                out.append({"symbol": sym, "side": "long" if is_long else "short", "size": amt,
+                            "entry": entry, "mark": mark, "upnl": upnl, "pct": pct,
+                            "tp": None, "sl": None, "src": "TSM"})
+            lc.close()
+    except sqlite3.Error:
+        pass
+    can = _trade_exchange() is not None
+    return {"ok": True, "err": "", "list": out, "can_close": can,
+            "close_err": _TRADE_EX["err"]}
 
 
 def _close_position(symbol: str) -> Dict[str, Any]:
-    """Cancel a symbol's resting orders, then market-close its position (reduceOnly).
-    Mirrors the bot's emergency_flatten. Sandbox-only, close-only."""
+    """Cancel the symbol's resting orders, then market-close its open position using
+    the JOURNAL's recorded size + side. Sandbox-only, close-only. Spot-aware params."""
     ex = _trade_exchange()
     if ex is None:
         return {"ok": False, "err": _TRADE_EX["err"] or "trading not configured"}
+    # First: is this an intraday-TSM live position? Close it from tsm_live.db.
+    try:
+        if TSM_LIVE_DB.exists():
+            lc = sqlite3.connect(str(TSM_LIVE_DB), timeout=2.0)
+            lc.row_factory = sqlite3.Row
+            trow = lc.execute("SELECT * FROM positions WHERE status='OPEN' AND symbol=? "
+                              "ORDER BY day DESC LIMIT 1", (symbol,)).fetchone()
+            if trow:
+                td = dict(trow); amt = _fnum(td.get("amount"))
+                is_long = str(td.get("side", "")).upper() == "LONG"
+                if amt and amt > 0:
+                    try:
+                        ca = getattr(ex, "cancel_all_orders", None)
+                        if callable(ca):
+                            ca(symbol)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    exit_side = "sell" if is_long else "buy"
+                    order = ex.create_order(symbol, "market", exit_side, float(amt))
+                    fill = None
+                    if isinstance(order, dict):
+                        fill = order.get("average") or order.get("price")
+                    now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+                    lc.execute("UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=? "
+                               "WHERE day=? AND symbol=?", (fill, now, td.get("day"), symbol))
+                    lc.commit(); lc.close()
+                    return {"ok": True, "msg": f"closed TSM {symbol} — market {exit_side} {amt}"}
+            lc.close()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "err": f"tsm close failed: {str(exc)[:120]}"}
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM trades WHERE status='OPEN' AND symbol=? ORDER BY id DESC LIMIT 1",
+            (symbol,)).fetchone()
+        conn.close()
+    except sqlite3.Error as exc:
+        return {"ok": False, "err": f"journal read failed: {str(exc)[:60]}"}
+    if not row:
+        return {"ok": True, "msg": f"no open journal position on {symbol}"}
+    d = dict(row)
+    amt = _fnum(d.get("amount"))
+    is_long = str(d.get("direction", "")).endswith("LONG")
+    if not amt or amt <= 0:
+        return {"ok": False, "err": "open trade has no usable size in the journal"}
     try:
         try:
             ca = getattr(ex, "cancel_all_orders", None)
@@ -309,29 +379,17 @@ def _close_position(symbol: str) -> Dict[str, Any]:
                 ca(symbol)
         except Exception:  # noqa: BLE001 — nothing to cancel is fine
             pass
-        closed = []
-        for p in ex.fetch_positions([symbol]):
-            try:
-                size = abs(float(p.get("contracts") or 0))
-            except (TypeError, ValueError):
-                size = 0.0
-            if not size:
-                continue
-            side = str(p.get("side") or "long").lower()
-            exit_side = "sell" if side == "long" else "buy"
-            try:
-                spot = bool((ex.market(symbol) or {}).get("spot"))
-            except Exception:  # noqa: BLE001
-                spot = False
-            params = {} if spot else {"reduceOnly": True}
-            ex.create_order(symbol, "market", exit_side, size, None, params)
-            closed.append({"side": exit_side, "size": size})
-        _POS_CACHE["ts"] = 0.0  # force refresh next poll
-        if not closed:
-            return {"ok": True, "msg": f"no open position on {symbol}"}
-        return {"ok": True, "msg": f"closed {symbol}", "closed": closed}
+        exit_side = "sell" if is_long else "buy"
+        try:
+            spot = bool((ex.market(symbol) or {}).get("spot"))
+        except Exception:  # noqa: BLE001
+            spot = True
+        params = {} if spot else {"reduceOnly": True}
+        order = ex.create_order(symbol, "market", exit_side, float(amt), None, params)
+        oid = (order or {}).get("id") if isinstance(order, dict) else None
+        return {"ok": True, "msg": f"closed {symbol} — market {exit_side} {amt}", "order_id": oid}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "err": str(exc)[:140]}
+        return {"ok": False, "err": str(exc)[:160]}
 
 
 _EQUITY = re.compile(
