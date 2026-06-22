@@ -212,6 +212,38 @@ def _tsm_forward() -> Dict[str, Any]:
             "by_coin": by_coin, "curve": curve, "pending": pend}
 
 
+def _tsm_live() -> Dict[str, Any]:
+    """The live intraday-TSM trader's realized track record from tsm_live.db:
+    closed-trade P&L curve, total, win%, by-coin, and open count."""
+    if not TSM_LIVE_DB.exists():
+        return {"present": False}
+    try:
+        conn = sqlite3.connect(f"file:{TSM_LIVE_DB}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute("SELECT * FROM positions ORDER BY entry_ts")]
+        conn.close()
+    except sqlite3.Error as exc:
+        return {"present": True, "error": str(exc)[:80]}
+    closed = [r for r in rows if r.get("status") == "CLOSED" and r.get("pnl") is not None]
+    open_n = sum(1 for r in rows if r.get("status") == "OPEN")
+    pnls = [float(r["pnl"]) for r in closed]
+    n = len(pnls); total = sum(pnls)
+    win = (sum(1 for p in pnls if p > 0) / n) if n else 0.0
+    cum = 0.0; curve: List[Dict[str, Any]] = []
+    for r in closed:
+        cum += float(r["pnl"])
+        curve.append({"label": (r.get("day") or "") + " " + (r.get("symbol") or "").split("/")[0],
+                      "cum": round(cum, 2)})
+    by: Dict[str, List[float]] = {}
+    for r in closed:
+        by.setdefault((r.get("symbol") or "").split("/")[0], []).append(float(r["pnl"]))
+    by_coin = sorted(
+        ({"coin": c, "n": len(a), "win": sum(1 for x in a if x > 0) / len(a), "total": sum(a)}
+         for c, a in by.items()), key=lambda d: -d["total"])
+    return {"present": True, "error": "", "n": n, "open": open_n, "total": total,
+            "win": win, "curve": curve, "by_coin": by_coin}
+
+
 def _fwd_rules() -> Dict[str, Any]:
     """Auto-enrolled green search rules + their live forward results (read-only)."""
     if _forward_rules_mod is None:
@@ -652,6 +684,7 @@ def _payload() -> bytes:
         "observations": {},
         "ta_signals": {},
         "tsm_forward": {},
+        "tsm_live": {},
         "forward_rules": {},
         "positions": {},
         "sentiment": {},
@@ -683,6 +716,7 @@ def _payload() -> bytes:
     out["observations"] = _obs_stats()
     out["ta_signals"] = _ta_signals()
     out["tsm_forward"] = _tsm_forward()
+    out["tsm_live"] = _tsm_live()
     out["forward_rules"] = _fwd_rules()
     out["positions"] = _positions()
     out["sentiment"] = dict(_sentiment_cache)

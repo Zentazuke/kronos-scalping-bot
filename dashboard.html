@@ -196,10 +196,35 @@
     </label>
   </div>
 
-  <div class="sec">Open positions — live P&amp;L &amp; manual close (testnet)</div>
+  <!-- ===== ZONE 1: LIVE ===== -->
+  <div class="sec" style="color:#166534;border-color:#86efac">🟢 LIVE — your strategy (intraday-TSM · real testnet trades)</div>
   <div class="panel" style="margin-bottom:14px">
+    <h2>Open positions — live P&amp;L &amp; manual close</h2>
     <div id="positionsBox"></div>
   </div>
+  <div class="panel" style="margin-bottom:14px">
+    <h2>Track record — realized P&amp;L of the live trader</h2>
+    <div id="tsmLiveCards" class="cards" style="margin-bottom:10px"></div>
+    <div class="chartbox" style="height:200px"><canvas id="tsmLiveChart"></canvas></div>
+    <div id="tsmLiveBox"></div>
+  </div>
+
+  <!-- ===== ZONE 2: ON TRIAL ===== -->
+  <div class="sec" style="color:#92400e;border-color:#fcd34d">🟡 ON TRIAL — paper only, judged by time (no real money)</div>
+  <div class="panel" style="margin-bottom:14px">
+    <h2>Intraday-TSM — shadow forward test</h2>
+    <div id="tsmCards" class="cards" style="margin-bottom:10px"></div>
+    <div class="chartbox" style="height:200px"><canvas id="tsmChart"></canvas></div>
+    <div id="tsmForward"></div>
+  </div>
+  <div class="panel" style="margin-bottom:14px">
+    <h2>Auto forward-tests — every green search rule, vetted by time</h2>
+    <div id="fwdRules"></div>
+  </div>
+
+  <!-- ===== ZONE 3: RETIRED & TOOLS (collapsed) ===== -->
+  <details style="margin-bottom:14px">
+  <summary style="cursor:pointer;color:#94a3b8;font-weight:700;font-size:13px;padding:10px 0;border-top:1px solid #e2e8f0">⚪ Retired Kronos engine &amp; tools — click to expand (frozen / optional)</summary>
 
   <div class="sec">Account</div>
   <div class="cards" id="cards"></div>
@@ -228,18 +253,6 @@
   <div class="sec">OFI Gate — live forward test</div>
   <div class="panel" style="margin-bottom:14px">
     <div id="ofiGate"><div class="sim-meta">Inactive. Set <code>OFI_GATE_MIN</code> on the bot to route only strong order-flow setups — every decision still streams here live.</div></div>
-  </div>
-
-  <div class="sec">Intraday-TSM — live shadow forward test</div>
-  <div class="panel" style="margin-bottom:14px">
-    <div id="tsmCards" class="cards" style="margin-bottom:10px"></div>
-    <div class="chartbox" style="height:200px"><canvas id="tsmChart"></canvas></div>
-    <div id="tsmForward"></div>
-  </div>
-
-  <div class="sec">Auto forward-tests — every green rule, vetted by time</div>
-  <div class="panel" style="margin-bottom:14px">
-    <div id="fwdRules"></div>
   </div>
 
   <div class="sec">Run a Simulation</div>
@@ -302,6 +315,8 @@
     <p class="clickhint">Click any row to see the full decision chain that opened that position.</p>
     <div id="grid"></div>
   </div>
+
+  </details><!-- /retired & tools (zone 3) -->
   </div><!-- /main -->
 </div>
 
@@ -312,7 +327,7 @@
 <script>
 const POLL_MS = 3000;
 let PAYLOAD = { trades: [], events: [], ts: '' };
-let ALL = [], cumChart = null, barChart = null, tsmChart = null, grid = null, filterSig = '', lastJson = '';
+let ALL = [], cumChart = null, barChart = null, tsmChart = null, tsmLiveChart = null, grid = null, filterSig = '', lastJson = '';
 let lwChart = null, lwSeries = null, lwSym = null, lwTip = null, lwTradeMap = {}, priceSym = localStorage.getItem('priceSym') || '';
 let showExits = localStorage.getItem('showExits') !== '0';
 let pollCount = 0;
@@ -336,6 +351,7 @@ async function poll() {
     // Re-render only when the underlying data actually changed — keeps the
     // charts perfectly still between updates.
     try { renderPositions(); } catch(e) {}   // live P&L: update every poll, no full re-render
+    try { renderTsmLive(); } catch(e) {}     // live track record (independent of full re-render)
     const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.tsm_forward, PAYLOAD.forward_rules, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
     if (sig === lastJson) return;
     lastJson = sig;
@@ -551,8 +567,8 @@ function render() {
   renderOfiGate();
   renderTsmForward();
   renderFwdRules();
-  buildSymBtns();
-  renderPriceChart();
+  try { buildSymBtns(); } catch(e) {}
+  try { renderPriceChart(); } catch(e) {}   // retired chart now in a collapsed section — never let it break the page
 
   const dec = decided.slice().sort((a,b) => a.id - b.id);
   let run = 0;
@@ -914,17 +930,54 @@ function renderFwdRules(){
   el.innerHTML = h;
 }
 function _pf(v,d){ return (v===null||v===undefined||isNaN(v))?'—':(+v).toLocaleString(undefined,{maximumFractionDigits:d}); }
+function renderTsmLive(){
+  const el=document.getElementById('tsmLiveBox'); if(!el) return;
+  const cardsEl=document.getElementById('tsmLiveCards');
+  const d=(typeof PAYLOAD!=='undefined' && PAYLOAD && PAYLOAD.tsm_live)||{};
+  if(!d.present){
+    if(cardsEl) cardsEl.innerHTML='';
+    if(tsmLiveChart){ tsmLiveChart.destroy(); tsmLiveChart=null; }
+    el.innerHTML='<div class="sim-meta">No live trades yet. Once the trader runs (08:05 UTC) and a position closes at day-close, the realized P&amp;L track record builds here.</div>';
+    return;
+  }
+  if(d.error){ el.innerHTML='<div class="sim-meta">Live DB read error: '+d.error+'</div>'; return; }
+  const cls=v=>v>0?'pos':(v<0?'neg':'neutral');
+  const cards=[
+    ['Realized P&L', (d.total>=0?'+':'')+(d.total||0).toFixed(2)+' $', d.n?cls(d.total):'neutral', (d.n||0)+' closed trade'+(d.n===1?'':'s')],
+    ['Win rate', d.n?Math.round(d.win*100)+'%':'—', 'neutral', (d.n||0)+' settled'],
+    ['Open now', String(d.open||0), 'neutral', 'holding through the day'],
+  ];
+  if(cardsEl) cardsEl.innerHTML=cards.map(c=>'<div class="card"><div class="k">'+c[0]+'</div><div class="v '+c[2]+'">'+c[1]+'</div><div class="k" style="text-transform:none;margin-top:2px">'+c[3]+'</div></div>').join('');
+  const curve=d.curve||[];
+  if(tsmLiveChart){ tsmLiveChart.destroy(); tsmLiveChart=null; }
+  if(curve.length){
+    tsmLiveChart=new Chart(document.getElementById('tsmLiveChart'),{
+      type:'line',
+      data:{labels:curve.map(p=>p.label),datasets:[{data:curve.map(p=>p.cum),borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.08)',fill:true,tension:.2,pointRadius:2}]},
+      options:{responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'cum '+c.parsed.y+' $'}}},scales:{y:{grid:{color:'#eef2f7'},title:{display:true,text:'cumulative $'}},x:{grid:{display:false},ticks:{maxTicksLimit:8}}}}
+    });
+  }
+  let h='';
+  if((d.by_coin||[]).length){
+    h+='<table class="sim-tbl"><thead><tr><th class="sim-rule">coin</th><th>trades</th><th>win%</th><th>total $</th></tr></thead><tbody>';
+    d.by_coin.forEach(c=>{ h+='<tr><td class="sim-rule">'+c.coin+'</td><td>'+c.n+'</td><td>'+Math.round(c.win*100)+'%</td><td style="color:'+(c.total>=0?'#166534':'#b91c1c')+'">'+(c.total>=0?'+':'')+c.total.toFixed(2)+'</td></tr>'; });
+    h+='</tbody></table>';
+  } else {
+    h+='<div class="sim-meta">No closed trades yet — open positions show above; realized P&amp;L lands here after each day-close exit.</div>';
+  }
+  el.innerHTML=h;
+}
 function renderPositions(){
   const el=document.getElementById('positionsBox'); if(!el) return;
   const p=(typeof PAYLOAD!=='undefined' && PAYLOAD && PAYLOAD.positions) || {};
-  if(p.ok===false || (!p.ok && !p.list)){
-    el.innerHTML='<div class="sim-meta">Live close unavailable: '+(p.err||'not configured')+
-      '. It needs the dashboard running on the server (same box as the bot) with <code>USE_SANDBOX=true</code> and the API keys in the environment.</div>';
+  if(!p.ok){
+    el.innerHTML='<div class="sim-meta">Couldn\'t read open trades from the journal'+(p.err?(': '+p.err):'')+'.</div>';
     return;
   }
   const list=p.list||[];
-  if(!list.length){ el.innerHTML='<div class="sim-meta">No open positions right now. When the bot opens one it appears here with live P&amp;L and a Close button.</div>'; return; }
-  let h='<table class="sim-tbl"><thead><tr><th class="sim-rule">symbol</th><th>side</th><th>size</th><th>entry</th><th>mark</th><th>P&amp;L %</th><th>P&amp;L $</th><th></th></tr></thead><tbody>';
+  if(!list.length){ el.innerHTML='<div class="sim-meta">No open positions right now. When the bot opens one it shows here with live P&amp;L'+(p.can_close?' and a Close button.':'.')+'</div>'; return; }
+  const canClose=!!p.can_close;
+  let h='<table class="sim-tbl"><thead><tr><th class="sim-rule">symbol</th><th>side</th><th>size</th><th>entry</th><th>now</th><th>P&amp;L %</th><th>P&amp;L $</th>'+(canClose?'<th></th>':'')+'</tr></thead><tbody>';
   list.forEach(r=>{
     const win=(r.upnl!=null? r.upnl>=0 : (r.pct||0)>=0); const col=win?'#166534':'#b91c1c';
     h+='<tr><td class="sim-rule">'+r.symbol+'</td>'+
@@ -932,11 +985,15 @@ function renderPositions(){
       '<td>'+_pf(r.size,6)+'</td><td>'+_pf(r.entry,4)+'</td><td>'+_pf(r.mark,4)+'</td>'+
       '<td style="color:'+col+';font-weight:700">'+(r.pct!=null?(r.pct>=0?'+':'')+r.pct.toFixed(2)+'%':'—')+'</td>'+
       '<td style="color:'+col+'">'+(r.upnl!=null?(r.upnl>=0?'+':'')+_pf(r.upnl,2)+' $':'—')+'</td>'+
-      '<td><button class="symbtn" style="background:#dc2626;color:#fff;border-color:#dc2626" onclick="closePosition(\''+r.symbol+'\')">Close</button></td></tr>';
+      (canClose?('<td><button class="symbtn" style="background:#dc2626;color:#fff;border-color:#dc2626" onclick="closePosition(\''+r.symbol+'\')">Close</button></td>'):'')+'</tr>';
   });
-  h+='</tbody></table><div style="margin-top:8px">'+
-     '<button class="symbtn" style="background:#b91c1c;color:#fff;border-color:#b91c1c" onclick="closePosition(\'__ALL__\')">Close ALL</button>'+
-     '<span class="sim-meta" id="closeMsg" style="margin-left:10px"></span></div>';
+  h+='</tbody></table>';
+  if(canClose){
+    h+='<div style="margin-top:8px"><button class="symbtn" style="background:#b91c1c;color:#fff;border-color:#b91c1c" onclick="closePosition(\'__ALL__\')">Close ALL</button>'+
+       '<span class="sim-meta" id="closeMsg" style="margin-left:10px"></span></div>';
+  } else {
+    h+='<div class="sim-meta" style="margin-top:8px">Live P&amp;L only — the Close button is off: '+(p.close_err||'exchange not configured')+'. (Needs the dashboard on the server with <code>USE_SANDBOX=true</code> + API keys.)</div>';
+  }
   el.innerHTML=h;
 }
 function closePosition(sym){
