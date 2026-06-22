@@ -413,6 +413,14 @@ class TradingSupervisor:
             logger.info("OFI gate ACTIVE — routing only setups with aligned OFI >= %.3f",
                         self._ofi_gate_min)
 
+        # OBSERVE-ONLY mode (OBSERVE_ONLY=true): compute signals and RECORD every
+        # observation (so the auto-forward-tests keep accruing), but place NO orders.
+        # Lets the retired Kronos engine keep harvesting data without conflicting
+        # with the live intraday-TSM trader on the same testnet account.
+        self._observe_only: bool = os.getenv("OBSERVE_ONLY", "").strip().lower() == "true"
+        if self._observe_only:
+            logger.warning("OBSERVE-ONLY mode — recording observations, placing NO orders")
+
         # Mission Control dashboard — pure observer, drop-oldest telemetry.
         self._visualizer: Optional[TradingBotVisualizer] = (
             None
@@ -1067,7 +1075,15 @@ class TradingSupervisor:
                 else (float(ofi_rel) if direction is SignalDirection.LONG else -float(ofi_rel))
             )
             result: ExecutionResult
-            if self._ofi_gate_min is not None and (
+            if self._observe_only:
+                # Record-only: no order ever placed; the observation is journaled below.
+                result = ExecutionResult(
+                    status=ExecutionStatus.BLOCKED_STATE,
+                    symbol=symbol,
+                    direction=direction,
+                    reason="observe-only mode — observation recorded, no order placed",
+                )
+            elif self._ofi_gate_min is not None and (
                 _aligned_ofi is None or _aligned_ofi < self._ofi_gate_min
             ):
                 self._ofi_gated += 1
