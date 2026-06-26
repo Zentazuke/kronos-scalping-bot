@@ -39,8 +39,8 @@ from consensus_backtest import fetch_ohlcv
 from intraday_tsm_backtest import day_samples
 
 DB_PATH = "tsm_forward.db"
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT",
-           "XRP/USDT", "ADA/USDT", "DOGE/USDT", "LINK/USDT"]
+SYMBOLS = ["ETH/USDT", "SOL/USDT", "XRP/USDT",
+           "DOGE/USDT", "LINK/USDT", "AVAX/USDT"]
 SPLIT = 8           # UTC hour: morning = 00:00->08:00, afternoon = 08:00->day close
 VOL_WINDOW = 60     # trailing days for the vol-gate threshold (no lookahead)
 VOL_Q = 0.667       # top-tertile |morning move|

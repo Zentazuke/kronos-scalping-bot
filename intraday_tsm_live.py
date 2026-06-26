@@ -1,13 +1,15 @@
 """intraday_tsm_live.py — trade the intraday-TSM edge LIVE on testnet.
 
 This is the forward-validated strategy (vol-gated + momentum-regime + on-chain risk-off
-gate), now placing REAL testnet orders instead of shadow-logging. It reuses the EXACT
-signal functions from intraday_tsm_forward, so what trades is provably what we backtested
-and forward-tested. Sandbox-only, both directions, one position per coin per day.
+gate), now placing REAL testnet orders instead of shadow-logging. It EXECUTES the trial's
+committed decisions from tsm_forward.db verbatim — ONE BRAIN (the forward logger), ONE
+executor (this) — so the live book is provably identical to the shadow forward test.
+Sandbox-only, both directions, one position per coin per day.
 
-  * ENTER  (run >= 08:05 UTC): for each coin in the basket, if the signal fires, place a
-    market order ($NOTIONAL each), sized to the venue's precision. Mirrors the bot's own
-    create_order(symbol, "market", buy/sell). Records to tsm_live.db.
+  * ENTER  (run >= 08:05 UTC): refresh the TRIAL's committed decisions (run_daily), then
+    place a market order ($NOTIONAL each) for every coin the trial committed LONG/SHORT
+    today. We do NOT recompute the signal here — that independent recompute was the bug
+    that let the live book take LONGs the trial gated out. Records to tsm_live.db.
   * EXIT   (run >= 00:05 UTC next day): flatten every open position (cancel orders +
     market close), record realized P&L. This is the strategy's day-close exit.
   * STATUS : show open positions with live unrealized P&L.
@@ -38,12 +40,10 @@ try:  # load .env so a cron run has USE_SANDBOX + API keys without sourcing it
 except Exception:  # noqa: BLE001
     pass
 
-from consensus_backtest import fetch_ohlcv
-from intraday_tsm_forward import (FETCH_DAYS, SPLIT, _day, _hour, day_prices,
-                                  onchain_risk_off, regime_on, trailing_threshold)
+import intraday_tsm_forward as fwd       # the trial brain: we execute ITS decisions
 
 DB_PATH = "tsm_live.db"
-BASKET = ["ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "LINK/USDT", "AVAX/USDT"]
+FWD_DB = "tsm_forward.db"                # source of truth for today's committed decisions
 NOTIONAL = float(os.getenv("TSM_NOTIONAL", "200"))   # $ per trade
 
 
@@ -79,49 +79,54 @@ def exchange(dry: bool):
     return ex
 
 
-def _signal(candles, today: str) -> Optional[str]:
-    """Reuse the forward logger's exact gates -> 'LONG' / 'SHORT' / None."""
-    today_bars = [b for b in candles if _day(int(b[0])) == today]
-    if not any(_hour(int(b[0])) == SPLIT - 1 for b in today_bars):
-        return None                                       # morning window not complete yet
-    open_px, split_px, _c = day_prices(candles, today, SPLIT)
-    if not open_px or not split_px:
-        return None
-    thr = trailing_threshold(candles, today)
-    regime = regime_on(candles, today)
-    if thr is None or regime is None:
-        return None
-    morning = split_px / open_px - 1.0
-    risk_off = onchain_risk_off(today)
-    long_blocked = morning > 0 and risk_off
-    if abs(morning) >= thr and regime and not long_blocked:
-        return "LONG" if morning > 0 else "SHORT"
-    return None
+def _todays_decisions(today: str) -> List[tuple]:
+    """The single source of truth: read the TRIAL's committed directional decisions for
+    `today` from tsm_forward.db. Returns [(symbol, direction), ...] for LONG/SHORT only
+    (FLAT / gated days are skipped). This is what makes the live book == trial by
+    construction — we execute what the one brain committed, nothing else."""
+    if not os.path.exists(FWD_DB):
+        return []
+    c = sqlite3.connect(FWD_DB)
+    try:
+        return c.execute(
+            "SELECT symbol, direction FROM forward_trades "
+            "WHERE decision_day=? AND direction IN ('LONG','SHORT')", (today,)).fetchall()
+    finally:
+        c.close()
 
 
 def do_enter(dry: bool) -> int:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # ONE BRAIN: make sure the trial has committed today's decisions, then execute exactly
+    # those. We no longer recompute the signal here — that independent recompute was the
+    # source of the live/trial divergence (live took LONGs the trial gated out).
+    try:
+        fwd.run_daily()
+    except Exception as exc:  # noqa: BLE001 — fall back to whatever is already committed
+        print(f"  warning: couldn't refresh trial decisions ({str(exc)[:60]}); "
+              f"using existing {FWD_DB}.")
     ex = exchange(dry)
     if ex is None:
         return 1
+    decisions = _todays_decisions(today)
+    if not decisions:
+        print(f"[{_now_iso()}] enter: trial committed no directional trades for {today} "
+              f"(all gated/FLAT){' (dry-run)' if dry else ''}.")
+        return 0
     conn = sqlite3.connect(DB_PATH); ensure(conn)
     placed = 0
-    for sym in BASKET:
+    for sym, direction in decisions:
         if conn.execute("SELECT 1 FROM positions WHERE day=? AND symbol=?", (today, sym)).fetchone():
-            continue                                      # already decided today
+            continue                                      # already executed this coin today
         try:
-            candles = fetch_ohlcv(sym, "1h", FETCH_DAYS)
+            price = float(ex.fetch_ticker(sym)["last"])
         except Exception as exc:  # noqa: BLE001
-            print(f"  {sym}: fetch failed ({str(exc)[:40]})"); continue
-        direction = _signal(candles, today)
-        if direction is None:
-            continue                                      # gated out (or too early) — try again next run
-        price = float(ex.fetch_ticker(sym)["last"])
+            print(f"  {sym}: ticker failed ({str(exc)[:40]})"); continue
         raw_amt = NOTIONAL / price
         amount = float(ex.amount_to_precision(sym, raw_amt))
         side = "buy" if direction == "LONG" else "sell"
         if dry:
-            print(f"  DRY {sym:<10} {direction:<5} would {side} {amount} @ ~{price}")
+            print(f"  DRY {sym:<10} {direction:<5} (trial) would {side} {amount} @ ~{price}")
             continue
         try:
             order = ex.create_order(sym, "market", side, amount)
@@ -131,12 +136,12 @@ def do_enter(dry: bool) -> int:
                 (today, sym, direction, amount, fill, _now_iso(), "OPEN",
                  None, None, None, str(order.get("id"))))
             conn.commit(); placed += 1
-            print(f"  ENTER {sym:<10} {direction:<5} {side} {amount} @ {fill}")
+            print(f"  ENTER {sym:<10} {direction:<5} {side} {amount} @ {fill}  [trial decision]")
         except Exception as exc:  # noqa: BLE001 — never crash the run on one bad order
             print(f"  {sym}: ORDER FAILED ({str(exc)[:90]})")
     conn.close()
-    print(f"[{_now_iso()}] enter: {placed} position(s) opened for {today}"
-          f"{' (dry-run)' if dry else ''}.")
+    print(f"[{_now_iso()}] enter: {placed} position(s) opened for {today} "
+          f"(executing trial decisions){' (dry-run)' if dry else ''}.")
     return 0
 
 
