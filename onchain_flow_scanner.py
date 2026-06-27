@@ -7,7 +7,7 @@ Academic work (arXiv 2411.06327) and practitioner data both find stablecoin
 inflows / mints LEAD crypto returns by hours-to-days. This is information that
 isn't in the candle feed Kronos sees, and it's a single-leg signal (no double fees).
 
-Free data, no keys: stablecoin market-cap history from CoinGecko, daily price from
+Free data, no keys: aggregate stablecoin supply history from DefiLlama, daily price from
 Binance (reused fetch_ohlcv). We test it the SAME honest way we tested OFI:
   * signal_t = trailing --window-day growth of (USDT+USDC) supply,
   * forward return = price move over the next --horizon days,
@@ -30,32 +30,39 @@ import numpy as np
 
 from consensus_backtest import fetch_ohlcv
 
-STABLES = ("tether", "usd-coin")   # CoinGecko ids for USDT, USDC
+# Aggregate stablecoin supply from DefiLlama — free, no key, multi-year history.
+# This is the TOTAL USD-pegged stablecoin circulating supply (USDT+USDC dominate it),
+# a cleaner, longer, key-free replacement for the old USDT+USDC CoinGecko series that
+# now 401s on multi-year / interval=daily requests.
+DEFILLAMA_URL = "https://stablecoins.llama.fi/stablecoincharts/all"
 
 
 def _day(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-def fetch_stable_supply(coin_id: str, days: int) -> Dict[str, float]:
-    """Daily market cap (=circulating supply in $) for one stablecoin, by UTC date."""
-    url = (f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-           f"?vs_currency=usd&days={days}&interval=daily")
-    req = urllib.request.Request(url, headers={"User-Agent": "kronos-onchain/1.0"})
-    with urllib.request.urlopen(req, timeout=40) as resp:
+def aggregate_supply(days: int) -> Dict[str, float]:
+    """Total USD-pegged stablecoin circulating supply per UTC day, from DefiLlama.
+
+    Returns {date: supply_usd}. Free, no key, years of history (fixes the CoinGecko 401).
+    Each row looks like {"date": "<unix>", "totalCirculatingUSD": {"peggedUSD": <number>}}.
+    """
+    req = urllib.request.Request(DEFILLAMA_URL, headers={"User-Agent": "kronos-onchain/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.load(resp)
     out: Dict[str, float] = {}
-    for ts, mcap in data.get("market_caps", []):
-        if mcap:
-            out[_day(int(ts))] = float(mcap)   # last value of the day wins
+    for row in data:
+        ts = row.get("date")
+        val = row.get("totalCirculatingUSD")
+        if isinstance(val, dict):                       # {"peggedUSD": <number>, ...}
+            val = val.get("peggedUSD")
+        if ts is None or val in (None, ""):
+            continue
+        out[_day(int(ts) * 1000)] = float(val)
+    if days and len(out) > days:                        # keep only the trailing window asked for
+        for d in sorted(out)[:-(days + 2)]:
+            out.pop(d, None)
     return out
-
-
-def aggregate_supply(days: int) -> Dict[str, float]:
-    """Summed USDT+USDC supply per day (only days present for ALL stables)."""
-    per = {c: fetch_stable_supply(c, days) for c in STABLES}
-    common = set.intersection(*[set(d) for d in per.values()]) if per else set()
-    return {d: sum(per[c][d] for c in STABLES) for d in sorted(common)}
 
 
 def price_by_day(symbol: str, days: int) -> Dict[str, float]:
@@ -180,12 +187,12 @@ def main() -> int:
     args = ap.parse_args()
     fee = args.fee_bps / 10000.0
 
-    print("fetching stablecoin supply (CoinGecko) + daily price (Binance) ...")
+    print("fetching stablecoin supply (DefiLlama) + daily price (Binance) ...")
     try:
         supply = aggregate_supply(args.days)
     except Exception as exc:  # noqa: BLE001
         print(f"stablecoin fetch failed ({str(exc)[:80]}).")
-        print("CoinGecko free API can rate-limit; wait a minute and retry, or get a free demo key.")
+        print("DefiLlama stablecoins API is key-free and usually up; check connectivity and retry.")
         return 1
     if len(supply) < args.window + args.horizon + 40:
         print(f"only {len(supply)} days of supply data — try a smaller --days or retry"); return 1
