@@ -133,7 +133,7 @@ def main() -> int:
           f"peak {dd_peak_day} -> trough {trough_day} (${trough:,.0f})")
     avg_gross = (sum(gross_used) / len(gross_used) * 100) if gross_used else 0.0
     print(f"  avg exposure     {avg_gross:.0f}% of equity on trading days · "
-          f"deployed {100*days_deployed/len(all_days):.0f}% of days")
+          f"traded {100*trading_days/cal_days:.0f}% of calendar days")
 
     print("\nBY MONTH (account P&L, $):")
     eq_run = args.capital

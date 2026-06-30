@@ -17,3 +17,11 @@ __pycache__/
 *.pyc
 .mypy_cache/
 .pytest_cache/
+
+# Virtual environment — never commit (regenerate with: python -m venv .venv && pip install ...)
+.venv/
+venv/
+
+# Generated data + logs (regenerable)
+data_cache/
+*.log

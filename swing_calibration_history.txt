@@ -1,0 +1,6 @@
+==============================================================================
+2026-06-16T12:16:51+00:00  1d  ~30d hold  model_horizon=30 bars
+pooled: n=548  skill=-0.521  lambda=0.05  confident_hit=0.5169
+VERDICT: no real swing edge in Kronos's confidence at this horizon — same story as the 5-minute test.
+  BTC/USDT   n=274   skill=-0.659 lambda=0.00
+  ETH/USDT   n=274   skill=-0.399 lambda=0.15
