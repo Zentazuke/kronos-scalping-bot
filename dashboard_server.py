@@ -380,11 +380,18 @@ def _close_position(symbol: str) -> Dict[str, Any]:
                     fill = None
                     if isinstance(order, dict):
                         fill = order.get("average") or order.get("price")
+                    fill = _fnum(fill) or _last_price(symbol)
+                    entry = _fnum(td.get("entry_price"))
+                    # compute realized P&L like the bot's own exit does, else the closed
+                    # trade lands with pnl=NULL and silently drops out of the totals.
+                    pnl = ((1 if is_long else -1) * (fill - entry) * amt
+                           if (fill and entry and amt) else None)
                     now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
-                    lc.execute("UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=? "
-                               "WHERE day=? AND symbol=?", (fill, now, td.get("day"), symbol))
+                    lc.execute("UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=?, pnl=? "
+                               "WHERE day=? AND symbol=?", (fill, now, pnl, td.get("day"), symbol))
                     lc.commit(); lc.close()
-                    return {"ok": True, "msg": f"closed TSM {symbol} — market {exit_side} {amt}"}
+                    return {"ok": True, "msg": f"closed TSM {symbol} {exit_side} {amt} — pnl "
+                                               f"{round(pnl, 2) if pnl is not None else 'n/a'}"}
             lc.close()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "err": f"tsm close failed: {str(exc)[:120]}"}
