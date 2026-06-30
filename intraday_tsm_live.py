@@ -45,6 +45,9 @@ import intraday_tsm_forward as fwd       # the trial brain: we execute ITS decis
 DB_PATH = "tsm_live.db"
 FWD_DB = "tsm_forward.db"                # source of truth for today's committed decisions
 NOTIONAL = float(os.getenv("TSM_NOTIONAL", "200"))   # $ per trade
+# Count the realized track record only from the corrected strategy's start — pre-rewire
+# trades were a bug, not the strategy. Override via .env (YYYY-MM-DD).
+TSM_LIVE_START = os.getenv("TSM_LIVE_START", "2026-06-27")
 
 
 def ensure(conn: sqlite3.Connection) -> None:
@@ -53,6 +56,12 @@ def ensure(conn: sqlite3.Connection) -> None:
             day TEXT, symbol TEXT, side TEXT, amount REAL, entry_price REAL, entry_ts TEXT,
             status TEXT, exit_price REAL, exit_ts TEXT, pnl REAL, order_id TEXT,
             PRIMARY KEY (day, symbol))""")
+    # exit_by records WHO closed the trade: 'auto' (the 00:05 day-close cron) vs 'manual'
+    # (you, via the dashboard) — so we can compare discretionary exits to mechanical ones.
+    try:
+        conn.execute("ALTER TABLE positions ADD COLUMN exit_by TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
 
 
@@ -169,7 +178,7 @@ def do_exit(dry: bool) -> int:
             sign = 1.0 if side == "LONG" else -1.0
             pnl = sign * (fill - float(entry)) * float(amount)
             conn.execute(
-                "UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=?, pnl=? "
+                "UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=?, pnl=?, exit_by='auto' "
                 "WHERE day=? AND symbol=?", (fill, _now_iso(), pnl, day, sym))
             conn.commit(); closed += 1
             print(f"  EXIT  {sym:<10} {side:<5} @ {fill}  pnl {pnl:+.2f} $")
@@ -187,10 +196,11 @@ def do_status() -> int:
     opens = conn.execute(
         "SELECT day,symbol,side,amount,entry_price FROM positions WHERE status='OPEN'").fetchall()
     closed = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(pnl),0) FROM positions WHERE status='CLOSED'").fetchone()
+        "SELECT COUNT(*), COALESCE(SUM(pnl),0) FROM positions WHERE status='CLOSED' AND day>=?",
+        (TSM_LIVE_START,)).fetchone()
     conn.close()
     print(f"\n=== INTRADAY-TSM LIVE (testnet) — ${NOTIONAL:g}/trade ===")
-    print(f"realized: {closed[0]} closed trades, total P&L {closed[1]:+.2f} $\n")
+    print(f"realized (since {TSM_LIVE_START}): {closed[0]} closed trades, total P&L {closed[1]:+.2f} $\n")
     if not opens:
         print("no open positions."); return 0
     try:

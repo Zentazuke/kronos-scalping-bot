@@ -965,6 +965,17 @@ function renderTsmLive(){
   } else {
     h+='<div class="sim-meta">No closed trades yet — open positions show above; realized P&amp;L lands here after each day-close exit.</div>';
   }
+  const be=d.by_exit||{};
+  if((be.manual&&be.manual.n)||(be.auto&&be.auto.n)){
+    const row=(lbl,x)=>{x=x||{n:0,total:0,win:0,avg:0};const col=(x.total||0)>=0?'#166534':'#b91c1c';
+      return '<tr><td class="sim-rule">'+lbl+'</td><td>'+(x.n||0)+'</td><td>'+Math.round((x.win||0)*100)+'%</td>'+
+        '<td style="color:'+col+'">'+((x.total||0)>=0?'+':'')+(x.total||0).toFixed(2)+'</td>'+
+        '<td>'+((x.avg||0)>=0?'+':'')+(x.avg||0).toFixed(2)+'</td></tr>';};
+    h+='<div class="sim-meta" style="margin-top:12px;font-weight:700">You vs the bot — who exits better?</div>';
+    h+='<table class="sim-tbl"><thead><tr><th class="sim-rule">closed by</th><th>trades</th><th>win%</th><th>total $</th><th>avg/trade $</th></tr></thead><tbody>';
+    h+=row('you (manual close)', be.manual)+row('bot (auto day-close)', be.auto);
+    h+='</tbody></table>';
+  }
   el.innerHTML=h;
 }
 function renderPositions(){

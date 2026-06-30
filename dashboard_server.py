@@ -44,6 +44,10 @@ LOG_PATH: Final[Path] = BASE_DIR / "bot.log"
 HTML_PATH: Final[Path] = BASE_DIR / "dashboard.html"
 TSM_DB_PATH: Final[Path] = BASE_DIR / "tsm_forward.db"
 TSM_LIVE_DB: Final[Path] = BASE_DIR / "tsm_live.db"
+# Count the live track record only from when the corrected ("one brain") strategy went
+# live — the pre-rewire trades were a bug (wrong-way LONGs the trial never authorized),
+# not the strategy. Override in .env if you want a different cutoff (YYYY-MM-DD).
+TSM_LIVE_START: Final[str] = os.getenv("TSM_LIVE_START", "2026-06-27")
 LOG_TAIL_BYTES: Final[int] = 600_000
 
 try:  # optional TA-signals engine; the dashboard must run even if it's absent
@@ -224,6 +228,9 @@ def _tsm_live() -> Dict[str, Any]:
         conn.close()
     except sqlite3.Error as exc:
         return {"present": True, "error": str(exc)[:80]}
+    # only count trades on/after the corrected strategy's start (day is "YYYY-MM-DD",
+    # which sorts lexicographically = chronologically)
+    rows = [r for r in rows if (r.get("day") or "") >= TSM_LIVE_START]
     closed = [r for r in rows if r.get("status") == "CLOSED" and r.get("pnl") is not None]
     open_n = sum(1 for r in rows if r.get("status") == "OPEN")
     pnls = [float(r["pnl"]) for r in closed]
@@ -240,8 +247,17 @@ def _tsm_live() -> Dict[str, Any]:
     by_coin = sorted(
         ({"coin": c, "n": len(a), "win": sum(1 for x in a if x > 0) / len(a), "total": sum(a)}
          for c, a in by.items()), key=lambda d: -d["total"])
+    # who pulled the trigger: YOU (manual close) vs the BOT (auto day-close exit).
+    # Untagged legacy rows count as 'auto' (they were the mechanical day-close exits).
+    def _split(pred):
+        a = [float(r["pnl"]) for r in closed if pred(r)]
+        return {"n": len(a), "total": round(sum(a), 2),
+                "win": round(sum(1 for x in a if x > 0) / len(a), 3) if a else 0.0,
+                "avg": round(sum(a) / len(a), 2) if a else 0.0}
+    by_exit = {"manual": _split(lambda r: r.get("exit_by") == "manual"),
+               "auto": _split(lambda r: r.get("exit_by") != "manual")}
     return {"present": True, "error": "", "n": n, "open": open_n, "total": total,
-            "win": win, "curve": curve, "by_coin": by_coin}
+            "win": win, "curve": curve, "by_coin": by_coin, "by_exit": by_exit}
 
 
 def _fwd_rules() -> Dict[str, Any]:
@@ -363,6 +379,10 @@ def _close_position(symbol: str) -> Dict[str, Any]:
         if TSM_LIVE_DB.exists():
             lc = sqlite3.connect(str(TSM_LIVE_DB), timeout=2.0)
             lc.row_factory = sqlite3.Row
+            try:  # ensure the exit_by column exists (older DBs predate it)
+                lc.execute("ALTER TABLE positions ADD COLUMN exit_by TEXT")
+            except sqlite3.OperationalError:
+                pass
             trow = lc.execute("SELECT * FROM positions WHERE status='OPEN' AND symbol=? "
                               "ORDER BY day DESC LIMIT 1", (symbol,)).fetchone()
             if trow:
@@ -387,8 +407,9 @@ def _close_position(symbol: str) -> Dict[str, Any]:
                     pnl = ((1 if is_long else -1) * (fill - entry) * amt
                            if (fill and entry and amt) else None)
                     now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
-                    lc.execute("UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=?, pnl=? "
-                               "WHERE day=? AND symbol=?", (fill, now, pnl, td.get("day"), symbol))
+                    lc.execute("UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=?, pnl=?, "
+                               "exit_by='manual' WHERE day=? AND symbol=?",
+                               (fill, now, pnl, td.get("day"), symbol))
                     lc.commit(); lc.close()
                     return {"ok": True, "msg": f"closed TSM {symbol} {exit_side} {amt} — pnl "
                                                f"{round(pnl, 2) if pnl is not None else 'n/a'}"}
