@@ -203,7 +203,7 @@
     <div id="positionsBox"></div>
   </div>
   <div class="panel" style="margin-bottom:14px">
-    <h2>Track record — intraday-TSM (shadow forward test, since inception)</h2>
+    <h2>Track record — your manual closes vs the bot's auto exits (real testnet $)</h2>
     <div id="tsmLiveCards" class="cards" style="margin-bottom:10px"></div>
     <div class="chartbox" style="height:200px"><canvas id="tsmLiveChart"></canvas></div>
     <div id="tsmLiveBox"></div>
@@ -933,53 +933,53 @@ function _pf(v,d){ return (v===null||v===undefined||isNaN(v))?'—':(+v).toLocal
 function renderTsmLive(){
   const el=document.getElementById('tsmLiveBox'); if(!el) return;
   const cardsEl=document.getElementById('tsmLiveCards');
-  const f=(typeof PAYLOAD!=='undefined' && PAYLOAD && PAYLOAD.tsm_forward)||{};   // honest from-inception scorecard
   const d=(typeof PAYLOAD!=='undefined' && PAYLOAD && PAYLOAD.tsm_live)||{};       // real testnet execution
-  if(!f.present){
+  if(!d.present){
     if(cardsEl) cardsEl.innerHTML='';
     if(tsmLiveChart){ tsmLiveChart.destroy(); tsmLiveChart=null; }
-    el.innerHTML='<div class="sim-meta">No forward-test data yet. Once the strategy runs daily (08:05 UTC), its committed-trade scorecard builds here.</div>';
+    el.innerHTML='<div class="sim-meta">No live trades yet. Your manual closes and the bot\'s day-close exits will tally here to compare.</div>';
     return;
   }
-  if(f.error){ el.innerHTML='<div class="sim-meta">Forward-test read error: '+f.error+'</div>'; return; }
-  const pct=v=>(v>=0?'+':'')+((v||0)*100).toFixed(2)+'%';
+  if(d.error){ el.innerHTML='<div class="sim-meta">Live DB read error: '+d.error+'</div>'; return; }
   const cls=v=>v>0?'pos':(v<0?'neg':'neutral');
+  const money=v=>(v>=0?'+':'')+(v||0).toFixed(2)+' $';
+  const be=d.by_exit||{};
+  const M=be.manual||{n:0,total:0,win:0,avg:0}, A=be.auto||{n:0,total:0,win:0,avg:0};
   const cards=[
-    ['Net / trade', f.n_settled?pct(f.exp):'—', f.n_settled?cls(f.exp):'neutral', 'after fees, settled only'],
-    ['Win rate', f.n_settled?Math.round(f.win*100)+'%':'—', 'neutral', (f.n_settled||0)+' settled trade'+(f.n_settled===1?'':'s')],
-    ['Cumulative net', f.n_settled?pct(f.total):'—', f.n_settled?cls(f.total):'neutral', 'since '+((f.span&&f.span[0])||'start')],
-    ['Open now', String((d.open!=null?d.open:0)), 'neutral', 'live positions held'],
+    ['You — manual', M.n?money(M.total):'—', M.n?cls(M.total):'neutral', (M.n||0)+' close'+(M.n===1?'':'s')+' · '+Math.round((M.win||0)*100)+'% win'],
+    ['Bot — auto', A.n?money(A.total):'—', A.n?cls(A.total):'neutral', (A.n||0)+' close'+(A.n===1?'':'s')+' · '+Math.round((A.win||0)*100)+'% win'],
+    ['Live total', d.n?money(d.total):'—', d.n?cls(d.total):'neutral', (d.n||0)+' closed · '+Math.round((d.win||0)*100)+'% win'],
+    ['Open now', String(d.open||0), 'neutral', 'holding through the day'],
   ];
   if(cardsEl) cardsEl.innerHTML=cards.map(c=>'<div class="card"><div class="k">'+c[0]+'</div><div class="v '+c[2]+'">'+c[1]+'</div><div class="k" style="text-transform:none;margin-top:2px">'+c[3]+'</div></div>').join('');
-  const curve=f.curve||[];
+  const curve=d.curve||[];
   if(tsmLiveChart){ tsmLiveChart.destroy(); tsmLiveChart=null; }
   if(curve.length){
     tsmLiveChart=new Chart(document.getElementById('tsmLiveChart'),{
       type:'line',
-      data:{labels:curve.map(p=>p.day+(p.coin?(' '+p.coin):'')),datasets:[{data:curve.map(p=>+((p.cum||0)*100).toFixed(3)),borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.08)',fill:true,tension:.2,pointRadius:2}]},
-      options:{responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'cum '+c.parsed.y+'%'}}},scales:{y:{grid:{color:'#eef2f7'},title:{display:true,text:'cumulative net %'}},x:{grid:{display:false},ticks:{maxTicksLimit:8}}}}
+      data:{labels:curve.map(p=>p.label),datasets:[{data:curve.map(p=>p.cum),borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.08)',fill:true,tension:.2,pointRadius:2}]},
+      options:{responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'cum '+c.parsed.y+' $'}}},scales:{y:{grid:{color:'#eef2f7'},title:{display:true,text:'cumulative $'}},x:{grid:{display:false},ticks:{maxTicksLimit:8}}}}
     });
   }
   let h='';
-  if((f.by_coin||[]).length){
-    h+='<table class="sim-tbl"><thead><tr><th class="sim-rule">coin</th><th>trades</th><th>win%</th><th>net/trade</th><th>total</th></tr></thead><tbody>';
-    f.by_coin.forEach(c=>{ h+='<tr><td class="sim-rule">'+c.coin+'</td><td>'+c.n+'</td><td>'+Math.round(c.win*100)+'%</td><td style="color:'+(c.exp>=0?'#166534':'#b91c1c')+'">'+pct(c.exp)+'</td><td style="color:'+(c.total>=0?'#166534':'#b91c1c')+'">'+pct(c.total)+'</td></tr>'; });
-    h+='</tbody></table>';
-  } else {
-    h+='<div class="sim-meta">No settled trades yet — committed decisions mature at day-close.</div>';
-  }
-  const be=(d&&d.by_exit)||{};
-  if((be.manual&&be.manual.n)||(be.auto&&be.auto.n)){
-    const row=(lbl,x)=>{x=x||{n:0,total:0,win:0,avg:0};const col=(x.total||0)>=0?'#166534':'#b91c1c';
+  if(M.n||A.n){
+    const row=(lbl,x)=>{const col=(x.total||0)>=0?'#166534':'#b91c1c';
       return '<tr><td class="sim-rule">'+lbl+'</td><td>'+(x.n||0)+'</td><td>'+Math.round((x.win||0)*100)+'%</td>'+
         '<td style="color:'+col+'">'+((x.total||0)>=0?'+':'')+(x.total||0).toFixed(2)+'</td>'+
         '<td>'+((x.avg||0)>=0?'+':'')+(x.avg||0).toFixed(2)+'</td></tr>';};
-    h+='<div class="sim-meta" style="margin-top:12px;font-weight:700">Real execution (testnet $) — you vs the bot</div>';
+    h+='<div class="sim-meta" style="font-weight:700">You vs the bot — who exits better?</div>';
     h+='<table class="sim-tbl"><thead><tr><th class="sim-rule">closed by</th><th>trades</th><th>win%</th><th>total $</th><th>avg/trade $</th></tr></thead><tbody>';
-    h+=row('you (manual close)', be.manual)+row('bot (auto day-close)', be.auto);
+    h+=row('you (manual close)', M)+row('bot (auto day-close)', A);
+    h+='</tbody></table>';
+  } else {
+    h+='<div class="sim-meta">No closed trades yet since the corrected strategy started. Your manual closes and the bot\'s day-close exits will tally up here to compare.</div>';
+  }
+  if((d.by_coin||[]).length){
+    h+='<table class="sim-tbl" style="margin-top:10px"><thead><tr><th class="sim-rule">coin</th><th>trades</th><th>win%</th><th>total $</th></tr></thead><tbody>';
+    d.by_coin.forEach(c=>{ h+='<tr><td class="sim-rule">'+c.coin+'</td><td>'+c.n+'</td><td>'+Math.round(c.win*100)+'%</td><td style="color:'+(c.total>=0?'#166534':'#b91c1c')+'">'+(c.total>=0?'+':'')+c.total.toFixed(2)+'</td></tr>'; });
     h+='</tbody></table>';
   }
-  h+='<div class="sim-meta" style="margin-top:8px;color:#94a3b8">Headline = the shadow forward test: pre-committed at 08:00 UTC, settled at day-close, never touched by execution bugs — the honest scorecard from inception. The $ table is real testnet fills since the corrected strategy went live.</div>';
+  h+='<div class="sim-meta" style="margin-top:8px;color:#94a3b8">Real testnet fills since the corrected strategy went live. The strategy\'s full from-inception scorecard (the auto bot) is the ON TRIAL panel below.</div>';
   el.innerHTML=h;
 }
 function renderPositions(){
