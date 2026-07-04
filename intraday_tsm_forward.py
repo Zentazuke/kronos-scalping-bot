@@ -46,7 +46,11 @@ VOL_WINDOW = 60     # trailing days for the vol-gate threshold (no lookahead)
 VOL_Q = 0.667       # top-tertile |morning move|
 REGIME_WINDOW = 30  # trailing days for the autocorr regime gate (hardened config)
 ONCHAIN_WINDOW = 7  # trailing days for the stablecoin supply-growth sign (risk-off gate)
-FEE_BPS = 10.0
+# AUDIT FIX (2026-07-03): was 10.0 — but the live executor pays TWO taker fills
+# (market in at 08:05, market out at 00:05) = ~20 bps round-trip at the 10 bps spot
+# taker tier (15 with BNB). The trial must charge the toll the live book actually pays.
+# Applies to newly settled rows only; gross_ret is stored, so old nets are recomputable.
+FEE_BPS = 20.0
 FETCH_DAYS = 80     # enough for the 60d trailing window + settle backlog
 
 

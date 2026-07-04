@@ -9,13 +9,24 @@ far apart on the same trade -> testnet execution slippage).
 
 Run it wherever the dashboard runs (the server), where both .db files live:
 
-    python compare_live_vs_trial.py
+    python compare_live_vs_trial.py                  # full side-by-side table
+    python compare_live_vs_trial.py --alert          # one line + exit 1 on divergence
+    python compare_live_vs_trial.py --alert --days 3 # only check the last 3 days
+
+AUDIT FIX (2026-07-03): --alert mode added so reconciliation is a daily cron, not a
+thing you remember to do. The original live/trial wiring bug sat unnoticed until a
+human eyeballed the divergence; this makes the guard automatic:
+
+    10 1 * * *  cd ~/kronos-scalping-bot && .venv/bin/python compare_live_vs_trial.py \
+                --alert --days 3 >> reconcile.log 2>&1
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 LIVE_DB = "tsm_live.db"
 FWD_DB = "tsm_forward.db"
@@ -50,15 +61,26 @@ def _f(v, nd=4):
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Reconcile the live book against the trial")
+    ap.add_argument("--alert", action="store_true",
+                    help="terse mode for cron: one line, exit 1 on any divergence")
+    ap.add_argument("--days", type=int, default=0,
+                    help="only check decisions from the last N days (0 = all)")
+    args = ap.parse_args()
+    say = (lambda *a, **k: None) if args.alert else print
+
     live = live_trades()
     trial = trial_trades()
     keys = sorted(set(live) | set(trial))
+    if args.days > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).strftime("%Y-%m-%d")
+        keys = [k for k in keys if k[0] >= cutoff]
 
-    print(f"\n=== LIVE (tsm_live.db) vs TRIAL (tsm_forward.db) — {len(live)} live, "
-          f"{len(trial)} trial rows ===\n")
+    say(f"\n=== LIVE (tsm_live.db) vs TRIAL (tsm_forward.db) — {len(live)} live, "
+        f"{len(trial)} trial rows ===\n")
     hdr = f"{'day':<11}{'coin':<10}{'L.side':>7}{'T.dir':>7}{'L.entry':>11}{'T.entry':>11}{'entryΔ%':>8}{'L.exit':>11}{'T.exit':>11}{'L.pnl$':>9}{'T.net%':>8}  flag"
-    print(hdr)
-    print("-" * len(hdr))
+    say(hdr)
+    say("-" * len(hdr))
 
     n_dir_mismatch = n_only_live = n_only_trial = n_big_entry = 0
     for k in keys:
@@ -67,8 +89,8 @@ def main() -> int:
         T = trial.get(k)
         if L and not T:
             n_only_live += 1
-            print(f"{d:<11}{s:<10}{L['side']:>7}{'--':>7}{_f(L['entry']):>11}{'--':>11}{'--':>8}"
-                  f"{_f(L['exit']):>11}{'--':>11}{_f(L['pnl'],2):>9}{'--':>8}  ONLY-LIVE")
+            say(f"{d:<11}{s:<10}{L['side']:>7}{'--':>7}{_f(L['entry']):>11}{'--':>11}{'--':>8}"
+                f"{_f(L['exit']):>11}{'--':>11}{_f(L['pnl'],2):>9}{'--':>8}  ONLY-LIVE")
             continue
         if T and not L:
             # only count directional trial trades as "missing from live"
@@ -77,8 +99,8 @@ def main() -> int:
                 tag = "ONLY-TRIAL"
             else:
                 tag = "(trial-flat)"
-            print(f"{d:<11}{s:<10}{'--':>7}{T['dir']:>7}{'--':>11}{_f(T['entry']):>11}{'--':>8}"
-                  f"{'--':>11}{_f(T['exit']):>11}{'--':>9}{_f((T['net'] or 0)*100,3):>8}  {tag}")
+            say(f"{d:<11}{s:<10}{'--':>7}{T['dir']:>7}{'--':>11}{_f(T['entry']):>11}{'--':>8}"
+                f"{'--':>11}{_f(T['exit']):>11}{'--':>9}{_f((T['net'] or 0)*100,3):>8}  {tag}")
             continue
         # both present — compare
         lside = L['side']
@@ -96,10 +118,19 @@ def main() -> int:
         if entry_delta and abs(float(entry_delta)) > 0.20:
             flags.append("ENTRY-GAP")
         flag = ",".join(flags) if flags else "ok"
-        print(f"{d:<11}{s:<10}{lside:>7}{tdir:>7}{_f(L['entry']):>11}{_f(T['entry']):>11}"
-              f"{entry_delta:>8}{_f(L['exit']):>11}{_f(T['exit']):>11}"
-              f"{_f(L['pnl'],2):>9}{_f((T['net'] or 0)*100,3):>8}  {flag}")
+        say(f"{d:<11}{s:<10}{lside:>7}{tdir:>7}{_f(L['entry']):>11}{_f(T['entry']):>11}"
+            f"{entry_delta:>8}{_f(L['exit']):>11}{_f(T['exit']):>11}"
+            f"{_f(L['pnl'],2):>9}{_f((T['net'] or 0)*100,3):>8}  {flag}")
 
+    diverged = n_dir_mismatch + n_only_live + n_only_trial + n_big_entry
+    if args.alert:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if diverged:
+            print(f"[{stamp}] RECONCILE ALERT: dir-mismatch {n_dir_mismatch}, only-live {n_only_live}, "
+                  f"only-trial {n_only_trial}, entry-gaps {n_big_entry} — run without --alert to see rows")
+            return 1
+        print(f"[{stamp}] reconcile ok — live book matches trial")
+        return 0
     print("\n=== summary ===")
     print(f"  direction mismatches : {n_dir_mismatch}")
     print(f"  big entry-price gaps : {n_big_entry}  (>0.20% apart — testnet fill slippage)")
@@ -108,7 +139,7 @@ def main() -> int:
     print("\nRead: many DIR-MISMATCH -> the two are taking different trades (signal-timing).")
     print("      many ENTRY-GAP    -> same trades, but testnet fills are far off the clean")
     print("                           candle price the trial assumes (execution slippage).")
-    return 0
+    return 1 if diverged else 0
 
 
 if __name__ == "__main__":

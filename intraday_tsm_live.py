@@ -45,6 +45,9 @@ import intraday_tsm_forward as fwd       # the trial brain: we execute ITS decis
 DB_PATH = "tsm_live.db"
 FWD_DB = "tsm_forward.db"                # source of truth for today's committed decisions
 NOTIONAL = float(os.getenv("TSM_NOTIONAL", "200"))   # $ per trade
+# AUDIT FIX (2026-07-03): the live P&L ignored fees entirely — the exact "toll" the whole
+# postmortem is about. Charge the taker fee on both legs when computing realized P&L.
+TAKER_BPS = float(os.getenv("TSM_TAKER_BPS", "10"))  # spot taker per fill (7.5 with BNB)
 # Count the realized track record only from the corrected strategy's start — pre-rewire
 # trades were a bug, not the strategy. Override via .env (YYYY-MM-DD).
 TSM_LIVE_START = os.getenv("TSM_LIVE_START", "2026-06-27")
@@ -78,9 +81,14 @@ def exchange(dry: bool):
     if not (key and sec):
         print("REFUSED: no API keys in env."); return None
     import ccxt  # type: ignore[import-untyped]
+    # AUDIT FIX (2026-07-03): default (spot) cannot express a true SHORT — a spot 'sell'
+    # only disposes of base you already hold (no borrow, no short economics), or fails
+    # quietly, biasing the live book long-only vs the trial. Set EXCHANGE_MARKET_TYPE=future
+    # (USDT-M testnet) so both directions are real.
+    mtype = os.getenv("EXCHANGE_MARKET_TYPE", "spot").strip().lower()
     ex = getattr(ccxt, os.getenv("EXCHANGE_ID", "binance"))(
         {"enableRateLimit": True, "apiKey": key, "secret": sec,
-         "options": {"adjustForTimeDifference": True}})
+         "options": {"adjustForTimeDifference": True, "defaultType": mtype}})
     sm = getattr(ex, "set_sandbox_mode", None)
     if callable(sm):
         sm(True)
@@ -134,6 +142,9 @@ def do_enter(dry: bool) -> int:
         raw_amt = NOTIONAL / price
         amount = float(ex.amount_to_precision(sym, raw_amt))
         side = "buy" if direction == "LONG" else "sell"
+        if direction == "SHORT" and os.getenv("EXCHANGE_MARKET_TYPE", "spot").strip().lower() == "spot":
+            print(f"  {sym}: WARNING — SHORT on SPOT is not a real short (sells held base, or "
+                  f"fails and silently drops the trade). Set EXCHANGE_MARKET_TYPE=future.")
         if dry:
             print(f"  DRY {sym:<10} {direction:<5} (trial) would {side} {amount} @ ~{price}")
             continue
@@ -176,7 +187,8 @@ def do_exit(dry: bool) -> int:
             order = ex.create_order(sym, "market", exit_side, float(amount))
             fill = float(order.get("average") or order.get("price") or 0) or float(ex.fetch_ticker(sym)["last"])
             sign = 1.0 if side == "LONG" else -1.0
-            pnl = sign * (fill - float(entry)) * float(amount)
+            fees = (float(entry) + fill) * float(amount) * TAKER_BPS / 1e4   # both legs
+            pnl = sign * (fill - float(entry)) * float(amount) - fees
             conn.execute(
                 "UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=?, pnl=?, exit_by='auto' "
                 "WHERE day=? AND symbol=?", (fill, _now_iso(), pnl, day, sym))

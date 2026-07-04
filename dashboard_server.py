@@ -26,7 +26,7 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Final, List
+from typing import Any, Dict, Final, List, Tuple
 from urllib.parse import parse_qs, urlparse
 
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
@@ -276,6 +276,13 @@ def _fwd_rules() -> Dict[str, Any]:
 # hard-guarded to sandbox mode and can only REDUCE/close, never open.
 # --------------------------------------------------------------------------- #
 _TRADE_EX: Dict[str, Any] = {"ex": None, "tried": False, "err": ""}
+# AUDIT FIX (2026-07-03): journal-path closes can't mark journal.db (the bot owns it,
+# we open it read-only), so remember what we already closed this server-session to
+# refuse a double market order on a position the UI still shows as OPEN.
+_MANUAL_CLOSED: set = set()
+# AUDIT FIX (2026-07-03): single-flight for the heavy on-demand searches — without it,
+# refresh-spamming /run-search//run-geometry stacks parallel 5-10 min subprocesses.
+_RUN_LOCK = threading.Lock()
 
 
 def _trade_exchange():
@@ -404,7 +411,12 @@ def _close_position(symbol: str) -> Dict[str, Any]:
                     entry = _fnum(td.get("entry_price"))
                     # compute realized P&L like the bot's own exit does, else the closed
                     # trade lands with pnl=NULL and silently drops out of the totals.
+                    # AUDIT FIX (2026-07-03): subtract both-leg taker fees, matching the
+                    # auto day-close exit — otherwise the manual-vs-auto comparison is
+                    # biased in favor of manual closes.
+                    taker = float(os.getenv("TSM_TAKER_BPS", "10")) / 1e4
                     pnl = ((1 if is_long else -1) * (fill - entry) * amt
+                           - (entry + fill) * amt * taker
                            if (fill and entry and amt) else None)
                     now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
                     lc.execute("UPDATE positions SET status='CLOSED', exit_price=?, exit_ts=?, pnl=?, "
@@ -427,6 +439,10 @@ def _close_position(symbol: str) -> Dict[str, Any]:
         return {"ok": False, "err": f"journal read failed: {str(exc)[:60]}"}
     if not row:
         return {"ok": True, "msg": f"no open journal position on {symbol}"}
+    if symbol in _MANUAL_CLOSED:
+        return {"ok": False, "err": f"{symbol} was already manually closed this session — "
+                                    "the journal still shows OPEN because only the bot can "
+                                    "update journal.db. Restart the dashboard to override."}
     d = dict(row)
     amt = _fnum(d.get("amount"))
     is_long = str(d.get("direction", "")).endswith("LONG")
@@ -447,6 +463,7 @@ def _close_position(symbol: str) -> Dict[str, Any]:
         params = {} if spot else {"reduceOnly": True}
         order = ex.create_order(symbol, "market", exit_side, float(amt), None, params)
         oid = (order or {}).get("id") if isinstance(order, dict) else None
+        _MANUAL_CLOSED.add(symbol)          # journal stays OPEN (bot-owned); block re-close
         return {"ok": True, "msg": f"closed {symbol} — market {exit_side} {amt}", "order_id": oid}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "err": str(exc)[:160]}
@@ -762,10 +779,24 @@ class _Handler(BaseHTTPRequestHandler):
             body = HTML_PATH.read_bytes()
             content_type = "text/html; charset=utf-8"
         elif self.path.split("?")[0] == "/run-search":
-            body = _run_search(self.path)
+            if _RUN_LOCK.acquire(blocking=False):
+                try:
+                    body = _run_search(self.path)
+                finally:
+                    _RUN_LOCK.release()
+            else:
+                body = json.dumps({"error": "a search/sweep is already running — "
+                                            "wait for it to finish"}).encode("utf-8")
             content_type = "application/json"
         elif self.path.split("?")[0] == "/run-geometry":
-            body = _run_geometry(self.path)
+            if _RUN_LOCK.acquire(blocking=False):
+                try:
+                    body = _run_geometry(self.path)
+                finally:
+                    _RUN_LOCK.release()
+            else:
+                body = json.dumps({"error": "a search/sweep is already running — "
+                                            "wait for it to finish"}).encode("utf-8")
             content_type = "application/json"
         else:
             self.send_error(404)
@@ -780,6 +811,20 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 — http.server API
         if self.path.split("?")[0] != "/close":
             self.send_error(404); return
+        # AUDIT FIX (2026-07-03): CSRF guard. A plain form POST is a "simple request" —
+        # any website open in a browser that can reach this host (LAN/Tailscale) could
+        # silently close positions. Requiring a custom header forces a CORS preflight,
+        # which we never approve, so cross-origin calls die in the browser. The
+        # dashboard's own fetch() sends the header; curl users add -H "X-Kronos-Close: 1".
+        if self.headers.get("X-Kronos-Close") != "1":
+            body = json.dumps({"ok": False, "err": "missing X-Kronos-Close header "
+                                                   "(cross-site request blocked)"}).encode("utf-8")
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length).decode("utf-8") if length else ""

@@ -27,7 +27,8 @@ The scoreboard below is brutal but clean. **Nothing in the "directional predicti
 | **Lead-lag** (BTC-residual catch-up) | Trade alt's under/over-shoot vs BTC-implied move | Raw BTC lead ≈ **0** (it's a ~15s HFT game); residual catch-up didn't survive OOS | ❌ Too fast / no edge |
 | **Funding carry** | Delta-neutral long spot / short perp, collect funding | Headline research ~**19%/yr**; *our* net after real financing + fees + rotation = thin, tail-risky | ⚠️ Structural but compressing; not deployed |
 | **Pairs / stat-arb** | Cointegration mean-reversion, market-neutral | Beat passive on paper in lit; *our* OOS weak — cross-sectional momentum confirmed **weak** | ⚠️ Marginal after costs |
-| **Vol risk premium** | Sell overpriced implied vol (short variance) | Real premium, but **fat left tail**; needs an options venue (Deribit) | ⚠️ Real but un-built for our setup |
+| **Vol risk premium (VRP)** | Sell overpriced implied vol (short variance) on Deribit | Premium is **REAL** (proxy Sharpe ~1.8, implied > realized **74%** of days, +9.7 vol-pts); but the tradeable **defined-risk iron condor LOSES** (net Sharpe **−0.04 to −0.8** across strikes — crypto's fat-tailed endpoints breach the static structure). The version that *does* monetize it (delta-hedged short straddle) is operationally brutal + tail-risky. | ⚠️ The **one genuinely real edge** — but not cleanly harvestable by a small retail trader |
+| **Crypto-Analyst** (as alpha) | Calibrated regime/ensemble used to gate or trade | Intraday gates "won" then **failed the placebo** (1D + 4h, p=0.18 / 0.36 — one-month mirages); standalone swing **failed breadth** (2 of 7 coins, ETH was luck) | ❌ Honest engine, but no tradeable directional edge — its own model card says so |
 | **Intraday-TSM** | Morning→afternoon session momentum, daily hold | **+16%** on 1yr → **−17% / Sharpe 0.22 / −52% DD** on **5yr**; selective "careful-bets" version **worse** OOS | 🟡 NOT CLOSED (live only) — both backtests failed; alive only as a live forward test |
 | **Stablecoin-flow** | On-chain stablecoin supply timing (non-price) | **Sharpe ~1.3** on 1yr → **−8.4% / Sharpe −0.17** on 5yr vs buy-hold **+40%** | ❌ Failed 5yr — regime luck (IS −0.61 → OOS +0.32) |
 
@@ -84,6 +85,18 @@ These don't predict direction — they collect a premium. More durable in princi
 - **Vol risk premium:** a genuinely robust premium (implied vol > realized), but a **fat left tail** (collect small for months, lose big in a crash) and it requires an **options venue (Deribit)** we aren't set up on.
 
 The reframe from the deep-dive holds: **stop being the gambler, become the house** — provide liquidity (DeFi LP vaults like HLP: ~22% CAGR, Sharpe 2.9–5.2), sell insurance (vol premium), or read information that hits the chain before the price (on-chain flow).
+
+---
+
+## The one genuinely real edge — and why we still couldn't harvest it
+
+The variance risk premium (VRP) is the only thing in this entire project the data *refused to disprove*. On BTC, the implied volatility the options market charges (Deribit's DVOL) sits **systematically above** the volatility that actually shows up — implied beat realized **74% of days, by ~9.7 vol-points on average**. The proxy backtest (a daily-marked variance swap) showed **Sharpe ~1.8**, positive in both halves, surviving cost stress and beating ~96% of placebo shuffles. Unlike every directional signal, it didn't reshuffle — because it isn't a prediction. You're being *paid to bear tail risk*, like an insurer. That premium is real.
+
+**But the tradeable version failed.** We modeled the thing you'd actually put on — a monthly **defined-risk iron condor** (sell a strangle, buy wings to cap the loss), priced on real DVOL with the real capped payoff. Across strikes (1σ, 1.5σ) and tenors (30d, 45d) it came out **net-negative: Sharpe −0.04 to −0.8**, with an 82–91% win rate masking a few −100% capped tails that wiped out all the small wins. The diagnostic that explains it: even priced at *realized* vol (no premium), the structure loses **~−5%/cycle** — because **crypto's endpoints are fatter-tailed than daily vol predicts**, so a static short structure held to expiry gets run over by jumps. The premium (+2.5%/cycle) couldn't cover the fat-tail drag.
+
+**The reconciliation:** the ~1.8 proxy is a *continuously delta-hedged* variance swap — it harvests implied-minus-realized variance regardless of where price ends up. The condor is a *static endpoint bet* — no hedging — so the tail kills it. Same premium, completely different risk. The trade that actually monetizes the premium is a **delta-hedged short straddle** (rehedge daily) — which is the operationally-intensive, gap-risky institutional version, and we **chose not to pursue it** (a small trader selling vol they aren't fully confident in is exactly how blow-ups happen).
+
+So VRP lands in its own honest category: **a real edge that a small retail trader can't cleanly harvest.** The simple, defined-risk, set-and-forget version loses to crypto's fat tails; the version that works requires daily hedging, real tail risk, and a conviction we didn't have. The premium is genuine — the harvest isn't simple.
 
 ---
 

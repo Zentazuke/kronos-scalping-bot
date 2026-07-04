@@ -1015,7 +1015,7 @@ function closePosition(sym){
   const label=sym==='__ALL__'?'ALL open positions':sym;
   if(!confirm('Close '+label+' now at market?\nThis sends a real (testnet) close order.')) return;
   const msg=document.getElementById('closeMsg'); if(msg){ msg.textContent='closing '+label+'…'; msg.style.color='#475569'; }
-  fetch('/close',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'symbol='+encodeURIComponent(sym)})
+  fetch('/close',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Kronos-Close':'1'},body:'symbol='+encodeURIComponent(sym)})
     .then(r=>r.json()).then(d=>{ if(msg){ const ok=d.ok&&!(d.results&&d.results.some(x=>!x.ok));
         msg.style.color=ok?'#166534':'#b91c1c'; msg.textContent=ok?('done — '+(d.msg||'closed')):('error: '+(d.err||(d.results?JSON.stringify(d.results):'failed'))); } })
     .catch(e=>{ if(msg){ msg.style.color='#b91c1c'; msg.textContent='error: '+e; } });
