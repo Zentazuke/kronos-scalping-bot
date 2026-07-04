@@ -177,15 +177,19 @@ def simulate(c: List[list], regime: List[str], *, step: float, range_mult: float
         # every rebuild — realized losses from stand-downs/stop-losses were erased,
         # flattering exactly the gated modes under test.
         equity_now = cash + inv * price
-        band = max(range_mult * ap[i], 2 * step)         # half-band in fraction
+        # SAFETY FIX (2026-07-04): a glitch bar / flash crash can make ATR% huge.
+        # If band >= 1, floor <= 0 and the loop below NEVER terminates — it appends
+        # rungs until RAM dies (the MemoryError + pagefile blowout of 2026-07-04).
+        # Cap the half-band at 60% and hard-cap the rung count as a second belt.
+        band = min(max(range_mult * ap[i], 2 * step), 0.60)
         floor, ceil = price * (1 - band), price * (1 + band)
         levels = []
         p = price
-        while p > floor:
+        while p > floor and len(levels) < 500:
             p /= (1 + step); levels.append(p)
         levels = levels[::-1] + [price]
         p = price
-        while p < ceil:
+        while p < ceil and len(levels) < 1000:
             p *= (1 + step); levels.append(p)
         levels = sorted(set(levels))
         ncell = max(len(levels) - 1, 1)

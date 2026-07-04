@@ -140,6 +140,25 @@ Every time we got excited, it was a small sample or an in-sample fit. Every time
 
 ---
 
+## ADDENDUM 2026-07-04 — the audit-fixed backtest round (grid, fade, split-hour, allocator)
+
+Run after the equity-carry/lookahead bugs were fixed (see `Audit_2026-07-03.md` — pre-fix grid numbers were inflated and are void). 5-year bar, real fees, IS/OOS + breadth throughout.
+
+| Strategy | Best honest result | Verdict |
+|---|---|---|
+| **Grid, no gate** (the sweep's own IS-winner: step 1.0%, band 8) | OOS Sharpe **0.20**, **+5.5%** over ~2yr OOS, breadth 4/6 | ❌ Economically dead — thinner than funding carry on idle cash; not worth infra |
+| **Grid + exit gate** | BTC **−63.8%**, ETH **−84.1%**, fees 35–49% of capital | ❌ A sell-the-bottom fee machine |
+| **Grid + freeze gate** | ≈ no-gate minus a little, every config | ❌ Gate adds nothing |
+| **Grid + hedge gate** (the freeze+perp-short idea) | BTC **−58%**, ETH **−67%** — churned to death across ~280 regime flips | ❌ Creative idea, honestly killed |
+| **Morning-fade** (mirror of careful-bets) | OOS **−0.21%/trade**, breadth **2/7**; ride-mirror ALSO negative | ❌ No signal either direction at the extreme — the toll eats all of it |
+| **Split-hour TSM** (is 08:00 special?) | Green OOS at 12/16 UTC but **negative IS at those same hours** | ❌ Noise (real edges show in both halves). No hour-hopping; weakens the TSM prior |
+| **Analyst-regime allocator — trend-rider** | Beat B&H OOS **6/7** (median Sharpe **0.58 vs 0.27**, maxDD **34% vs 77%**), consistent IS too | 🟡 **PASS pre-registered bar → shadow forward test** (`trend_sleeve_forward.py`) |
+| **Analyst-regime allocator — default-long** | Beat B&H OOS **7/7** (median Sharpe **0.82**), but IS weak and DD 62% | 🟡 Shadow forward test alongside trend-rider |
+
+**The pattern, again:** everything that *trades a lot* (grid rungs, fades, gate churn) died of fees; the one thing that passed *trades ~2 flips a month* and leans on the single classifier output that was calibrated as RELIABLE in both halves (SIGNAL_CARD). Slow, fat, structural — same lesson as ever.
+
+**Grid loose end (one run, then closed):** the sweep gated on the internal ER classifier; the original thesis named the *analyst* as the brain. Final check: `grid_backtest.py --days 1650 --regime-csv data_cache/analyst_lean.csv`. If that doesn't materially beat the no-gate anchor either, the grid file closes for good.
+
 ## Sources (internal)
 - `Kronos_Search_Runs_Tracker.md` — Runs A–D, OOS Sharpes, win-rate collapse
 - `CAPTAINS_LOG.md` — meta-labeler v1 33.3% vs 61.9%, ADA shorts 7W/13L
