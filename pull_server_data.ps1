@@ -11,6 +11,9 @@ $REMOTE = "kronos-scalping-bot"             # remote repo folder (relative to ho
 $files = @(
   "tsm_live.db",        # live intraday trader (your closes + the bot's)
   "tsm_forward.db",     # the shadow forward-test scorecard
+  "sleeve_forward.db",  # analyst-regime sleeves shadow test (added 2026-07-07)
+  "sleeve.log",         # its cron log (commit/settle lines, MISSED warnings)
+  "reconcile.log",      # daily live-vs-trial reconciliation verdicts
   "journal.db",         # Kronos trade journal
   "observations.db"     # harvested observations
 )

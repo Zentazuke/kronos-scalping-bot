@@ -412,7 +412,20 @@ on the restated fee basis. No live-config changes while evidence accrues. New
 metric layers stay DECORATION until `/metric-calibration` cards them RELIABLE
 on accrued history (needs ~4-6 weeks of scheduler uptime).
 
-### Next session menu
+### INCIDENT 2026-07-07 — reconciler's first real catch (resolved same day)
+Nightly alert flagged only-trial trades growing since Jul 5. Root cause was a
+two-part failure: (1) the `positions` table gained a 12th column (exit_by) but
+do_enter's INSERT supplied 11 positional values — it failed AFTER create_order,
+so market sells were PLACED on the spot testnet and never recorded (the exit
+cron can't flatten what the DB doesn't know); (2) all trial commitments that
+week were SHORTs (risk-off), which spot can't express anyway. Fixes: INSERT
+now names its columns (migration-proof) and screams with the order id if
+recording ever fails post-placement; spot mode now SKIPS shorts explicitly
+(live book = LONG-side validation only, shorts stay shadow-tracked); the
+reconciler counts `shorts spot-skipped` separately and only alerts on gaps
+that matter (missing LONGs, mismatches). Lesson: order placement and record
+keeping must never share one try-block. Check testnet balances for the
+orphan sells of Jul 5-7 (market sells — filled and done, only balances drifted).
 1. Read the sleeve forward report (~2-3 weeks) and the grid loose-end output.
 2. Analyst P1.3: frontend evidence panel (/explain) + metric explorer — the
    remaining UI work. P4.2 Docker + P3 composite score (data-gated) after.

@@ -82,7 +82,7 @@ def main() -> int:
     say(hdr)
     say("-" * len(hdr))
 
-    n_dir_mismatch = n_only_live = n_only_trial = n_big_entry = 0
+    n_dir_mismatch = n_only_live = n_only_trial = n_big_entry = n_short_skipped = 0
     for k in keys:
         d, s = k
         L = live.get(k)
@@ -93,8 +93,14 @@ def main() -> int:
                 f"{_f(L['exit']):>11}{'--':>11}{_f(L['pnl'],2):>9}{'--':>8}  ONLY-LIVE")
             continue
         if T and not L:
-            # only count directional trial trades as "missing from live"
-            if T['dir'] != 'FLAT':
+            # only count directional trial trades as "missing from live".
+            # FIX (2026-07-07): SHORTs are EXPECTED to be trial-only while the live
+            # book runs on spot (long-side validation only) — tracked separately,
+            # never alerted, so the alert stays meaningful for missing LONGs.
+            if T['dir'] == 'SHORT':
+                n_short_skipped += 1
+                tag = "short-skipped(spot)"
+            elif T['dir'] != 'FLAT':
                 n_only_trial += 1
                 tag = "ONLY-TRIAL"
             else:
@@ -125,17 +131,19 @@ def main() -> int:
     diverged = n_dir_mismatch + n_only_live + n_only_trial + n_big_entry
     if args.alert:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        skipped = f" (+{n_short_skipped} shorts spot-skipped, expected)" if n_short_skipped else ""
         if diverged:
             print(f"[{stamp}] RECONCILE ALERT: dir-mismatch {n_dir_mismatch}, only-live {n_only_live}, "
-                  f"only-trial {n_only_trial}, entry-gaps {n_big_entry} — run without --alert to see rows")
+                  f"only-trial {n_only_trial}, entry-gaps {n_big_entry}{skipped} — run without --alert to see rows")
             return 1
-        print(f"[{stamp}] reconcile ok — live book matches trial")
+        print(f"[{stamp}] reconcile ok — live book matches trial{skipped}")
         return 0
     print("\n=== summary ===")
     print(f"  direction mismatches : {n_dir_mismatch}")
     print(f"  big entry-price gaps : {n_big_entry}  (>0.20% apart — testnet fill slippage)")
     print(f"  trades only live     : {n_only_live}")
-    print(f"  trades only trial    : {n_only_trial}  (directional)")
+    print(f"  trades only trial    : {n_only_trial}  (directional LONGs missing = real problem)")
+    print(f"  shorts spot-skipped  : {n_short_skipped}  (expected — live book is long-side only)")
     print("\nRead: many DIR-MISMATCH -> the two are taking different trades (signal-timing).")
     print("      many ENTRY-GAP    -> same trades, but testnet fills are far off the clean")
     print("                           candle price the trial assumes (execution slippage).")

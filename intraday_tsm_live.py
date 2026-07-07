@@ -142,23 +142,39 @@ def do_enter(dry: bool) -> int:
         raw_amt = NOTIONAL / price
         amount = float(ex.amount_to_precision(sym, raw_amt))
         side = "buy" if direction == "LONG" else "sell"
+        # FIX (2026-07-07): on SPOT, a "short" is just selling wallet inventory — not
+        # short economics — and the July 5-7 incident placed such sells that then went
+        # UNRECORDED. Spot mode now SKIPS shorts entirely: the live book validates the
+        # LONG side; SHORT days stay shadow-tracked in the trial (the reconciler knows).
         if direction == "SHORT" and os.getenv("EXCHANGE_MARKET_TYPE", "spot").strip().lower() == "spot":
-            print(f"  {sym}: WARNING — SHORT on SPOT is not a real short (sells held base, or "
-                  f"fails and silently drops the trade). Set EXCHANGE_MARKET_TYPE=future.")
+            print(f"  {sym}: SHORT skipped (spot mode — tracked in trial only)")
+            continue
         if dry:
             print(f"  DRY {sym:<10} {direction:<5} (trial) would {side} {amount} @ ~{price}")
             continue
         try:
             order = ex.create_order(sym, "market", side, amount)
-            fill = float(order.get("average") or order.get("price") or price)
+        except Exception as exc:  # noqa: BLE001 — order rejected: nothing placed, skip
+            print(f"  {sym}: ORDER FAILED ({str(exc)[:90]})")
+            continue
+        fill = float(order.get("average") or order.get("price") or price)
+        try:
+            # FIX (2026-07-07): the July incident — the table gained a 12th column
+            # (exit_by) but this INSERT supplied 11 positional values, so it failed
+            # AFTER the order was live -> orphan orders the exit cron couldn't see.
+            # Name the columns (robust to future migrations) and, if recording ever
+            # fails again, scream with the order id instead of a quiet one-liner.
             conn.execute(
-                "INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO positions (day,symbol,side,amount,entry_price,entry_ts,"
+                "status,exit_price,exit_ts,pnl,order_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (today, sym, direction, amount, fill, _now_iso(), "OPEN",
                  None, None, None, str(order.get("id"))))
             conn.commit(); placed += 1
             print(f"  ENTER {sym:<10} {direction:<5} {side} {amount} @ {fill}  [trial decision]")
-        except Exception as exc:  # noqa: BLE001 — never crash the run on one bad order
-            print(f"  {sym}: ORDER FAILED ({str(exc)[:90]})")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {sym}: CRITICAL — order {order.get('id')} was PLACED but could NOT "
+                  f"be recorded ({str(exc)[:80]}). The exit cron will NOT flatten it — "
+                  f"close it manually on the exchange!")
     conn.close()
     print(f"[{_now_iso()}] enter: {placed} position(s) opened for {today} "
           f"(executing trial decisions){' (dry-run)' if dry else ''}.")
