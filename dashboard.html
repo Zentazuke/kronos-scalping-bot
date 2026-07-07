@@ -352,7 +352,7 @@ async function poll() {
     // charts perfectly still between updates.
     try { renderPositions(); } catch(e) {}   // live P&L: update every poll, no full re-render
     try { renderTsmLive(); } catch(e) {}     // live track record (independent of full re-render)
-    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.tsm_forward, PAYLOAD.forward_rules, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
+    const sig = JSON.stringify([PAYLOAD.trades, PAYLOAD.events, PAYLOAD.equity, PAYLOAD.decisions, PAYLOAD.candles, PAYLOAD.walkforward, PAYLOAD.observations, PAYLOAD.ta_signals, PAYLOAD.tsm_forward, PAYLOAD.tsm_live, PAYLOAD.tsm_reconcile, PAYLOAD.forward_rules, PAYLOAD.sentiment, PAYLOAD.sentiment_ok]);
     if (sig === lastJson) return;
     lastJson = sig;
     const b = document.getElementById('banner');
@@ -897,6 +897,21 @@ function renderTsmForward(){
     h += '<div class="sim-meta" style="margin-top:8px"><b>Committed, awaiting close:</b> '+
       d.pending.map(p=> p.coin+' <b style="color:'+(p.dir==='LONG'?'#166534':'#b91c1c')+'">'+p.dir+'</b>').join(' · ')+'</div>';
   }
+  if((d.recent||[]).length){
+    h += '<div class="sim-meta" style="margin-top:10px;font-weight:700">Recent decisions — every day, including gated ones (why nothing traded)</div>';
+    h += '<table class="sim-tbl"><thead><tr><th class="sim-rule">day</th><th>coin</th><th>decision</th><th>morning vs gate</th><th>entry</th><th>exit</th><th>net</th><th>why / status</th></tr></thead><tbody>';
+    d.recent.forEach(r=>{
+      const dirCol = r.dir==='LONG'?'#166534':(r.dir==='SHORT'?'#b91c1c':'#94a3b8');
+      const mv = (r.morning!=null&&r.thr!=null)? ((r.morning>=0?'+':'')+(r.morning*100).toFixed(2)+'% vs '+(r.thr*100).toFixed(2)+'%') : '—';
+      const netCol = r.net>0?'#166534':(r.net<0?'#b91c1c':'#64748b');
+      h += '<tr><td class="sim-rule">'+r.day+'</td><td>'+r.coin+'</td>'+
+        '<td style="font-weight:700;color:'+dirCol+'">'+r.dir+'</td><td>'+mv+'</td>'+
+        '<td>'+_pf(r.entry,4)+'</td><td>'+_pf(r.exit,4)+'</td>'+
+        '<td style="color:'+netCol+'">'+(r.net!=null?pct(r.net):'—')+'</td>'+
+        '<td style="color:#64748b">'+(r.why||r.status)+'</td></tr>';
+    });
+    h += '</tbody></table>';
+  }
   h += '<div class="sim-meta" style="margin-top:8px;color:#94a3b8">Shadow test — no live orders. Pre-committed at 08:00 UTC, settled at day-close. Expect ugly stretches; what matters is staying net-positive and broad across coins over weeks.</div>';
   el.innerHTML = h;
 }
@@ -978,6 +993,37 @@ function renderTsmLive(){
     h+='<table class="sim-tbl" style="margin-top:10px"><thead><tr><th class="sim-rule">coin</th><th>trades</th><th>win%</th><th>total $</th></tr></thead><tbody>';
     d.by_coin.forEach(c=>{ h+='<tr><td class="sim-rule">'+c.coin+'</td><td>'+c.n+'</td><td>'+Math.round(c.win*100)+'%</td><td style="color:'+(c.total>=0?'#166534':'#b91c1c')+'">'+(c.total>=0?'+':'')+c.total.toFixed(2)+'</td></tr>'; });
     h+='</tbody></table>';
+  }
+  if((d.recent||[]).length){
+    h+='<div class="sim-meta" style="margin-top:10px;font-weight:700">Recent live fills — real entry &amp; exit prices</div>';
+    h+='<table class="sim-tbl"><thead><tr><th class="sim-rule">day</th><th>coin</th><th>side</th><th>size</th><th>entry</th><th>exit</th><th>P&amp;L $</th><th>closed by</th></tr></thead><tbody>';
+    d.recent.forEach(t=>{
+      const col=(t.pnl||0)>=0?'#166534':'#b91c1c';
+      h+='<tr><td class="sim-rule">'+(t.day||'—')+'</td><td>'+t.coin+'</td>'+
+        '<td style="font-weight:700;color:'+(t.side==='LONG'?'#166534':'#b91c1c')+'">'+(t.side||'')+'</td>'+
+        '<td>'+_pf(t.amount,6)+'</td><td>'+_pf(t.entry,4)+'</td><td>'+_pf(t.exit,4)+'</td>'+
+        '<td style="color:'+col+';font-weight:700">'+(t.pnl!=null?((t.pnl>=0?'+':'')+t.pnl.toFixed(2)):'—')+'</td>'+
+        '<td>'+(t.by==='manual'?'<b>you</b>':'bot')+'</td></tr>';
+    });
+    h+='</tbody></table>';
+  }
+  const rec=(typeof PAYLOAD!=='undefined' && PAYLOAD && PAYLOAD.tsm_reconcile)||{};
+  if(rec.present && (rec.rows||[]).length){
+    h+='<div class="sim-meta" style="margin-top:10px;font-weight:700">Live vs trial — is the live book doing what the shadow committed?</div>';
+    h+='<table class="sim-tbl"><thead><tr><th class="sim-rule">day</th><th>coin</th><th>trial dir</th><th>trial entry</th><th>trial net</th><th>live entry</th><th>live P&amp;L $</th><th>verdict</th></tr></thead><tbody>';
+    rec.rows.forEach(r=>{
+      const ok=r.flag==='ok'; const skip=(r.flag||'').indexOf('by design')>=0;
+      const col=ok?'#166534':(skip?'#94a3b8':'#b91c1c');
+      h+='<tr><td class="sim-rule">'+r.day+'</td><td>'+r.coin+'</td>'+
+        '<td style="color:'+(r.dir==='LONG'?'#166534':'#b91c1c')+';font-weight:700">'+r.dir+'</td>'+
+        '<td>'+_pf(r.t_entry,4)+'</td>'+
+        '<td>'+(r.t_net!=null?((r.t_net>=0?'+':'')+(r.t_net*100).toFixed(2)+'%'):r.t_status)+'</td>'+
+        '<td>'+_pf(r.l_entry,4)+'</td>'+
+        '<td>'+(r.l_pnl!=null?((r.l_pnl>=0?'+':'')+r.l_pnl.toFixed(2)):'—')+'</td>'+
+        '<td style="color:'+col+';font-weight:600">'+r.flag+'</td></tr>';
+    });
+    h+='</tbody></table>';
+    h+='<div class="sim-meta" style="color:#94a3b8">Gray SHORT rows are trial-only ON PURPOSE — spot can\'t short, so the live book validates the LONG side while the trial scores both. <b style="color:#b91c1c">Red rows are real problems</b> (a LONG the live bot missed, or a direction mismatch) — if one appears, check tsm_live.log.</div>';
   }
   h+='<div class="sim-meta" style="margin-top:8px;color:#94a3b8">Real testnet fills since the corrected strategy went live. The strategy\'s full from-inception scorecard (the auto bot) is the ON TRIAL panel below.</div>';
   el.innerHTML=h;

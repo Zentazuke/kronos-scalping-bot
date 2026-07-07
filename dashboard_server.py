@@ -172,7 +172,8 @@ def _tsm_forward() -> Dict[str, Any]:
         conn = sqlite3.connect(f"file:{TSM_DB_PATH}?mode=ro", uri=True, timeout=2.0)
         conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(
-            "SELECT decision_day, symbol, direction, status, morning_ret, net_ret "
+            "SELECT decision_day, symbol, direction, status, morning_ret, vol_thr, "
+            "entry_price, exit_price, gross_ret, net_ret "
             "FROM forward_trades ORDER BY decision_day, symbol")]
         conn.close()
     except sqlite3.Error as exc:
@@ -209,11 +210,33 @@ def _tsm_forward() -> Dict[str, Any]:
              "dir": r["direction"], "morning": r["morning_ret"]} for r in pending]
     pend.sort(key=lambda d: (d["day"], d["coin"]))
 
+    # UPGRADE (2026-07-07): the full recent decision log — EVERY day incl. gated
+    # ones, with entry/exit prices and a derived reason for FLAT days, so the
+    # dashboard explains itself instead of showing silent nothing.
+    days_recent = set(days[-8:])
+    recent = []
+    for r in rows:
+        if r["decision_day"] not in days_recent:
+            continue
+        why = ""
+        if r["direction"] == "FLAT":
+            m, thr = r.get("morning_ret"), r.get("vol_thr")
+            if m is not None and thr is not None and abs(m) < thr:
+                why = "vol gate: |morning| below trailing threshold"
+            else:
+                why = "regime / on-chain risk-off gate"
+        recent.append({"day": r["decision_day"], "coin": r["symbol"].split("/")[0],
+                       "dir": r["direction"], "status": r["status"],
+                       "morning": r.get("morning_ret"), "thr": r.get("vol_thr"),
+                       "entry": r.get("entry_price"), "exit": r.get("exit_price"),
+                       "net": r.get("net_ret"), "why": why})
+    recent.sort(key=lambda x: (x["day"], x["coin"]), reverse=True)
+
     return {"present": True, "error": "",
             "span": [days[0], days[-1]] if days else [],
             "n_days": len(days), "n_settled": n, "n_pending": len(pending), "n_flat": len(flat),
             "win": win, "exp": exp, "total": total,
-            "by_coin": by_coin, "curve": curve, "pending": pend}
+            "by_coin": by_coin, "curve": curve, "pending": pend, "recent": recent}
 
 
 def _tsm_live() -> Dict[str, Any]:
@@ -256,8 +279,58 @@ def _tsm_live() -> Dict[str, Any]:
                 "avg": round(sum(a) / len(a), 2) if a else 0.0}
     by_exit = {"manual": _split(lambda r: r.get("exit_by") == "manual"),
                "auto": _split(lambda r: r.get("exit_by") != "manual")}
+    # UPGRADE (2026-07-07): the actual fills — real entry/exit prices per trade.
+    recent = [{"day": r.get("day"), "coin": (r.get("symbol") or "").split("/")[0],
+               "side": r.get("side"), "amount": r.get("amount"),
+               "entry": r.get("entry_price"), "exit": r.get("exit_price"),
+               "pnl": r.get("pnl"), "by": r.get("exit_by") or "auto"}
+              for r in closed[-12:]][::-1]
     return {"present": True, "error": "", "n": n, "open": open_n, "total": total,
-            "win": win, "curve": curve, "by_coin": by_coin, "by_exit": by_exit}
+            "win": win, "curve": curve, "by_coin": by_coin, "by_exit": by_exit,
+            "recent": recent}
+
+
+def _tsm_reconcile() -> Dict[str, Any]:
+    """UPGRADE (2026-07-07): live-vs-trial, rendered where the eyes are. For each
+    recent directional TRIAL commitment: did the live book do the same thing, and
+    if not, WHY. SHORT days are trial-only BY DESIGN (spot can't short) and are
+    shown gray; red rows are real divergence. The July-2026 incident would have
+    been visible here on day one."""
+    if not TSM_DB_PATH.exists():
+        return {"present": False}
+    try:
+        fc = sqlite3.connect(f"file:{TSM_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        trial = fc.execute(
+            "SELECT decision_day, symbol, direction, entry_price, net_ret, status "
+            "FROM forward_trades WHERE direction != 'FLAT' "
+            "ORDER BY decision_day DESC, symbol LIMIT 40").fetchall()
+        fc.close()
+    except sqlite3.Error as exc:
+        return {"present": True, "error": str(exc)[:80], "rows": []}
+    live: Dict[tuple, Dict[str, Any]] = {}
+    if TSM_LIVE_DB.exists():
+        try:
+            lc = sqlite3.connect(f"file:{TSM_LIVE_DB}?mode=ro", uri=True, timeout=2.0)
+            lc.row_factory = sqlite3.Row
+            for r in lc.execute("SELECT * FROM positions"):
+                live[(r["day"], r["symbol"])] = dict(r)
+            lc.close()
+        except sqlite3.Error:
+            pass
+    rows = []
+    for day, sym, dirn, t_entry, net, status in trial:
+        found = live.get((day, sym))
+        if found:
+            flag = "ok" if (found.get("side") == dirn) else "DIR-MISMATCH"
+        elif dirn == "SHORT":
+            flag = "short-skipped (spot, by design)"
+        else:
+            flag = "MISSING — live never entered!"
+        rows.append({"day": day, "coin": sym.split("/")[0], "dir": dirn,
+                     "t_entry": t_entry, "t_net": net, "t_status": status,
+                     "l_entry": (found or {}).get("entry_price"),
+                     "l_pnl": (found or {}).get("pnl"), "flag": flag})
+    return {"present": True, "error": "", "rows": rows}
 
 
 def _fwd_rules() -> Dict[str, Any]:
@@ -762,6 +835,7 @@ def _payload() -> bytes:
     out["ta_signals"] = _ta_signals()
     out["tsm_forward"] = _tsm_forward()
     out["tsm_live"] = _tsm_live()
+    out["tsm_reconcile"] = _tsm_reconcile()
     out["forward_rules"] = _fwd_rules()
     out["positions"] = _positions()
     out["sentiment"] = dict(_sentiment_cache)
