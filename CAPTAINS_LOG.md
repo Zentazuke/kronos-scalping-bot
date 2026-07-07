@@ -1,7 +1,9 @@
 # CAPTAIN'S LOG — Kronos Scalping Bot
 
 Handoff document for continuing this project in any session/workspace.
-Read this top to bottom before touching code. Last updated: 2026-06-11.
+Read this top to bottom before touching code. Last updated: 2026-07-04.
+**Start with §8 (the audit sessions) — it is the current state of play.**
+§1–7 describe the retired Kronos-scalper era, kept as history.
 
 ---
 
@@ -360,6 +362,59 @@ ALSO: bot.log timestamps are LOCAL (UTC+1 for user); journal/TUI are UTC.
 Cowork mount sync can lag bot.log by HOURS — diagnose live issues from
 user-pasted PowerShell output, not the mounted file.
 
-### ACTIVE — main account switched to HARVESTER mode (2026-06-11 evening)
-User chose to maximize training data on the existing testnet account while
-the 2 extra a
+### ACTIVE — main a
+
+---
+
+## 8. LOG ENTRY — 2026-07-03/04, the audit sessions (CURRENT STATE OF PLAY)
+
+Two days that changed the project's footing. Full detail in `Audit_2026-07-03.md`
+and the postmortem's 2026-07-04 addendum; this is the handoff summary.
+
+### What was found and fixed
+- **grid_backtest.py had a critical bug**: every grid rebuild silently reset cash
+  to initial capital — realized losses were ERASED, flattering exactly the gated
+  modes under test. Also same-bar regime lookahead, and later an unbounded
+  level-loop that ate 100GB of pagefile (glitch-bar ATR → negative floor). All
+  fixed, all regression-tested. **Any grid result from before 2026-07-04 is void.**
+- **TSM cost model undercounted by ~half** (trial charged 10bps vs the real ~20bps
+  two-taker round trip; live P&L ignored fees entirely). Fixed both;
+  `restate_forward_nets.py` recomputes the stored forward history to the honest
+  basis. Fees now live in ONE place: `costs.py`.
+- **Dashboard**: manual-close P&L ignored fees (biasing the you-vs-bot scoreboard
+  pro-manual), /close was CSRF-able, search endpoints could stack subprocesses,
+  journal-path closes could double-fire. All fixed.
+
+### The 2026-07-04 verdict round (honest backtests, post-fix)
+- Grid: DEAD economically (best config = no gate at all, OOS Sharpe 0.20; the
+  hedge-gate idea also died — churn). One loose end: rerun gated by the ANALYST
+  regime csv; if that doesn't beat no-gate, the grid file closes forever.
+- Morning-fade: FAIL, graveyarded. Split-hour study: noise (no hour-hopping).
+- **Analyst-regime allocator: PASSED the pre-registered bar** — trend-rider beat
+  buy&hold OOS on 6/7 coins (Sharpe 0.58 vs 0.27, maxDD 34% vs 77%), default-long
+  7/7. The analyst's regime signal (its one RELIABLE calibrated output) is the
+  project's best result to date. Reward: a shadow forward test, nothing more.
+
+### What is RUNNING now (all on the Ubuntu server unless noted)
+- `crypto-analyst.service` — analyst API + scheduler, localhost:8000, 7-coin
+  basket, recording candles/micro/funding/alerts/VRP + (new) sentiment/on-chain
+  metric history + (new) options surface / derivatives crowd / stablecoin feeds.
+- `trend_sleeve_forward.py` — cron 00:10 UTC, shadow-logs both allocator sleeves
+  vs buy&hold from the analyst's live regime reads. First day committed 7/7.
+- Intraday-TSM live testnet (unchanged cadence) + `compare_live_vs_trial.py
+  --alert` reconcile cron 01:10 UTC — divergence now alerts instead of waiting
+  to be noticed.
+- CryptoAnalyst is on GitHub (public) with CI green on clean Linux.
+
+### The judgment rules (do not renegotiate mid-test)
+Sleeves and TSM are judged over WEEKS via their forward reports, vs buy&hold,
+on the restated fee basis. No live-config changes while evidence accrues. New
+metric layers stay DECORATION until `/metric-calibration` cards them RELIABLE
+on accrued history (needs ~4-6 weeks of scheduler uptime).
+
+### Next session menu
+1. Read the sleeve forward report (~2-3 weeks) and the grid loose-end output.
+2. Analyst P1.3: frontend evidence panel (/explain) + metric explorer — the
+   remaining UI work. P4.2 Docker + P3 composite score (data-gated) after.
+3. If sleeves confirm live: design the testnet executor (same one-brain pattern
+   as TSM: execute the trial's committed decisions, never recompute).
