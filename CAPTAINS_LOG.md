@@ -426,8 +426,48 @@ reconciler counts `shorts spot-skipped` separately and only alerts on gaps
 that matter (missing LONGs, mismatches). Lesson: order placement and record
 keeping must never share one try-block. Check testnet balances for the
 orphan sells of Jul 5-7 (market sells — filled and done, only balances drifted).
+### Next session menu
 1. Read the sleeve forward report (~2-3 weeks) and the grid loose-end output.
 2. Analyst P1.3: frontend evidence panel (/explain) + metric explorer — the
    remaining UI work. P4.2 Docker + P3 composite score (data-gated) after.
+   (P1.3 + P3.2 shipped 2026-07-07.)
 3. If sleeves confirm live: design the testnet executor (same one-brain pattern
    as TSM: execute the trial's committed decisions, never recompute).
+
+### PRE-REGISTERED VERDICT RULE for intraday-TSM (locked 2026-07-14)
+Status at lock: 31 settled trial trades on the honest 20bps basis — net/trade
+−0.040%, win 61% (wins smaller than losses+toll), breadth 4/9 coins positive
+with winners on tiny n. The 5yr backtest already failed; the split-hour study
+was noise. RULE, decided before more data arrives: **on 2026-08-04 (or at
+n≥50 settled trades, whichever comes first), if trial net/trade ≤ 0,
+intraday-TSM retires** — live cron off, trial cron off, full graveyard entry
+in the postmortem. If net/trade > 0 it earns exactly one more month, nothing
+else. No config changes before the verdict date. Written down NOW so the
+flattering or ugly week right before the deadline can't renegotiate it.
+
+### GRID — CLOSED PERMANENTLY (2026-07-14)
+The last open verdict is in: analyst-regime-gated grid run on 4.5yr BTC+ETH.
+No gate beats no-gate; no-gate loses to buy&hold on BTC; and the regime split
+shows the grid LOST in ranges (−29.5% BTC) and earned only in trends (+63.3%)
+— it was disguised beta paying 9–21% of capital in fees. The "harvest chop"
+thesis is dead on its own terms, with both regime sources. Full entry in the
+postmortem. Any future grid proposal must FIRST beat no-gate AND buy&hold in
+a new pre-registered backtest — the burden of proof is on the grid now. The
+"intelligent automated bot" road is the sleeves' testnet executor, if August
+confirms them.
+
+### SLEEVE CONSUMPTION STUDY (2026-07-14) — one qualified winner
+Pre-registered 4-variant study of HOW to consume the regime signal (locked in
+Strategy_Roadmap_2026-07-14.md before results). Verdict: confidence-scaled
+trend-rider (TR-A) passes — basket Sharpe 1.17 vs 1.06, DD 19% vs 23%, 4/7
+coins (minimum breadth); won via risk reduction, not return. Vol-targeting
+variants died of their own churn (compatibility doctrine again); default-long
+stays binary. TR-A becomes a THIRD shadow sleeve only after the ~Aug 1 read
+confirms the baselines. Nothing running changes before then.
+
+### SLEEVES — first 10-day read (2026-07-14, no action)
+0 missed days. Falling tape: buy&hold −4.26%. trend-rider fully flat (0 pump
+confirmations in 10 days — corroborated by the TSM trial committing ~all
+SHORTs the same week) = +4.26pp vs B&H by dodging the fall. default-long
+−3.64% = +0.62pp vs B&H. Both ahead, exactly the crash-avoidance premium the
+backtest promised. Still noise at n=10 days; real verdict ~2026-08-01.
