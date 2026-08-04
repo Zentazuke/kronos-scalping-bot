@@ -63,13 +63,29 @@ def _now_iso() -> str:
 
 
 def analyst_regime(symbol: str) -> tuple[str, float] | None:
-    """(label, confidence) from the analyst API, or None if unreachable."""
+    """(label, confidence) from the analyst API, or None if unreachable.
+
+    FIX (2026-08-04, label-diagnostic finding): use the last COMPLETED daily
+    bar's label, never the just-opened partial bar. The July flaw: committing
+    at 00:10 UTC classified a series ending in a 10-minute-old candle — a
+    breakout (close escaping the prior range) is structurally impossible to
+    confirm on a bar that barely moved, so TR under-confirmed vs the backtest
+    path (offline export showed breakouts on ETH/LINK Jul 15-16 that the live
+    path labeled range). Completed-bar selection reproduces the backtest's
+    +1-day causal shift exactly."""
     sym = symbol.replace("/", "_")
     try:
-        with urllib.request.urlopen(f"{ANALYST_API}/regime/{sym}?timeframe=1D",
+        with urllib.request.urlopen(f"{ANALYST_API}/regime/{sym}?timeframe=1D&limit=3",
                                     timeout=10) as resp:  # noqa: S310 — local API
             data = json.loads(resp.read().decode("utf-8"))
-        cur = data.get("current") or {}
+        midnight = int(datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        completed = [r for r in (data.get("recent") or [])
+                     if r.get("label") and r.get("ts") and int(r["ts"]) < midnight]
+        if completed:
+            r = completed[-1]                      # newest bar that OPENED before today
+            return str(r["label"]), float(r.get("confidence") or 0.0)
+        cur = data.get("current") or {}            # fallback: old behavior, better than MISSED
         if cur.get("label"):
             return str(cur["label"]), float(cur.get("confidence") or 0.0)
     except Exception:  # noqa: BLE001 — down/missing -> MISSED, never guessed

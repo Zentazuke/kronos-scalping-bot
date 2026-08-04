@@ -434,6 +434,45 @@ orphan sells of Jul 5-7 (market sells — filled and done, only balances drifted
 3. If sleeves confirm live: design the testnet executor (same one-brain pattern
    as TSM: execute the trial's committed decisions, never recompute).
 
+### VERDICT DAY 2026-08-04 — TSM retired; sleeves extended under locked rules
+**TSM: RETIRED per the 2026-07-14 rule.** n=41, net/trade −0.134%, total −5.5%,
+win 54%. The forward test converged to the 5yr backtest's answer. Crons removed
+(enter/exit/trial/reconcile), graveyard entry written. The live long-only book
+and trial record are frozen as evidence.
+
+**Sleeves month 1 (31 days, 0 missed): NOT confirmed, NOT killed — extended.**
+DL −3.67% vs B&H −2.98% (ran as a ~0.9-beta clone; its crash-avoidance edge
+case never occurred; paid defense premium in chop). TR: 0/31 long — the market
+produced ZERO trend_up/breakout labels in 224 coin-days (backtest base ≈ 20%),
+so TR's long side remains UNTESTED live. **Open diagnostic:** offline export vs
+live-committed label reconciliation (does the live 00:10 API path under-confirm
+trends vs the completed-bar export?). TR-A promotion is ON HOLD pending that
+diagnostic — promoting on an unvalidated labeling path would inherit any gap.
+
+**LABEL DIAGNOSTIC RESULT (2026-08-04, same day):** offline completed-bar
+export vs live-committed labels, July: 192 match / 25 mismatch (88.5%).
+20 mismatches = harmless low_vol↔range jitter (identical positions). 5 were
+REAL: the export confirmed **breakout on ETH Jul 15-16 + LINK Jul 16** that
+the live path labeled range — TR's silent month was PARTLY plumbing. Root
+cause: committing at 00:10 classified a series ending in the 10-minute-old
+partial daily bar; a breakout (close escaping the prior range) cannot confirm
+on a bar that barely moved. **FIX deployed 2026-08-04:** analyst_regime() now
+selects the last COMPLETED daily bar's label (ts < today-midnight, limit=3),
+reproducing the backtest's +1-day shift exactly. Sleeve records before/after
+2026-08-05 sit on different labeling paths — the 9/1 judgment weighs the
+post-fix segment more. Lesson for every future consumer: NEVER classify on a
+partial bar; the "10 minutes old ≈ yesterday's close" assumption was mine and
+it was wrong for escape-style features.
+
+**LOCKED RULES for 2026-09-01 (60 settled days), written before the data:**
+1. DL retires if it trails B&H cumulatively AND its max drawdown is not at
+   least 25% shallower than B&H's. Defense must show up in return OR in risk.
+2. TR is judged only if it logs ≥5 long coin-days by then; if the market again
+   provides none, judgment rolls forward but the LABEL DIAGNOSTIC must pass
+   for the test to continue at all.
+3. TR-A promotes only after the diagnostic passes AND baselines survive 9/1.
+4. No config changes, no new variants, no bar-moving before 9/1.
+
 ### PRE-REGISTERED VERDICT RULE for intraday-TSM (locked 2026-07-14)
 Status at lock: 31 settled trial trades on the honest 20bps basis — net/trade
 −0.040%, win 61% (wins smaller than losses+toll), breadth 4/9 coins positive
