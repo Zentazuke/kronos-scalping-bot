@@ -5,7 +5,7 @@
 # 2) from this folder in PowerShell:   ./pull_server_data.ps1
 #    (if blocked:  powershell -ExecutionPolicy Bypass -File .\pull_server_data.ps1)
 
-$SERVER = "kronos@YOUR_SERVER_ADDRESS"      # <-- EDIT THIS (same as your ssh target)
+$SERVER = "kronos@5.75.238.93"             # same target as connect_server.bat
 $REMOTE = "kronos-scalping-bot"             # remote repo folder (relative to home)
 
 $files = @(

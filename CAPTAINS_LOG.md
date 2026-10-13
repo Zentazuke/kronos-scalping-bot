@@ -434,6 +434,56 @@ orphan sells of Jul 5-7 (market sells — filled and done, only balances drifted
 3. If sleeves confirm live: design the testnet executor (same one-brain pattern
    as TSM: execute the trial's committed decisions, never recompute).
 
+### ⚓ PROJECT CLOSED — 2026-10-13
+Ricardo's decision, made deliberately. Every strategy family tested to a
+verdict; no live candidate remains; real capital was never risked and the
+bankroll is untouched. All trading crons stopped, trading services disabled.
+What survives as reusable knowledge: Failed_Strategies_Postmortem.md (the
+cost-wall thesis, the compatibility doctrine, pre-registration discipline),
+the crypto-analyst repo (a working, calibrated analytics instrument), and this
+log. Known loose ends left deliberately unpursued: long-only TSM (likely beta),
+metric-layer calibration (data accrued but never judged), sentiment never
+recorded. If ever reopened: read the postmortem first, pre-register before
+building anything, and set calendar reminders for every verdict date.
+
+### VERDICT 2026-10-13 — sleeves judged by the Aug-4 rules (read 6 weeks late)
+Read on 10/13, not 9/1 — the date passed unread. Rules applied as written.
+Data: 81 settled days (Jul 4 – Oct 12); ~19 days unrecorded (see incident).
+| | Overall | POST-fix (49d) | Post-fix maxDD |
+|---|---|---|---|
+| Buy & hold | +32.9% | +36.5% | 9.6% |
+| Default-long | +21.3% | +25.4% | 9.6% |
+| Trend-rider | +11.7% | +11.7% | 9.6% |
+The label fix WORKED: post-fix labels were 221 trend_up + 12 breakout; TR
+held 233 long coin-days (the ≥5 threshold met many times over).
+- **Default-long: RETIRED by Rule 1** — trails B&H cumulatively AND drawdown
+  not ≥25% shallower (identical). Defense appeared in neither return nor risk.
+- **Trend-rider: FAILED its live test** — captured ~1/3 of the rally at the
+  SAME drawdown. Equal risk, fraction of the reward. Confirm-then-hold enters
+  late and pays caution's cost without caution's benefit in this tape.
+- **TR-A: NOT promoted** — precondition (baselines survive) not met.
+Caveat stated honestly, not as a rescue: one ~3-month window, one regime (a
+strong rally). The backtest's case was crash-avoidance, and no crash came.
+That does NOT reopen the sleeves — the rules were locked for exactly this
+temptation. It means "slow regime allocation" as a family is not yet buried
+by this test alone; any successor needs a NEW pre-registration.
+
+### INCIDENT 2026-10-13 — server disk full (found during the verdict read)
+`crypto-analyst/data/raw` (raw API-payload replay archive) had no retention
+and grew to 23 GB in ~3 months (microstructure every 2 min × 7 coins), filling
+the 38 GB disk to 100%. Effects: sleeve_forward settle crashed nightly BEFORE
+committing, so ~19 days were never recorded — not even as MISSED (the "0
+missed" in the report was true and wrong). Analyst DB writes also failed.
+Fix: deleted raw files >3 days (disk 100%→37%), analyst restarted (7/7
+collectors 0 errors), sleeve DB integrity ok. Root cause fixed in code:
+archive.py now prunes itself to ANALYST_RAW_RETENTION_DAYS (default 7),
+hourly, from inside the writer (+3 tests). Also found: the TSM crons were
+never removed after its Aug-4 retirement — removed 10/13.
+Lessons: (1) every growth path of an unattended system needs a bound;
+(2) "0 missed" must count expected days, not just failed attempts — a script
+that crashes before logging can't report its own absence; (3) verdict dates
+need a reminder, not memory.
+
 ### VERDICT DAY 2026-08-04 — TSM retired; sleeves extended under locked rules
 **TSM: RETIRED per the 2026-07-14 rule.** n=41, net/trade −0.134%, total −5.5%,
 win 54%. The forward test converged to the 5yr backtest's answer. Crons removed

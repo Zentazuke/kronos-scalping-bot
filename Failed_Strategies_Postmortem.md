@@ -152,6 +152,7 @@ Run after the equity-carry/lookahead bugs were fixed (see `Audit_2026-07-03.md` 
 | **Grid + hedge gate** (the freeze+perp-short idea) | BTC **−58%**, ETH **−67%** — churned to death across ~280 regime flips | ❌ Creative idea, honestly killed |
 | **Morning-fade** (mirror of careful-bets) | OOS **−0.21%/trade**, breadth **2/7**; ride-mirror ALSO negative | ❌ No signal either direction at the extreme — the toll eats all of it |
 | **Split-hour TSM** (is 08:00 special?) | Green OOS at 12/16 UTC but **negative IS at those same hours** | ❌ Noise (real edges show in both halves). No hour-hopping; weakens the TSM prior |
+| **Sleeves — LIVE verdict 2026-10-13** | 81 live days; post-fix B&H +36.5% / DL +25.4% / TR +11.7%, all at 9.6% maxDD | ⚰️ **DL retired (Rule 1), TR failed its live test, TR-A not promoted.** Passed the 4.5yr backtest, failed the live window: a strong rally with no crash to avoid, so the defensive premium was paid with nothing bought. One regime only — the *family* (slow regime allocation) needs a new pre-registration to return, not a rescue of these two. |
 | **Analyst-regime allocator — trend-rider** | Beat B&H OOS **6/7** (median Sharpe **0.58 vs 0.27**, maxDD **34% vs 77%**), consistent IS too | 🟡 **PASS pre-registered bar → shadow forward test** (`trend_sleeve_forward.py`) |
 | **Analyst-regime allocator — default-long** | Beat B&H OOS **7/7** (median Sharpe **0.82**), but IS weak and DD 62% | 🟡 Shadow forward test alongside trend-rider |
 
